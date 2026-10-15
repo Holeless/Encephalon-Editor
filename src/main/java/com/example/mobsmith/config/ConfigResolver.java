@@ -5,6 +5,7 @@ import java.util.List;
 
 import com.example.mobsmith.behavior.Behavior;
 import com.example.mobsmith.behavior.Setting;
+import com.example.mobsmith.scope.MobGroups;
 import com.example.mobsmith.scope.Scope;
 import com.example.mobsmith.scope.ScopeType;
 
@@ -26,7 +27,10 @@ public final class ConfigResolver {
     public static List<Scope> chain(Mob mob) {
         List<Scope> list = new ArrayList<>();
         list.add(Scope.ALL);
-        list.add(new Scope(ScopeType.CATEGORY, mob.getType().getCategory().getName()));
+        String cat = MobGroups.categoryOf(mob.getType());
+        if (cat != null) {
+            list.add(new Scope(ScopeType.CATEGORY, cat));
+        }
         list.add(new Scope(ScopeType.MOB_TYPE, BuiltInRegistries.ENTITY_TYPE.getKey(mob.getType()).toString()));
         list.add(new Scope(ScopeType.INDIVIDUAL, mob.getUUID().toString()));
         return list;
@@ -87,7 +91,10 @@ public final class ConfigResolver {
             case MOB_TYPE -> {
                 l.add(Scope.ALL);
                 EntityType<?> t = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id()));
-                l.add(new Scope(ScopeType.CATEGORY, t.getCategory().getName()));
+                String cat = MobGroups.categoryOf(t);
+                if (cat != null) {
+                    l.add(new Scope(ScopeType.CATEGORY, cat));
+                }
                 l.add(s);
             }
             default -> {

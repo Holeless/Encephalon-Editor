@@ -3,8 +3,12 @@ package com.example.mobsmith.client;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import com.example.mobsmith.behavior.Behavior;
 import com.example.mobsmith.behavior.Behaviors;
@@ -12,6 +16,7 @@ import com.example.mobsmith.behavior.Setting;
 import com.example.mobsmith.config.ConfigResolver;
 import com.example.mobsmith.config.MobConfigData;
 import com.example.mobsmith.config.Tri;
+import com.example.mobsmith.scope.MobGroups;
 import com.example.mobsmith.scope.Scope;
 import com.example.mobsmith.scope.ScopeType;
 
@@ -31,15 +36,16 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.item.ItemStack;
 
 /**
- * Mob Editor: scope list (left), behavior list for that scope (middle), details and settings (right).
+ * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
+ * Middle: behaviors for the selected scope, with a behavior search. Right: scrollable details and settings.
  * Singleplayer only for now: it edits the integrated server's MobConfigData directly (networking is a TODO).
  */
 public class MobEditorScreen extends Screen {
-    private static final int TOP = 48;
+    private static final int TOP = 50;
+    private static final int BOTTOM_RESERVE = 34;
 
     private MinecraftServer server;
     private MobConfigData data;
@@ -47,19 +53,28 @@ public class MobEditorScreen extends Screen {
 
     private PickList scopeList;
     private PickList behaviorList;
-    private EditBox search;
+    private EditBox mobSearch;
+    private EditBox behaviorSearch;
     private Button stateButton;
-    private final List<AbstractWidget> detail = new ArrayList<>();
+    private final List<Placed> placed = new ArrayList<>();
     private final List<SettingRow> rows = new ArrayList<>();
     private List<FormattedCharSequence> descLines = List.of();
+    private final Map<String, List<EntityType<?>>> typesByCategory = new HashMap<>();
+    private final Set<String> expanded = new HashSet<>(Set.of(Scope.ALL.key()));
 
     private Scope scope = Scope.ALL;
     private Behavior behavior;
-    private String filter = "";
+    private String mobFilter = "";
+    private String behaviorFilter = "";
     private int mx;
     private int rx;
     private int rw;
     private int explainY;
+    private int scroll;
+    private int contentHeight;
+
+    private record Placed(AbstractWidget widget, int baseY) {
+    }
 
     private record SettingRow(Setting setting, int y) {
     }
@@ -73,13 +88,18 @@ public class MobEditorScreen extends Screen {
         return false;
     }
 
+    private int viewBottom() {
+        return height - BOTTOM_RESERVE;
+    }
+
     // ------------------------------------------------------------------ setup
 
     @Override
     protected void init() {
-        detail.clear();
+        placed.clear();
         rows.clear();
         stateButton = null;
+        scroll = 0;
 
         server = this.minecraft.getSingleplayerServer();
         editable = server != null && this.minecraft.player != null && this.minecraft.player.hasPermissions(2);
@@ -97,22 +117,33 @@ public class MobEditorScreen extends Screen {
         addRenderableWidget(Button.builder(Component.translatable("mobsmith.screen.reset_scope"), b -> resetScope())
                 .bounds(width / 2 - 155, height - 28, 150, 20).build()).active = editable;
 
-        int lw = Mth.clamp(width * 30 / 100, 130, 200);
-        int mw = Mth.clamp(width * 30 / 100, 130, 200);
+        buildTypes();
+
+        int lw = Mth.clamp(width * 27 / 100, 100, 190);
+        int mw = Mth.clamp(width * 27 / 100, 100, 190);
         int lx = 8;
         mx = lx + lw + 6;
         rx = mx + mw + 6;
-        rw = Math.max(80, width - 8 - rx);
-        int listH = height - TOP - 34;
+        rw = Math.max(100, width - 14 - rx);
+        int listH = height - TOP - BOTTOM_RESERVE;
 
-        search = new EditBox(this.font, lx, 28, lw, 16, Component.empty());
-        search.setHint(Component.translatable("mobsmith.screen.search"));
-        search.setValue(filter);
-        search.setResponder(s -> {
-            filter = s.toLowerCase().trim();
+        mobSearch = new EditBox(this.font, lx, 28, lw, 16, Component.empty());
+        mobSearch.setHint(Component.translatable("mobsmith.screen.search"));
+        mobSearch.setValue(mobFilter);
+        mobSearch.setResponder(s -> {
+            mobFilter = s.toLowerCase().trim();
             rebuildScopes();
         });
-        addRenderableWidget(search);
+        addRenderableWidget(mobSearch);
+
+        behaviorSearch = new EditBox(this.font, mx, 28, mw, 16, Component.empty());
+        behaviorSearch.setHint(Component.translatable("mobsmith.screen.search_behaviors"));
+        behaviorSearch.setValue(behaviorFilter);
+        behaviorSearch.setResponder(s -> {
+            behaviorFilter = s.toLowerCase().trim();
+            rebuildBehaviors();
+        });
+        addRenderableWidget(behaviorSearch);
 
         scopeList = addRenderableWidget(new PickList(this.minecraft, lx, TOP, lw, listH, 18));
         behaviorList = addRenderableWidget(new PickList(this.minecraft, mx, TOP, mw, listH, 22));
@@ -121,12 +152,28 @@ public class MobEditorScreen extends Screen {
         rebuildDetail();
     }
 
+    private void buildTypes() {
+        typesByCategory.clear();
+        for (String c : MobGroups.CATEGORIES) {
+            typesByCategory.put(c, new ArrayList<>());
+        }
+        for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
+            String c = MobGroups.categoryOf(t);
+            if (c != null) {
+                typesByCategory.get(c).add(t);
+            }
+        }
+        for (List<EntityType<?>> list : typesByCategory.values()) {
+            list.sort(Comparator.comparing(t -> t.getDescription().getString()));
+        }
+    }
+
     private void edit(Runnable r) {
         server.executeBlocking(r);
     }
 
     private <T extends AbstractWidget> T track(T widget) {
-        detail.add(widget);
+        placed.add(new Placed(widget, widget.getY()));
         return addRenderableWidget(widget);
     }
 
@@ -142,55 +189,73 @@ public class MobEditorScreen extends Screen {
         };
     }
 
+    private static Scope mobScope(EntityType<?> t) {
+        return new Scope(ScopeType.MOB_TYPE, BuiltInRegistries.ENTITY_TYPE.getKey(t).toString());
+    }
+
     private static String fmt(double v) {
         return BigDecimal.valueOf(v).stripTrailingZeros().toPlainString();
     }
 
-    private String fit(String text, int width) {
-        return this.font.width(text) <= width ? text : this.font.plainSubstrByWidth(text, width - this.font.width("...")) + "...";
+    private String fit(String text, int w) {
+        return this.font.width(text) <= w ? text : this.font.plainSubstrByWidth(text, Math.max(0, w - this.font.width("..."))) + "...";
     }
 
-    // ------------------------------------------------------------------ scope list
+    // ------------------------------------------------------------------ scope tree
+
+    private boolean matches(Scope s) {
+        return mobFilter.isEmpty() || labelOf(s).getString().toLowerCase().contains(mobFilter);
+    }
 
     private void rebuildScopes() {
+        boolean filtering = !mobFilter.isEmpty();
         List<PickList.Item> items = new ArrayList<>();
-        addScope(items, Scope.WORLD, 0);
-        addScope(items, Scope.ALL, 0);
-        for (MobCategory c : MobCategory.values()) {
-            if (c != MobCategory.MISC) {
-                addScope(items, new Scope(ScopeType.CATEGORY, c.getName()), 1);
-            }
+        if (matches(Scope.WORLD)) {
+            items.add(new ScopeItem(Scope.WORLD, 0, false, false));
         }
-        List<EntityType<?>> types = new ArrayList<>();
-        for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
-            if (t.getCategory() != MobCategory.MISC) {
-                types.add(t);
-            }
+        boolean allOpen = filtering || expanded.contains(Scope.ALL.key());
+        if (!filtering || matches(Scope.ALL)) {
+            items.add(new ScopeItem(Scope.ALL, 0, true, allOpen));
         }
-        types.sort(Comparator.comparing(t -> BuiltInRegistries.ENTITY_TYPE.getKey(t).toString()));
-        for (EntityType<?> t : types) {
-            addScope(items, new Scope(ScopeType.MOB_TYPE, BuiltInRegistries.ENTITY_TYPE.getKey(t).toString()), 2);
+        if (allOpen) {
+            for (String cat : MobGroups.CATEGORIES) {
+                Scope cs = new Scope(ScopeType.CATEGORY, cat);
+                boolean catMatch = matches(cs);
+                List<EntityType<?>> shown = new ArrayList<>();
+                for (EntityType<?> t : typesByCategory.get(cat)) {
+                    if (!filtering || catMatch || matches(mobScope(t))) {
+                        shown.add(t);
+                    }
+                }
+                if (filtering && shown.isEmpty()) {
+                    continue;
+                }
+                boolean open = filtering || expanded.contains(cs.key());
+                items.add(new ScopeItem(cs, 1, true, open));
+                if (open) {
+                    for (EntityType<?> t : shown) {
+                        items.add(new ScopeItem(mobScope(t), 2, false, false));
+                    }
+                }
+            }
         }
         scopeList.setItems(items);
         scopeList.select(scope);
-    }
-
-    private void addScope(List<PickList.Item> items, Scope s, int indent) {
-        Component label = labelOf(s);
-        if (filter.isEmpty() || label.getString().toLowerCase().contains(filter)) {
-            items.add(new ScopeItem(s, label, indent));
-        }
     }
 
     private final class ScopeItem implements PickList.Item {
         private final Scope s;
         private final Component label;
         private final int indent;
+        private final boolean expandable;
+        private final boolean open;
 
-        ScopeItem(Scope s, Component label, int indent) {
+        ScopeItem(Scope s, int level, boolean expandable, boolean open) {
             this.s = s;
-            this.label = label;
-            this.indent = indent * 6;
+            this.label = labelOf(s);
+            this.indent = level * 8;
+            this.expandable = expandable;
+            this.open = open;
         }
 
         @Override
@@ -203,16 +268,25 @@ public class MobEditorScreen extends Screen {
             int n = data.count(s);
             String badge = n > 0 ? String.valueOf(n) : "";
             int badgeW = n > 0 ? f.width(badge) + 4 : 0;
-            g.drawString(f, fit(label.getString(), w - indent - 6 - badgeW), x + 3 + indent, y + (h - 8) / 2 + 1,
-                    n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
+            int ty = y + (h - 8) / 2 + 1;
+            int px = x + 2 + indent;
+            if (expandable) {
+                g.drawString(f, open ? "-" : "+", px + 1, ty, 0xFFAA00, true);
+            }
+            int tx = px + 9;
+            g.drawString(f, fit(label.getString(), w - (tx - x) - 2 - badgeW), tx, ty, n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
             if (n > 0) {
-                g.drawString(f, badge, x + w - f.width(badge) - 2, y + (h - 8) / 2 + 1, 0xFFAA00, true);
+                g.drawString(f, badge, x + w - f.width(badge) - 2, ty, 0xFFAA00, true);
             }
         }
 
         @Override
         public void picked() {
             scope = s;
+            if (expandable && !expanded.remove(s.key())) {
+                expanded.add(s.key());
+            }
+            rebuildScopes();
             rebuildBehaviors();
             rebuildDetail();
         }
@@ -223,16 +297,22 @@ public class MobEditorScreen extends Screen {
     private void rebuildBehaviors() {
         List<PickList.Item> items = new ArrayList<>();
         for (Behavior b : Behaviors.all()) {
-            if (b.scopes().contains(scope.type())) {
+            if (b.scopes().contains(scope.type())
+                    && (behaviorFilter.isEmpty() || b.name().getString().toLowerCase().contains(behaviorFilter))) {
                 items.add(new BehaviorItem(b));
             }
         }
+        boolean changed = false;
         if (behavior != null && !behavior.scopes().contains(scope.type())) {
             behavior = null;
+            changed = true;
         }
         behaviorList.setItems(items);
         if (behavior != null) {
             behaviorList.select(behavior);
+        }
+        if (changed && placed != null && behaviorList != null && stateButton != null) {
+            rebuildDetail();
         }
     }
 
@@ -250,7 +330,7 @@ public class MobEditorScreen extends Screen {
 
         @Override
         public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
-            g.renderFakeItem(new ItemStack(b.icon()), x + 2, y + (h - 16) / 2);
+            g.renderFakeItem(new ItemStack(b.icon()), x + 1, y + (h - 16) / 2);
             Tri own = data.toggle(scope, b);
             Component state;
             int color;
@@ -264,7 +344,7 @@ public class MobEditorScreen extends Screen {
             }
             int stateW = f.width(state);
             int ty = y + (h - 8) / 2 + 1;
-            g.drawString(f, fit(b.name().getString(), w - 24 - stateW - 8), x + 24, ty, 0xFFFFFF, true);
+            g.drawString(f, fit(b.name().getString(), w - 20 - stateW - 6), x + 20, ty, 0xFFFFFF, true);
             g.drawString(f, state, x + w - stateW - 2, ty, color, true);
         }
 
@@ -275,17 +355,19 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    // ------------------------------------------------------------------ detail panel
+    // ------------------------------------------------------------------ detail panel (scrollable)
 
     private void rebuildDetail() {
         setFocused(null); // commits any box being edited, against the behavior it was created for
-        for (AbstractWidget w : detail) {
-            removeWidget(w);
+        for (Placed p : placed) {
+            removeWidget(p.widget());
         }
-        detail.clear();
+        placed.clear();
         rows.clear();
         stateButton = null;
         descLines = List.of();
+        scroll = 0;
+        contentHeight = 0;
         if (behavior == null) {
             return;
         }
@@ -314,6 +396,32 @@ public class MobEditorScreen extends Screen {
             rows.add(new SettingRow(s, y));
             y += 48;
         }
+        contentHeight = y - TOP;
+        layoutDetail();
+    }
+
+    private int maxScroll() {
+        return Math.max(0, contentHeight - (viewBottom() - TOP));
+    }
+
+    /** Moves every detail widget by the scroll offset and hides the ones that would spill out of the panel. */
+    private void layoutDetail() {
+        scroll = Mth.clamp(scroll, 0, maxScroll());
+        for (Placed p : placed) {
+            int y = p.baseY() - scroll;
+            p.widget().setY(y);
+            p.widget().visible = y >= TOP && y + p.widget().getHeight() <= viewBottom();
+        }
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (mouseX >= rx && mouseY >= TOP && mouseY < viewBottom() && maxScroll() > 0) {
+            scroll = Mth.clamp(scroll - (int) (scrollY * 12), 0, maxScroll());
+            layoutDetail();
+            return true;
+        }
+        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
     }
 
     private void refreshState() {
@@ -337,7 +445,7 @@ public class MobEditorScreen extends Screen {
         rebuildDetail();
     }
 
-    /** Number field: greyed hint shows the inherited value; Enter or clicking away applies it, clamped to the max/min. */
+    /** Number field: greyed hint shows the inherited value; Enter or clicking away applies it, clamped to min/max. */
     private final class NumBox extends EditBox {
         private final Scope sc;
         private final Behavior bh;
@@ -415,25 +523,31 @@ public class MobEditorScreen extends Screen {
             g.drawCenteredString(this.font, Component.translatable("mobsmith.screen.readonly"), width / 2, 16, 0xFFAA00);
         }
 
+        // Right column header: scope (with override count) on the first line, behavior on the second.
         int n = data.count(scope);
         Component scopeTitle = labelOf(scope).copy().withStyle(ChatFormatting.RED);
         if (n > 0) {
             scopeTitle = scopeTitle.copy().append(Component.literal(" ")
                     .append(Component.translatable("mobsmith.screen.overrides", n)).withStyle(ChatFormatting.GOLD));
         }
-        g.drawString(this.font, scopeTitle, mx, 34, 0xFFFFFF, true);
-
+        g.enableScissor(rx, 26, rx + rw + 6, TOP - 1);
+        g.drawString(this.font, scopeTitle, rx, 28, 0xFFFFFF, true);
         if (behavior == null) {
-            g.drawString(this.font, Component.translatable("mobsmith.screen.select"), rx, 34, 0xA0A0A0, true);
+            g.drawString(this.font, Component.translatable("mobsmith.screen.select"), rx, 39, 0xA0A0A0, true);
+        } else {
+            g.drawString(this.font, behavior.name().copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
+        }
+        g.disableScissor();
+        if (behavior == null) {
             return;
         }
-        g.drawString(this.font, behavior.name().copy().withStyle(ChatFormatting.RED), rx, 34, 0xFFFFFF, true);
+
+        g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         for (int i = 0; i < descLines.size(); i++) {
-            g.drawString(this.font, descLines.get(i), rx, TOP + 2 + i * 10, 0xC8C8C8, true);
+            g.drawString(this.font, descLines.get(i), rx, TOP + 2 + i * 10 - scroll, 0xC8C8C8, true);
         }
 
-        List<Scope> chain = ConfigResolver.chainFor(scope);
-        ConfigResolver.Toggle t = ConfigResolver.toggleFor(data, chain, behavior);
+        ConfigResolver.Toggle t = ConfigResolver.toggleFor(data, ConfigResolver.chainFor(scope), behavior);
         Component why;
         int whyColor;
         if (t.from() == null) {
@@ -446,16 +560,28 @@ public class MobEditorScreen extends Screen {
             why = Component.translatable("mobsmith.screen.from_other", labelOf(t.from()));
             whyColor = 0xFFFF55;
         }
-        g.drawString(this.font, fit(why.getString(), rw), rx, explainY, whyColor, true);
+        g.drawString(this.font, fit(why.getString(), rw), rx, explainY - scroll, whyColor, true);
 
         for (SettingRow row : rows) {
             Setting s = row.setting();
             boolean set = data.value(scope, behavior, s.key()) != null;
+            int y = row.y() - scroll;
             g.drawString(this.font, Component.translatable("setting.mobsmith." + behavior.id().getPath() + "." + s.key()),
-                    rx, row.y(), set ? 0xFFFFFF : 0xA0A0A0, true);
+                    rx, y, set ? 0xFFFFFF : 0xA0A0A0, true);
             g.drawString(this.font, fit(Component.translatable("mobsmith.screen.info",
                             fmt(s.def()), s.unit(), fmt(s.min()), fmt(s.max())).getString(), rw),
-                    rx, row.y() + 10, 0x808080, true);
+                    rx, y + 10, 0x808080, true);
+        }
+        g.disableScissor();
+
+        // Scrollbar for the right panel
+        int max = maxScroll();
+        if (max > 0) {
+            int view = viewBottom() - TOP;
+            int barH = Math.max(12, view * view / contentHeight);
+            int barY = TOP + (view - barH) * scroll / max;
+            g.fill(width - 7, TOP, width - 4, viewBottom(), 0x66000000);
+            g.fill(width - 7, barY, width - 4, barY + barH, 0xFFAAAAAA);
         }
     }
 

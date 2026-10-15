@@ -15,7 +15,6 @@
   "key.mobsmith.open": "Open Mob Editor",
   "key.categories.mobsmith": "Mobsmith",
   "mobsmith.screen.title": "Mob Editor",
-  "mobsmith.screen.search": "Search...",
   "mobsmith.screen.reset_scope": "Reset This Scope",
   "mobsmith.screen.reset_tip": "Reset to inherit",
   "mobsmith.screen.select": "Select a behavior",
@@ -35,11 +34,9 @@
   "mobsmith.state.inherit_off": "inherit: off",
   "mobsmith.scope.world": "World Rules",
   "mobsmith.scope.all": "All Mobs",
-  "mobsmith.category.monster": "Hostile",
-  "mobsmith.category.creature": "Passive Creatures",
-  "mobsmith.category.ambient": "Ambient",
-  "mobsmith.category.axolotls": "Axolotls",
-  "mobsmith.category.underground_water_creature": "Underground Water",
-  "mobsmith.category.water_creature": "Water Creatures",
-  "mobsmith.category.water_ambient": "Water Ambient"
+  "mobsmith.category.hostile": "Hostile",
+  "mobsmith.category.neutral": "Neutral",
+  "mobsmith.category.passive": "Passive",
+  "mobsmith.screen.search_behaviors": "Search behaviors...",
+  "mobsmith.screen.search": "Search mobs..."
 }
