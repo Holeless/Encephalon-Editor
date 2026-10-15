@@ -44,7 +44,11 @@ import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.FlyingMob;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ambient.Bat;
+import net.minecraft.world.entity.animal.FlyingAnimal;
+import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.SpawnEggItem;
 
@@ -79,6 +83,8 @@ public class MobEditorScreen extends Screen {
     private EntityType<?> previewType;
     private LivingEntity previewEntity;
     private final Set<EntityType<?>> badTypes = new HashSet<>();
+    private long lastTickNanos = System.nanoTime();
+    private boolean tickFailed;
 
     private Scope scope = Scope.ALL;
     private Behavior behavior;
@@ -551,13 +557,41 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ 3D preview
 
+    private static boolean isFlyer(LivingEntity e) {
+        return e instanceof FlyingAnimal || e instanceof FlyingMob || e instanceof Bat || e instanceof EnderDragon;
+    }
+
+    /**
+     * Ticks the preview mob so its own animations run (bat wings, dragon, camel, ...). It lives far above the world and is
+     * nudged forward by the lerp each tick, so the game's own walk-animation code sees it moving and animates it naturally.
+     */
     @Override
     public void tick() {
         super.tick();
+        lastTickNanos = System.nanoTime();
         LivingEntity e = previewEntity;
-        if (e != null && behavior == null) {
-            e.walkAnimation.update(0.5F, 1.0F);
+        if (e == null || behavior != null || this.minecraft.level == null || this.minecraft.player == null) {
+            return;
+        }
+        if (!tickFailed) {
+            try {
+                double hx = this.minecraft.player.getX();
+                double hy = this.minecraft.level.getMaxBuildHeight() + 64;
+                double hz = this.minecraft.player.getZ();
+                e.setPos(hx, hy, hz);
+                e.setOnGround(!isFlyer(e));
+                e.lerpTo(hx, hy, hz - 0.125, 180F, 0F, 1);
+                e.tick();
+                e.setPos(hx, hy, hz);
+            } catch (Exception ex) {
+                tickFailed = true;
+            }
+        }
+        if (tickFailed) {
             e.tickCount++;
+            e.walkAnimation.update(0.5F, 1.0F);
+        } else if (e.walkAnimation.speed(1.0F) < 0.15F) {
+            e.walkAnimation.update(0.5F, 0.4F);
         }
     }
 
@@ -594,6 +628,8 @@ public class MobEditorScreen extends Screen {
             try {
                 Entity e = t.create(this.minecraft.level);
                 if (e instanceof LivingEntity living) {
+                    living.setSilent(true);
+                    tickFailed = false;
                     previewType = t;
                     previewEntity = living;
                     return living;
@@ -606,28 +642,35 @@ public class MobEditorScreen extends Screen {
         return null;
     }
 
-    private void renderPreview(GuiGraphics g, float partial) {
+    private void renderPreview(GuiGraphics g) {
         LivingEntity e = previewEntity();
         if (e == null) {
             return;
         }
+        // The screen's partialTick is a frame delta in 1.21, not a 0..1 fraction, so time it ourselves.
+        float partial = Mth.clamp((System.nanoTime() - lastTickNanos) / 50_000_000F, 0F, 1F);
+
         int top = TOP + 6;
         int bottom = viewBottom() - 16;
         float bbH = Math.max(e.getBbHeight(), 0.4F);
         float bbW = Math.max(e.getBbWidth(), 0.4F);
-        float scale = Math.min(70F, Math.min((bottom - top) * 0.85F / bbH, rw * 0.7F / bbW));
+        // Models are often longer/wider than their hitbox (camel, dragon), so fit against a padded extent.
+        float extentH = Math.max(bbH, bbW * 1.2F);
+        float extentW = e instanceof EnderDragon ? 40F : bbW * 2.2F;
+        float scale = Math.min(55F, Math.min((bottom - top) * 0.7F / extentH, rw * 0.8F / extentW));
         float cx = rx + rw / 2F;
         float feetY = (top + bottom) / 2F + bbH * scale / 2F;
 
-        float yaw = 180F + 35F * (float) Math.sin(Util.getMillis() / 1200.0);
-        e.yBodyRot = yaw;
-        e.yBodyRotO = yaw;
-        e.setYRot(yaw);
-        e.yRotO = yaw;
-        e.yHeadRot = yaw;
-        e.yHeadRotO = yaw;
+        // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
+        e.yBodyRot = 180F;
+        e.yBodyRotO = 180F;
+        e.setYRot(180F);
+        e.yRotO = 180F;
+        e.yHeadRot = 180F;
+        e.yHeadRotO = 180F;
         e.setXRot(0F);
         e.xRotO = 0F;
+        float sway = (float) Math.toRadians(40.0 * Math.sin(Util.getMillis() / 1500.0));
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         PoseStack pose = g.pose();
@@ -636,7 +679,7 @@ public class MobEditorScreen extends Screen {
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
-            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI));
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway));
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
             RenderSystem.runAsFancy(() -> dispatcher.render(e, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880));
@@ -691,7 +734,7 @@ public class MobEditorScreen extends Screen {
         }
         g.disableScissor();
         if (behavior == null) {
-            renderPreview(g, partialTick);
+            renderPreview(g);
             return;
         }
 
