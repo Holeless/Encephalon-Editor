@@ -1,4 +1,4 @@
-# Mobsmith (NeoForge 1.21.1)
+# Encephalon Editor (NeoForge 1.21.1)
 
 Edit mob AI: toggle behaviors and tune their settings for all mobs, a category, a group, a mob type, or a single mob.
 
