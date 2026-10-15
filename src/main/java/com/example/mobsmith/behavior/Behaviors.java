@@ -12,26 +12,20 @@ import com.example.mobsmith.MobsmithMod;
 import com.example.mobsmith.scope.ScopeType;
 
 import net.minecraft.world.item.Item;
-import net.minecraft.world.item.Items;
 
-/** Behavior library. Layers: 0 Reflex, 1 Tactical, 2 Traversal, 3 Combat, 4 Idle. */
+/**
+ * Behavior library (currently empty). Layers: 0 Reflex, 1 Tactical, 2 Traversal, 3 Combat, 4 Idle.
+ * Add one with: public static final Behavior X = register("x", Items.FOO, Archetype.GOAL, MOBS, 3, List.of(...));
+ */
 public final class Behaviors {
     private static final Map<String, Behavior> REGISTRY = new LinkedHashMap<>();
-    private static final Set<ScopeType> WORLD_ONLY = EnumSet.of(ScopeType.WORLD);
-    private static final Set<ScopeType> MOBS = EnumSet.range(ScopeType.ALL, ScopeType.INDIVIDUAL);
-
-    public static final Behavior FAMINE = register("famine", Items.BOWL, Archetype.WORLD_RULE, WORLD_ONLY, 4,
-            List.of(new Setting("multiplier", 1.5, 1.0, 5.0, "x", false)));
-    public static final Behavior BASTION = register("bastion", Items.SHIELD, Archetype.LOADOUT, MOBS, 3,
-            List.of(new Setting("chance", 0.15, 0.0, 1.0, "", false)));
-    public static final Behavior KITING = register("kiting", Items.BOW, Archetype.GOAL, MOBS, 3,
-            List.of(new Setting("backpedal_speed", 1.0, 0.2, 3.0, "x", false),
-                    new Setting("range", 7.0, 1.0, 16.0, "blocks", false)));
+    public static final Set<ScopeType> WORLD_ONLY = EnumSet.of(ScopeType.WORLD);
+    public static final Set<ScopeType> MOBS = EnumSet.range(ScopeType.ALL, ScopeType.INDIVIDUAL);
 
     private Behaviors() {
     }
 
-    private static Behavior register(String path, Item icon, Archetype a, Set<ScopeType> scopes, int layer, List<Setting> settings) {
+    public static Behavior register(String path, Item icon, Archetype a, Set<ScopeType> scopes, int layer, List<Setting> settings) {
         Behavior b = new Behavior(MobsmithMod.id(path), icon, a, scopes, layer, settings);
         REGISTRY.put(path, b);
         return b;

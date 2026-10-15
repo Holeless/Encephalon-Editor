@@ -10,6 +10,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
+import org.joml.Quaternionf;
+
 import com.example.mobsmith.behavior.Behavior;
 import com.example.mobsmith.behavior.Behaviors;
 import com.example.mobsmith.behavior.Setting;
@@ -19,8 +21,11 @@ import com.example.mobsmith.config.Tri;
 import com.example.mobsmith.scope.MobGroups;
 import com.example.mobsmith.scope.Scope;
 import com.example.mobsmith.scope.ScopeType;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.PoseStack;
 
 import net.minecraft.ChatFormatting;
+import net.minecraft.Util;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -28,6 +33,8 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.renderer.Lighting;
+import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
@@ -35,17 +42,22 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.SpawnEggItem;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
- * Middle: behaviors for the selected scope, with a behavior search. Right: scrollable details and settings.
+ * Middle: behaviors for the selected scope, with a behavior search. Right: scrollable details and settings,
+ * or an animated 3D mob preview while no behavior is selected.
  * Singleplayer only for now: it edits the integrated server's MobConfigData directly (networking is a TODO).
  */
 public class MobEditorScreen extends Screen {
     private static final int TOP = 50;
     private static final int BOTTOM_RESERVE = 34;
+    private static final int GREY = 0xAAAAAA; // vanilla ChatFormatting.GRAY
 
     private MinecraftServer server;
     private MobConfigData data;
@@ -60,13 +72,20 @@ public class MobEditorScreen extends Screen {
     private final List<SettingRow> rows = new ArrayList<>();
     private List<FormattedCharSequence> descLines = List.of();
     private final Map<String, List<EntityType<?>>> typesByCategory = new HashMap<>();
+    private final List<EntityType<?>> allTypes = new ArrayList<>();
     private final Set<String> expanded = new HashSet<>(Set.of(Scope.ALL.key()));
+
+    // 3D preview
+    private EntityType<?> previewType;
+    private LivingEntity previewEntity;
+    private final Set<EntityType<?>> badTypes = new HashSet<>();
 
     private Scope scope = Scope.ALL;
     private Behavior behavior;
     private String mobFilter = "";
     private String behaviorFilter = "";
     private int mx;
+    private int mw;
     private int rx;
     private int rw;
     private int explainY;
@@ -120,7 +139,7 @@ public class MobEditorScreen extends Screen {
         buildTypes();
 
         int lw = Mth.clamp(width * 27 / 100, 100, 190);
-        int mw = Mth.clamp(width * 27 / 100, 100, 190);
+        mw = Mth.clamp(width * 27 / 100, 100, 190);
         int lx = 8;
         mx = lx + lw + 6;
         rx = mx + mw + 6;
@@ -145,7 +164,8 @@ public class MobEditorScreen extends Screen {
         });
         addRenderableWidget(behaviorSearch);
 
-        scopeList = addRenderableWidget(new PickList(this.minecraft, lx, TOP, lw, listH, 18));
+        // 20px rows so the 16px spawn egg icons fit inside the selection box.
+        scopeList = addRenderableWidget(new PickList(this.minecraft, lx, TOP, lw, listH, 20));
         behaviorList = addRenderableWidget(new PickList(this.minecraft, mx, TOP, mw, listH, 22));
         rebuildScopes();
         rebuildBehaviors();
@@ -154,6 +174,7 @@ public class MobEditorScreen extends Screen {
 
     private void buildTypes() {
         typesByCategory.clear();
+        allTypes.clear();
         for (String c : MobGroups.CATEGORIES) {
             typesByCategory.put(c, new ArrayList<>());
         }
@@ -163,8 +184,10 @@ public class MobEditorScreen extends Screen {
                 typesByCategory.get(c).add(t);
             }
         }
-        for (List<EntityType<?>> list : typesByCategory.values()) {
+        for (String c : MobGroups.CATEGORIES) {
+            List<EntityType<?>> list = typesByCategory.get(c);
             list.sort(Comparator.comparing(t -> t.getDescription().getString()));
+            allTypes.addAll(list);
         }
     }
 
@@ -249,6 +272,7 @@ public class MobEditorScreen extends Screen {
         private final int indent;
         private final boolean expandable;
         private final boolean open;
+        private final ItemStack egg;
 
         ScopeItem(Scope s, int level, boolean expandable, boolean open) {
             this.s = s;
@@ -256,6 +280,14 @@ public class MobEditorScreen extends Screen {
             this.indent = level * 8;
             this.expandable = expandable;
             this.open = open;
+            ItemStack stack = ItemStack.EMPTY;
+            if (s.type() == ScopeType.MOB_TYPE) {
+                SpawnEggItem item = SpawnEggItem.byId(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id())));
+                if (item != null) {
+                    stack = new ItemStack(item);
+                }
+            }
+            this.egg = stack;
         }
 
         @Override
@@ -270,10 +302,18 @@ public class MobEditorScreen extends Screen {
             int badgeW = n > 0 ? f.width(badge) + 4 : 0;
             int ty = y + (h - 8) / 2 + 1;
             int px = x + 2 + indent;
-            if (expandable) {
-                g.drawString(f, open ? "-" : "+", px + 1, ty, 0xFFAA00, true);
+            int tx;
+            if (s.type() == ScopeType.MOB_TYPE) {
+                if (!egg.isEmpty()) {
+                    g.renderFakeItem(egg, px, y + (h - 16) / 2);
+                }
+                tx = px + 18;
+            } else {
+                if (expandable) {
+                    g.drawString(f, open ? "-" : "+", px + 1, ty, GREY, true);
+                }
+                tx = px + 9;
             }
-            int tx = px + 9;
             g.drawString(f, fit(label.getString(), w - (tx - x) - 2 - badgeW), tx, ty, n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
             if (n > 0) {
                 g.drawString(f, badge, x + w - f.width(badge) - 2, ty, 0xFFAA00, true);
@@ -509,6 +549,114 @@ public class MobEditorScreen extends Screen {
         }
     }
 
+    // ------------------------------------------------------------------ 3D preview
+
+    @Override
+    public void tick() {
+        super.tick();
+        LivingEntity e = previewEntity;
+        if (e != null && behavior == null) {
+            e.walkAnimation.update(0.5F, 1.0F);
+            e.tickCount++;
+        }
+    }
+
+    /** The mob to show: the selected mob type, or a rotating pick from the selected category / all mobs. */
+    private LivingEntity previewEntity() {
+        if (this.minecraft.level == null) {
+            return null;
+        }
+        List<EntityType<?>> list;
+        int start = 0;
+        switch (scope.type()) {
+            case MOB_TYPE -> {
+                list = new ArrayList<>(1);
+                list.add(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())));
+            }
+            case CATEGORY -> list = typesByCategory.getOrDefault(scope.id(), List.of());
+            case ALL -> list = allTypes;
+            default -> list = List.of();
+        }
+        if (list.isEmpty()) {
+            return null;
+        }
+        if (scope.type() != ScopeType.MOB_TYPE) {
+            start = (int) ((Util.getMillis() / 4000L) % list.size());
+        }
+        for (int i = 0; i < list.size(); i++) {
+            EntityType<?> t = list.get((start + i) % list.size());
+            if (t == previewType && previewEntity != null) {
+                return previewEntity;
+            }
+            if (badTypes.contains(t)) {
+                continue;
+            }
+            try {
+                Entity e = t.create(this.minecraft.level);
+                if (e instanceof LivingEntity living) {
+                    previewType = t;
+                    previewEntity = living;
+                    return living;
+                }
+            } catch (Exception ex) {
+                // fall through and blacklist
+            }
+            badTypes.add(t);
+        }
+        return null;
+    }
+
+    private void renderPreview(GuiGraphics g, float partial) {
+        LivingEntity e = previewEntity();
+        if (e == null) {
+            return;
+        }
+        int top = TOP + 6;
+        int bottom = viewBottom() - 16;
+        float bbH = Math.max(e.getBbHeight(), 0.4F);
+        float bbW = Math.max(e.getBbWidth(), 0.4F);
+        float scale = Math.min(70F, Math.min((bottom - top) * 0.85F / bbH, rw * 0.7F / bbW));
+        float cx = rx + rw / 2F;
+        float feetY = (top + bottom) / 2F + bbH * scale / 2F;
+
+        float yaw = 180F + 35F * (float) Math.sin(Util.getMillis() / 1200.0);
+        e.yBodyRot = yaw;
+        e.yBodyRotO = yaw;
+        e.setYRot(yaw);
+        e.yRotO = yaw;
+        e.yHeadRot = yaw;
+        e.yHeadRotO = yaw;
+        e.setXRot(0F);
+        e.xRotO = 0F;
+
+        g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
+        PoseStack pose = g.pose();
+        pose.pushPose();
+        EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
+        try {
+            pose.translate(cx, feetY, 50.0);
+            pose.scale(scale, scale, -scale);
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI));
+            Lighting.setupForEntityInInventory();
+            dispatcher.setRenderShadow(false);
+            RenderSystem.runAsFancy(() -> dispatcher.render(e, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880));
+            g.flush();
+        } catch (Exception ex) {
+            badTypes.add(previewType);
+            previewEntity = null;
+            previewType = null;
+        } finally {
+            dispatcher.setRenderShadow(true);
+            pose.popPose();
+            Lighting.setupFor3DItems();
+        }
+        g.disableScissor();
+
+        if (previewType != null) {
+            g.drawCenteredString(this.font, previewType.getDescription(), (int) cx, viewBottom() - 12, 0xC8C8C8);
+        }
+    }
+
     // ------------------------------------------------------------------ render
 
     @Override
@@ -521,6 +669,10 @@ public class MobEditorScreen extends Screen {
         }
         if (!editable) {
             g.drawCenteredString(this.font, Component.translatable("mobsmith.screen.readonly"), width / 2, 16, 0xFFAA00);
+        }
+        if (behaviorList.children().isEmpty()) {
+            g.drawCenteredString(this.font, Component.translatable("mobsmith.screen.no_behaviors"),
+                    mx + mw / 2, TOP + 12, 0x808080);
         }
 
         // Right column header: scope (with override count) on the first line, behavior on the second.
@@ -539,6 +691,7 @@ public class MobEditorScreen extends Screen {
         }
         g.disableScissor();
         if (behavior == null) {
+            renderPreview(g, partialTick);
             return;
         }
 
@@ -574,14 +727,15 @@ public class MobEditorScreen extends Screen {
         }
         g.disableScissor();
 
-        // Scrollbar for the right panel
+        // Scrollbar for the right panel: spans the whole panel box, same look as the lists.
         int max = maxScroll();
         if (max > 0) {
-            int view = viewBottom() - TOP;
-            int barH = Math.max(12, view * view / contentHeight);
-            int barY = TOP + (view - barH) * scroll / max;
-            g.fill(width - 7, TOP, width - 4, viewBottom(), 0x66000000);
-            g.fill(width - 7, barY, width - 4, barY + barH, 0xFFAAAAAA);
+            int barTop = TOP - 2;
+            int barBottom = viewBottom() + 2;
+            int view = barBottom - barTop;
+            int thumbH = Math.max(32, Math.min(view - 8, view * (viewBottom() - TOP) / contentHeight));
+            int thumbY = barTop + (view - thumbH) * scroll / max;
+            PickList.drawScrollbar(g, width - 7, barTop, barBottom, thumbY, thumbH);
         }
     }
 

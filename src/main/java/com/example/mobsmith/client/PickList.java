@@ -7,9 +7,15 @@ import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.ObjectSelectionList;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
 
 /** A plain scrolling list of items that draw themselves; clicking one selects it and calls picked(). */
 public class PickList extends ObjectSelectionList<PickList.Row> {
+    /** Vanilla grey selection outline (what vanilla uses for an unfocused selected entry). */
+    private static final int SELECT_BORDER = 0xFF808080;
+    private static final int SELECT_FILL = 0xFF2B1111;
+    private static final int SCROLL_W = 6;
+
     public interface Item {
         Object key();
 
@@ -42,9 +48,43 @@ public class PickList extends ObjectSelectionList<PickList.Row> {
         }
     }
 
+    /** Leaves a 6px gutter on the right for the scrollbar plus a 1px gap. */
     @Override
     public int getRowWidth() {
-        return this.width - 24;
+        return this.width - SCROLL_W - 8;
+    }
+
+    @Override
+    protected int getScrollbarPosition() {
+        return getX() + this.width - SCROLL_W;
+    }
+
+    /** Same outline box vanilla draws, but always the vanilla grey and with our dark fill. */
+    @Override
+    protected void renderSelection(GuiGraphics g, int top, int width, int height, int outerColor, int innerColor) {
+        super.renderSelection(g, top, width, height, SELECT_BORDER, SELECT_FILL);
+    }
+
+    @Override
+    public void renderWidget(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+        super.renderWidget(g, mouseX, mouseY, partialTick);
+        int max = getMaxScroll();
+        if (max > 0) {
+            // Cover the vanilla bar and draw one that spans the whole box, separators included.
+            int top = getY() - 2;
+            int bottom = getBottom() + 2;
+            int view = bottom - top;
+            int content = Math.max(1, children().size() * this.itemHeight);
+            int thumbH = Mth.clamp(view * view / content, 32, view - 8);
+            int thumbY = top + (int) (getScrollAmount() * (view - thumbH) / max);
+            drawScrollbar(g, getScrollbarPosition(), top, bottom, thumbY, thumbH);
+        }
+    }
+
+    public static void drawScrollbar(GuiGraphics g, int x, int top, int bottom, int thumbY, int thumbH) {
+        g.fill(x, top, x + SCROLL_W, bottom, 0xFF000000);
+        g.fill(x, thumbY, x + SCROLL_W, thumbY + thumbH, 0xFF808080);
+        g.fill(x, thumbY, x + SCROLL_W - 1, thumbY + thumbH - 1, 0xFFC0C0C0);
     }
 
     public class Row extends ObjectSelectionList.Entry<Row> {
@@ -61,12 +101,11 @@ public class PickList extends ObjectSelectionList<PickList.Row> {
 
         @Override
         public void render(GuiGraphics g, int index, int top, int left, int width, int height, int mouseX, int mouseY, boolean hovering, float partialTick) {
-            if (getSelected() == this) {
-                g.fill(left, top - 2, left + width, top + height + 2, 0x40FF5555);
-            } else if (hovering) {
-                g.fill(left, top - 2, left + width, top + height + 2, 0x20FFFFFF);
+            // The selection box starts 2px left of "left" and is "width" wide, so keep everything inside that.
+            if (hovering && getSelected() != this) {
+                g.fill(left - 2, top - 2, left - 2 + width, top + height + 2, 0x20FFFFFF);
             }
-            item.draw(g, Minecraft.getInstance().font, left, top, width, height);
+            item.draw(g, Minecraft.getInstance().font, left, top, width - 2, height);
         }
 
         @Override
