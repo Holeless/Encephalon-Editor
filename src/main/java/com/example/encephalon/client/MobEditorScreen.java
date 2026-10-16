@@ -1080,7 +1080,10 @@ public class MobEditorScreen extends Screen {
      * with zero velocity jolts from one pose to the other on its first step.
      */
     private static Vec3 previewMotion(LivingEntity e) {
-        return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : 0.0);
+        // Modded land animals get a slow walk too: many mods start their walk animation from the mob's own velocity, not from
+        // the walk state, so a mob with zero velocity would only ever play its idle.
+        boolean moddedWalker = !isVanilla(e.getType()) && !isFlyer(e) && !isFish(e);
+        return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : moddedWalker ? 0.05 : 0.0);
     }
 
     private static boolean isVanilla(EntityType<?> t) {
@@ -2163,6 +2166,11 @@ public class MobEditorScreen extends Screen {
         }
         g.enableScissor(rx, 26, rx + rw + 6, TOP - 1);
         g.drawString(this.font, scopeTitle, rx, 28, 0xFFFFFF, true);
+        if (scope.type() == ScopeType.MOB_TYPE) {
+            // The registry id next to the name tells apart mobs that share a name or look alike.
+            int tw = this.font.width(scopeTitle) + 6;
+            g.drawString(this.font, fit(scope.id(), rw - tw), rx + tw, 28, 0x707070, true);
+        }
         if (behavior == null) {
             g.drawString(this.font, Component.translatable("encephalon.screen.select"), rx, 39, 0xA0A0A0, true);
         } else {

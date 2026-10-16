@@ -1,10 +1,12 @@
 package com.example.encephalon.config;
 
 import java.util.List;
+import java.util.Set;
 
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.EntityType;
 import net.neoforged.neoforge.common.ModConfigSpec;
+import net.neoforged.neoforge.common.Tags;
 
 /** Client config (encephalon-client.toml). */
 public final class EncephalonConfig {
@@ -13,6 +15,15 @@ public final class EncephalonConfig {
     public static final ModConfigSpec.ConfigValue<List<? extends String>> QUIET_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> PART_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> NOT_PART_MOBS;
+
+    /**
+     * Always treated as quiet, whatever the config file says (a config file made by an older version keeps its old list, so
+     * new entries added to the default list would never reach it). Bosses whose own code changes the sky or starts music.
+     */
+    private static final Set<String> BUILT_IN_QUIET = Set.of(
+            "alexscaves:luxtructosaurus", "alexscaves:tremorzilla", "alexscaves:hullbreaker",
+            "bosses_of_mass_destruction:lich", "bosses_of_mass_destruction:gauntlet",
+            "bosses_of_mass_destruction:obsidilith", "bosses_of_mass_destruction:void_blossom");
 
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
@@ -46,10 +57,15 @@ public final class EncephalonConfig {
 
     /** True if the preview should draw this type without ticking it or spawning a server twin for it. */
     public static boolean isQuiet(EntityType<?> type) {
-        if (!SPEC.isLoaded()) {
-            return false;
+        String id = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
+        if (BUILT_IN_QUIET.contains(id)) {
+            return true;
         }
-        return QUIET_MOBS.get().contains(BuiltInRegistries.ENTITY_TYPE.getKey(type).toString());
+        // Modded bosses (anything tagged c:bosses) are quiet too: they are the mobs that tend to change the sky or start music.
+        if (!id.startsWith("minecraft:") && type.is(Tags.EntityTypes.BOSSES)) {
+            return true;
+        }
+        return SPEC.isLoaded() && QUIET_MOBS.get().contains(id);
     }
 
     public static boolean isForcedPart(EntityType<?> type) {
