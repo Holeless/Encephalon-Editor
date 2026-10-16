@@ -88,6 +88,7 @@ import net.minecraft.world.item.SpawnEggItem;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.fml.ModList;
+import net.neoforged.neoforge.common.Tags;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
@@ -118,6 +119,15 @@ public class MobEditorScreen extends Screen {
     // A ghast's tentacles hang far below its hitbox, so like the squid it is drawn smaller and higher.
     private static final float GHAST_EXTENT_H = 6.5F;   // blocks: body plus tentacles
     private static final float GHAST_CENTER_Y = 1F;     // blocks above the ghast's feet where its visual middle sits
+
+    // Huge mobs are never shrunk below the size at which the panel shows this many blocks of height (and about 1.5x as many
+    // of width). A mob bigger than that is clipped by the panel instead of being drawn as a speck. Raise it for bigger
+    // minimum sizes (more clipping), lower it to let huge mobs shrink further.
+    private static final float MIN_BLOCKS_VISIBLE = 16F;
+    // Mobs made of several parts (worms, snakes, leviathans) are shown from a three-quarter angle: this many radians away from
+    // looking straight along their length. Their length mostly runs into the screen, so it costs little width.
+    private static final float GROUP_VIEW_ANGLE = 0.9F;
+    private static final double GROUP_SWAY_DEG = 15.0;
 
     // Shulkers only open when the server tells them to, so the lid is driven by hand. A shulker that sees its position
     // change also plays a 6-tick "slide in from the old spot" animation, which is pinned off.
@@ -914,6 +924,15 @@ public class MobEditorScreen extends Screen {
         return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
     }
 
+    /**
+     * Modded mobs whose own client code must not run for a preview: the ones listed in the mod config (quietMobs) and any
+     * modded boss tagged c:bosses. Boss code tends to start music, sky effects and warnings just because the boss exists.
+     * They are drawn but never ticked (their model animation does not need it) and get no server twin from the config list.
+     */
+    private static boolean isQuiet(EntityType<?> t) {
+        return !isVanilla(t) && (EncephalonConfig.isQuiet(t) || t.is(Tags.EntityTypes.BOSSES));
+    }
+
     private static Field field(Class<?> owner, String name) {
         try {
             Field f = owner.getDeclaredField(name);
@@ -1287,7 +1306,7 @@ public class MobEditorScreen extends Screen {
             return null;
         }
         int slot = -1;
-        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t)) {
+        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && !EncephalonConfig.isQuiet(t)) {
             slot = takeSlot(evict);
             if (slot < 0 && !evict) {
                 return null; // no room to warm it yet
@@ -1591,7 +1610,10 @@ public class MobEditorScreen extends Screen {
         p.warmTicks++;
         // A modded fish is not ticked at all: the game resets the water flag to dry at the start of every tick, before the
         // mod's own tick code runs, and code like "if (!isInWaterOrBubble()) onLandProgress++" then lays the model on its side.
-        boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN) || (!isVanilla(e.getType()) && isFish(e));
+        // Quiet mobs (configured, or modded bosses) are not ticked either: their client tick code can start boss music or
+        // change the sky, which a preview must never do.
+        boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN) || (!isVanilla(e.getType()) && isFish(e))
+                || isQuiet(e.getType());
         if (!p.tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
                 double hx = p.ax;
@@ -1710,7 +1732,10 @@ public class MobEditorScreen extends Screen {
     private static final Map<String, ModLogo> LOGOS = new HashMap<>();
     private static LogoRenderer mcLogo;
 
-    /** The mod's own logo (the one the mod list shows), loaded once. Null if it has none. */
+    /**
+     * The mod's own logo (the one the mod list shows), loaded once. Null if it has none. Small logos are enlarged with a
+     * smooth filter first (see LogoUpscaler) so they do not turn into big blocky blurs when drawn large.
+     */
     private static ModLogo logoOf(String modId) {
         if (LOGOS.containsKey(modId)) {
             return LOGOS.get(modId);
@@ -1721,7 +1746,11 @@ public class MobEditorScreen extends Screen {
             if (info != null && info.getLogoFile().isPresent()) {
                 Path path = info.getOwningFile().getFile().findResource(info.getLogoFile().get());
                 try (InputStream in = Files.newInputStream(path)) {
-                    NativeImage img = NativeImage.read(in);
+                    NativeImage raw = NativeImage.read(in);
+                    NativeImage img = LogoUpscaler.smooth(raw);
+                    if (img != raw) {
+                        raw.close();
+                    }
                     int w = img.getWidth();
                     int h = img.getHeight();
                     DynamicTexture tex = new DynamicTexture(img);
@@ -1775,6 +1804,7 @@ public class MobEditorScreen extends Screen {
             return;
         }
         float box = Math.min(Math.min(rw - 24, (bottom - top) - 24), 192);
+        // The texture is already enlarged to a good size, so just fit it into the box (never past 2x its own size).
         float s = Math.min(box / Math.max(logo.w(), logo.h()), 2F);
         int dw = Math.max(1, Math.round(logo.w() * s));
         int dh = Math.max(1, Math.round(logo.h() * s));
@@ -1842,11 +1872,12 @@ public class MobEditorScreen extends Screen {
             }
         }
 
-        // When the mob has companions (body segments, a detached head) the whole group is fitted and centred, and turned
-        // side-on so a long body is seen along its length.
+        // When the mob has companions (body segments, a detached head) the whole group is fitted and centred. It is turned
+        // three-quarters on: a long body mostly runs into the screen, so it takes far less width than seen from the side.
         boolean group = !extras.isEmpty();
         float pivotX = 0F;
         float pivotZ = 0F;
+        float viewYaw = 0F;
         if (group) {
             double minX = -bbW / 2.0;
             double maxX = bbW / 2.0;
@@ -1865,11 +1896,31 @@ public class MobEditorScreen extends Screen {
             }
             pivotX = (float) ((minX + maxX) / 2.0);
             pivotZ = (float) ((minZ + maxZ) / 2.0);
+            double ex = maxX - minX;
+            double ez = maxZ - minZ;
+            // The long axis is the one that should run into the screen.
+            viewYaw = ex > ez ? (float) (Math.PI / 2.0 - GROUP_VIEW_ANGLE) : GROUP_VIEW_ANGLE;
+            double swayRad = Math.toRadians(GROUP_SWAY_DEG);
+            double worstW = 0.0;
+            for (int k = -1; k <= 1; k++) {
+                double a = viewYaw + k * swayRad;
+                worstW = Math.max(worstW, ex * Math.abs(Math.cos(a)) + ez * Math.abs(Math.sin(a)));
+            }
             extentH = Math.max(extentH, (float) (maxY - minY));
-            extentW = (float) Math.hypot(maxX - minX, maxZ - minZ) + bbW;
+            extentW = (float) worstW + bbW;
             centerY = (float) ((minY + maxY) / 2.0);
         }
-        float scale = Math.min(55F, Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW));
+        // Never shrink a huge mob to a speck: below the minimum size the panel clips it instead.
+        float fit = Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW);
+        float minScale = (bottom - top) / MIN_BLOCKS_VISIBLE;
+        boolean clipped = fit < minScale;
+        float scale = Math.min(55F, Math.max(fit, minScale));
+        if (group && clipped) {
+            // Part of the group is going to be cut off: keep the main mob (the head) near the middle rather than the middle
+            // of a body that is mostly off-screen.
+            pivotX *= 0.4F;
+            pivotZ *= 0.4F;
+        }
         float cx = rx + rw / 2F;
         float feetY = (top + bottom) / 2F + centerY * scale;
 
@@ -1877,8 +1928,8 @@ public class MobEditorScreen extends Screen {
         faceViewer(e);
         forceWet(e); // the fish renderer lays fish on their side unless they are in water
         e.setInvisible(false);
-        float sway = (float) Math.toRadians((dragon ? 12.0 : 40.0) * Math.sin(Util.getMillis() / 1500.0));
-        float sideOn = group ? (float) (Math.PI / 2.0) : 0F;
+        double swayDeg = group ? GROUP_SWAY_DEG : dragon ? 12.0 : 40.0;
+        float sway = (float) Math.toRadians(swayDeg * Math.sin(Util.getMillis() / 1500.0));
         final float px = pivotX;
         final float pz = pivotZ;
         final List<Entity> drawExtras = extras;
@@ -1891,7 +1942,7 @@ public class MobEditorScreen extends Screen {
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
-            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + sideOn + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + viewYaw + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
             pose.translate(-px, 0.0F, -pz); // turn around the middle of the group, not the head
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
