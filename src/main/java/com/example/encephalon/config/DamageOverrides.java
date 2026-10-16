@@ -14,9 +14,11 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.entity.living.LivingIncomingDamageEvent;
 
 /**
- * Applies the damage set in the Mob Editor. The value is the damage on Normal difficulty; against players it is scaled the way
- * vanilla scales mob damage (Easy less, Hard more). Also keeps mobs set to Passive from hurting anyone in melee, and notes who
- * hurt a mob (a Neutral mob keeps fighting whoever provoked it).
+ * Applies the attack damage set in the Mob Editor. Melee and other attacks that hurt: the value is the damage on Normal
+ * difficulty; against players it is scaled the way vanilla scales mob damage (Easy less, Hard more). Explosions (a creeper):
+ * the value is the most the blast does at point blank, and the damage the victim really takes is scaled by value / default, so
+ * the fall-off with distance and the difficulty scaling stay as they are. Also keeps mobs set to Passive from hurting anyone in
+ * melee, and notes who hurt a mob (a Neutral mob keeps fighting whoever provoked it).
  */
 @EventBusSubscriber(modid = EncephalonMod.MOD_ID)
 public final class DamageOverrides {
@@ -51,6 +53,13 @@ public final class DamageOverrides {
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(attacker.getType()).toString();
         Double v = MobConfigData.get(server).damage(id, attack);
         if (v == null) {
+            return;
+        }
+        if (DamageDefaults.EXPLOSION.equals(attack)) {
+            double def = DamageDefaults.explosionMax(attacker);
+            if (def > 0.0) {
+                event.setAmount((float) (event.getAmount() * v / def));
+            }
             return;
         }
         double amount = v;

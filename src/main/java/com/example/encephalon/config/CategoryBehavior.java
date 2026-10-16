@@ -11,10 +11,12 @@ import com.example.encephalon.scope.MobGroups;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.PathfinderMob;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
 import net.minecraft.world.entity.ai.goal.RangedAttackGoal;
@@ -23,6 +25,7 @@ import net.minecraft.world.entity.ai.goal.RangedCrossbowAttackGoal;
 import net.minecraft.world.entity.ai.goal.WrappedGoal;
 import net.minecraft.world.entity.ai.goal.target.HurtByTargetGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
+import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.player.Player;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -38,6 +41,11 @@ import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
  * Only a category that differs from the mob's default one changes anything. A mob that is made to attack but has no attack of
  * its own gets a melee goal; its damage is its default damage (see DamageDefaults). The goals are added once to a mob and check
  * the setting every time they are asked, so changing or resetting the category takes effect at once, on mobs that already exist.
+ * <p>
+ * The chase speed of that melee goal is worked out from the mob's own walking speed (see chaseSpeed), so a mob that walks
+ * slowly because its goals and behaviors use a small speed factor (a villager: base speed 0.5, walks at about half of it) does
+ * not sprint after its target. Brain-driven mobs (villagers, piglins) also have their brain's walk target cleared while the
+ * melee goal is moving them, so the brain and the goal do not fight over the path.
  */
 @EventBusSubscriber(modid = EncephalonMod.MOD_ID)
 public final class CategoryBehavior {
@@ -45,6 +53,8 @@ public final class CategoryBehavior {
     private static final Map<Mob, Boolean> ARMED = Collections.synchronizedMap(new WeakHashMap<>());
     /** Neutral mobs: who they were provoked by. */
     private static final Map<Mob, UUID> PROVOKED = Collections.synchronizedMap(new WeakHashMap<>());
+    /** Blocks per tick (speed attribute times the goal's speed factor) a mob chases at: about a spider's pace. */
+    private static final double CHASE_SPEED = 0.3;
 
     private CategoryBehavior() {
     }
@@ -90,6 +100,31 @@ public final class CategoryBehavior {
             }
         }
         return false;
+    }
+
+    /**
+     * The speed factor the melee goal chases with. The goal's factor multiplies the mob's speed attribute, and that attribute
+     * differs a lot between mobs (a zombie 0.23, a villager 0.5, which its brain then walks at half of), so a fixed factor made
+     * a hostile villager more than twice as fast as a zombie. The factor is chosen so that attribute times factor is about
+     * CHASE_SPEED, and never above the 1.2 that was used before.
+     */
+    private static double chaseSpeed(PathfinderMob mob) {
+        double base = mob.getAttributeValue(Attributes.MOVEMENT_SPEED);
+        if (base <= 0.0) {
+            return 1.0;
+        }
+        return Mth.clamp(CHASE_SPEED / base, 0.3, 1.2);
+    }
+
+    /** Brain-driven mobs: drops the walk target the brain would start walking to, so it does not take the path over from the goal. */
+    private static void clearBrainWalk(Mob mob) {
+        try {
+            if (mob.getBrain().hasMemoryValue(MemoryModuleType.WALK_TARGET)) {
+                mob.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
+            }
+        } catch (RuntimeException ex) {
+            // a brain without that memory: nothing to clear
+        }
     }
 
     /** Adds the editor's goals to a mob (once). */
@@ -195,7 +230,7 @@ public final class CategoryBehavior {
     /** Melee attack for a mob that has none of its own. */
     private static final class Bite extends MeleeAttackGoal {
         Bite(PathfinderMob mob) {
-            super(mob, 1.2D, true);
+            super(mob, chaseSpeed(mob), true);
         }
 
         private boolean on() {
@@ -211,6 +246,12 @@ public final class CategoryBehavior {
         @Override
         public boolean canContinueToUse() {
             return on() && super.canContinueToUse();
+        }
+
+        @Override
+        public void tick() {
+            clearBrainWalk(this.mob);
+            super.tick();
         }
     }
 }
