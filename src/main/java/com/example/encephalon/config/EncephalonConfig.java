@@ -16,6 +16,7 @@ public final class EncephalonConfig {
     public static final ModConfigSpec.ConfigValue<List<? extends String>> QUIET_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> PART_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> NOT_PART_MOBS;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> NO_TWIN_MODS;
 
     /**
      * Always treated as quiet, whatever the config file says (a config file made by an older version keeps its old list, so
@@ -28,6 +29,13 @@ public final class EncephalonConfig {
 
     /** Never treated as a body part of a preview mob, whatever the config file says (a portal would be drawn and could do harm). */
     private static final Set<String> BUILT_IN_NOT_PART = Set.of("alexsmobs:void_portal");
+
+    /**
+     * Mods whose mobs are single entities (no body segments or detached heads), so they never get a hidden server twin in the
+     * preview. Making a twin costs a blocking round trip to the server plus a fast-forward of up to 48 server ticks, which is
+     * wasted (and can stall the game for big mobs) when there is nothing for it to build.
+     */
+    private static final Set<String> BUILT_IN_NO_TWIN_MODS = Set.of("naturalist");
 
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
@@ -57,6 +65,12 @@ public final class EncephalonConfig {
                 .comment("Entity ids that the preview must never treat as a body part: minions or helpers that a mob spawns with.",
                         "Anything listed here is removed when a preview mob creates it. Example: [\"somemod:minion\"]")
                 .defineListAllowEmpty("notPartMobs", List.of(), () -> "modid:entity", o -> o instanceof String);
+        NO_TWIN_MODS = b
+                .comment("Mod ids whose mobs never get a hidden server twin in the preview (the model is still drawn and ticked on",
+                        "the client). A twin is only needed by mods that build one mob out of several entities (the Void Worm's",
+                        "segments). For ordinary single-entity mobs it only costs time, and for big mobs it can freeze the game.",
+                        "\"naturalist\" is always on this list. Example: [\"somemod\"]")
+                .defineListAllowEmpty("noTwinMods", List.of(), () -> "modid", o -> o instanceof String);
         SPEC = b.build();
     }
 
@@ -68,6 +82,12 @@ public final class EncephalonConfig {
     public static boolean isQuietListed(EntityType<?> type) {
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
         return BUILT_IN_QUIET.contains(id) || (SPEC.isLoaded() && QUIET_MOBS.get().contains(id));
+    }
+
+    /** True if this type comes from a mod that is known (or configured) to need no server twin. */
+    public static boolean isNoTwinMod(EntityType<?> type) {
+        String ns = BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace();
+        return BUILT_IN_NO_TWIN_MODS.contains(ns) || (SPEC.isLoaded() && NO_TWIN_MODS.get().contains(ns));
     }
 
     public static boolean bossTwins() {
