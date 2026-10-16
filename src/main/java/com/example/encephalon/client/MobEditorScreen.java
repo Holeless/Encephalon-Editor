@@ -121,7 +121,11 @@ public class MobEditorScreen extends Screen {
     // How much of the panel a measured modded mob may fill (the measurement is accurate, so little padding is needed). The
     // panel it is fitted to stops above the name label, so nothing overlaps the text.
     private static final float FILL_H = 0.90F;
-    private static final float MAX_FIT_SCALE = 80F;     // pixels per block at most for a measured modded mob (small ones are enlarged)
+    // Mobs are never drawn bigger than this many pixels per block (a zombie-sized mob is already drawn about this big)...
+    private static final float MAX_FIT_SCALE = 55F;
+    // ...unless they are microscopic: a mob whose core size would come out smaller than this many pixels is enlarged until
+    // it is that big (so a 0.3 block mob is visible, but a normal small mob is left at its natural size).
+    private static final float MIN_SHOWN_PX = 30F;
     private static final int LABEL_STRIP = 18;          // pixels kept free above the bottom of the panel for the name label
     private static final float FILL_W = 0.95F;
     private static final float GROUP_VIEW_ANGLE = 0.55F;
@@ -189,6 +193,9 @@ public class MobEditorScreen extends Screen {
     private final List<Placed> placed = new ArrayList<>();
     private final List<SettingRow> rows = new ArrayList<>();
     private List<FormattedCharSequence> descLines = List.of();
+    /** Warning shown for internal mobs (body parts and the like) at the top of the right panel. */
+    private List<FormattedCharSequence> warnLines = List.of();
+    private int warnH;
     /** Vanilla mobs by category (hostile / neutral / passive). */
     private final Map<String, List<EntityType<?>>> vanillaByCategory = new HashMap<>();
     /** Modded mobs by mod id (sorted by mod name), then by category. */
@@ -263,6 +270,30 @@ public class MobEditorScreen extends Screen {
         float[] snap;
         int stableTicks;
         boolean stable;
+        // The space the settled companions (body segments) have ever occupied, in blocks from the anchor: minX, minY, minZ,
+        // maxX, maxY, maxZ. It only grows, so a worm that wiggles does not make the fit (and the zoom) wiggle with it.
+        final float[] env = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
+        boolean hasEnv;
+        // Once a mob has been shown as "elongated" it stays that way, and keeps its long axis, so it never flips back and forth.
+        boolean elongLatched;
+        boolean longX;
+
+        /** Adds every companion (not just the ones that are drawn) to the envelope, once the group has settled. */
+        void growEnv(List<Entity> companions) {
+            if (!settled) {
+                return;
+            }
+            for (Entity c : companions) {
+                AABB b = c.getBoundingBox();
+                env[0] = Math.min(env[0], (float) (b.minX - ax));
+                env[1] = Math.min(env[1], (float) (b.minY - ay));
+                env[2] = Math.min(env[2], (float) (b.minZ - az));
+                env[3] = Math.max(env[3], (float) (b.maxX - ax));
+                env[4] = Math.max(env[4], (float) (b.maxY - ay));
+                env[5] = Math.max(env[5], (float) (b.maxZ - az));
+                hasEnv = true;
+            }
+        }
 
         Preview(EntityType<?> type, LivingEntity entity, double ay, int slot) {
             this.type = type;
@@ -677,6 +708,7 @@ public class MobEditorScreen extends Screen {
         private final boolean expandable;
         private final boolean open;
         private final ItemStack egg;
+        private final boolean internal;
 
         ScopeItem(Scope s, int level, boolean expandable, boolean open) {
             this.s = s;
@@ -692,6 +724,8 @@ public class MobEditorScreen extends Screen {
                 }
             }
             this.egg = stack;
+            this.internal = s.type() == ScopeType.MOB_TYPE
+                    && listing.isInternal(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id())));
         }
 
         @Override
@@ -718,7 +752,7 @@ public class MobEditorScreen extends Screen {
                 }
                 tx = px + 9;
             }
-            g.drawString(f, fit(label.getString(), w - (tx - x) - 2 - badgeW), tx, ty, n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
+            g.drawString(f, fit(label.getString(), w - (tx - x) - 2 - badgeW), tx, ty, internal ? 0xFFB060 : n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
             if (n > 0) {
                 g.drawString(f, badge, x + w - f.width(badge) - 2, ty, 0xFFAA00, true);
             }
@@ -819,12 +853,14 @@ public class MobEditorScreen extends Screen {
         descLines = List.of();
         scroll = 0;
         contentHeight = 0;
+        warnLines = internalScope() ? this.font.split(Component.translatable("encephalon.screen.internal_warning"), rw) : List.of();
+        warnH = warnLines.isEmpty() ? 0 : warnLines.size() * 10 + 6;
         if (behavior == null) {
             return;
         }
 
         descLines = this.font.split(behavior.description(), rw);
-        int y = TOP + 2 + descLines.size() * 10 + 8;
+        int y = TOP + 2 + warnH + descLines.size() * 10 + 8;
         stateButton = track(Button.builder(Component.empty(), b -> cycleState()).bounds(rx, y, rw, 20).build());
         stateButton.active = editable;
         refreshState();
@@ -849,6 +885,20 @@ public class MobEditorScreen extends Screen {
         }
         contentHeight = y - TOP;
         layoutDetail();
+    }
+
+    /** True when the selected scope is a mob that is only listed because "show hidden / internal mobs" is on. */
+    private boolean internalScope() {
+        if (scope.type() != ScopeType.MOB_TYPE || listing == null) {
+            return false;
+        }
+        return listing.isInternal(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())));
+    }
+
+    private void drawWarning(GuiGraphics g, int scrollOffset) {
+        for (int i = 0; i < warnLines.size(); i++) {
+            g.drawString(this.font, warnLines.get(i), rx, TOP + 2 + i * 10 - scrollOffset, 0xFFAA00, true);
+        }
     }
 
     private int maxScroll() {
@@ -1522,6 +1572,7 @@ public class MobEditorScreen extends Screen {
                 p.firstRender = now;
             }
             List<Entity> raw = rawCompanions(p);
+            p.growEnv(raw);
             if (!warmedUp(p)) {
                 if (!fastForward(g, p, raw, realPartial)) {
                     badTypes.add(p.type);
@@ -1888,6 +1939,7 @@ public class MobEditorScreen extends Screen {
         float partial = (now - p.sim) / (float) TICK_NANOS;
 
         List<Entity> raw = rawCompanions(p);
+        p.growEnv(raw);
         // Companions are only drawn together once the group has settled; until then they are just warmed up hidden.
         List<Entity> extras = p.settled && !raw.isEmpty() ? (raw.size() > 64 ? raw.subList(0, 64) : raw) : List.of();
         boolean visible = revealable(p);
@@ -1897,8 +1949,8 @@ public class MobEditorScreen extends Screen {
         boolean dragon = e instanceof EnderDragon;
         boolean modded = !isVanilla(p.type);
         boolean measured = modded && p.hasMeasure();
-        boolean fitNew = modded && (measured || !extras.isEmpty());
-        int top = TOP + 6;
+        boolean fitNew = modded && (measured || p.hasEnv);
+        int top = TOP + 6 + warnH;
         int bottom = viewBottom() - (fitNew ? LABEL_STRIP : 16);
         float panelH = bottom - top;
         double swayDeg = dragon ? 12.0 : 40.0;
@@ -1928,27 +1980,32 @@ public class MobEditorScreen extends Screen {
                 minZ = r[0];
                 maxZ = r[1];
             }
-            for (Entity c : extras) {
-                AABB b = c.getBoundingBox();
-                minX = (float) Math.min(minX, b.minX - p.ax);
-                maxX = (float) Math.max(maxX, b.maxX - p.ax);
-                minY = (float) Math.min(minY, b.minY - p.ay);
-                maxY = (float) Math.max(maxY, b.maxY - p.ay);
-                minZ = (float) Math.min(minZ, b.minZ - p.az);
-                maxZ = (float) Math.max(maxZ, b.maxZ - p.az);
+            if (p.hasEnv) {
+                minX = Math.min(minX, p.env[0]);
+                minY = Math.min(minY, p.env[1]);
+                minZ = Math.min(minZ, p.env[2]);
+                maxX = Math.max(maxX, p.env[3]);
+                maxY = Math.max(maxY, p.env[4]);
+                maxZ = Math.max(maxZ, p.env[5]);
             }
             float spanH = Math.max(maxY - minY, 0.4F);
             float spanX = Math.max(maxX - minX, 0.4F);
             float spanZ = Math.max(maxZ - minZ, 0.4F);
             float core = Math.max(spanH, Math.min(spanX, spanZ));  // the size that must look right: height or thickness
             float longest = Math.max(spanX, spanZ);
-            boolean elongated = longest > ELONGATED_RATIO * core;
+            boolean elongatedNow = longest > ELONGATED_RATIO * core;
+            boolean elongated = p.elongLatched || elongatedNow;
+            boolean longX = p.elongLatched ? p.longX : spanX > spanZ;
+            if (visible && elongatedNow && !p.elongLatched) {
+                p.elongLatched = true;
+                p.longX = longX;
+            }
             float cap = elongated ? LENGTH_CAP * core : longest;    // how much of the length is fitted
             float fitX = Math.min(spanX, cap);
             float fitZ = Math.min(spanZ, cap);
             if (elongated) {
                 // Turn it so the long axis mostly runs into the screen.
-                tYaw = spanX > spanZ ? (float) (Math.PI / 2.0 - GROUP_VIEW_ANGLE) : GROUP_VIEW_ANGLE;
+                tYaw = longX ? (float) (Math.PI / 2.0 - GROUP_VIEW_ANGLE) : GROUP_VIEW_ANGLE;
                 swayDeg = GROUP_SWAY_DEG;
             }
             double swayRad = Math.toRadians(swayDeg);
@@ -1957,19 +2014,19 @@ public class MobEditorScreen extends Screen {
                 double a = tYaw + k * swayRad;
                 worstW = Math.max(worstW, fitX * Math.abs(Math.cos(a)) + fitZ * Math.abs(Math.sin(a)));
             }
-            if (!elongated && measured && extras.isEmpty()) {
+            if (!elongated && measured && !p.hasEnv) {
                 // A round mob is narrower than its box: turning it about the middle of the box, no vertex gets farther from
                 // the middle than the farthest one is from the anchor plus the offset of the middle.
                 double radial = 2.0 * (p.radius() + Math.hypot((minX + maxX) / 2.0, (minZ + maxZ) / 2.0));
                 worstW = Math.min(worstW, Math.max(radial, spanH * 0.0 + 0.4));
             }
-            tScale = Math.min(MAX_FIT_SCALE, Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
+            tScale = Math.min(Math.max(MAX_FIT_SCALE, MIN_SHOWN_PX / core), Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
             tCenterY = (minY + maxY) / 2F;
             tPivX = (minX + maxX) / 2F;
             tPivZ = (minZ + maxZ) / 2F;
             if (elongated && longest > cap) {
                 // Part of the length will be cut off: keep the end the mob's own origin (its head) is in on screen.
-                if (spanX > spanZ) {
+                if (longX) {
                     tPivX = Mth.clamp(0F, minX + cap / 2F, maxX - cap / 2F);
                 } else {
                     tPivZ = Mth.clamp(0F, minZ + cap / 2F, maxZ - cap / 2F);
@@ -2001,7 +2058,7 @@ public class MobEditorScreen extends Screen {
                     : e instanceof Squid ? SQUID_CENTER_Y
                     : e instanceof Ghast ? GHAST_CENTER_Y
                     : bbH / 2F;
-            tScale = Math.min(55F, Math.min(panelH * fillH / extentH, rw * fillW / extentW));
+            tScale = Math.min(Math.max(MAX_FIT_SCALE, MIN_SHOWN_PX / extentH), Math.min(panelH * fillH / extentH, rw * fillW / extentW));
         }
 
         if (p.sScale < 0F || !visible) { // while it is not shown yet there is nothing to ease
@@ -2103,6 +2160,9 @@ public class MobEditorScreen extends Screen {
         g.disableScissor();
         if (behavior == null) {
             renderPreview(g, partialTick);
+            g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
+            drawWarning(g, 0);
+            g.disableScissor();
             return;
         }
         // No preview while a behavior is open, but mobs in view keep warming up in the background.
@@ -2110,8 +2170,9 @@ public class MobEditorScreen extends Screen {
         pumpWarm(g, partialTick);
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
+        drawWarning(g, scroll);
         for (int i = 0; i < descLines.size(); i++) {
-            g.drawString(this.font, descLines.get(i), rx, TOP + 2 + i * 10 - scroll, 0xC8C8C8, true);
+            g.drawString(this.font, descLines.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
         }
 
         ConfigResolver.Toggle t = ConfigResolver.toggleFor(data, ConfigResolver.chainFor(scope), behavior);

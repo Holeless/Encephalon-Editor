@@ -112,9 +112,18 @@ final class MobListing {
     }
 
     boolean isListed(EntityType<?> t) {
-        if (EncephalonConfig.showMobsWithoutEgg()) {
-            return true;
-        }
+        return EncephalonConfig.showMobsWithoutEgg() || normallyListed(t);
+    }
+
+    /**
+     * True for mobs that are only in the list because showMobsWithoutEgg is on (no usable egg, no natural spawn): body parts,
+     * helpers and other internal entities. Also true for anything the user put in partMobs.
+     */
+    boolean isInternal(EntityType<?> t) {
+        return !normallyListed(t) || EncephalonConfig.isForcedPart(t);
+    }
+
+    private boolean normallyListed(EntityType<?> t) {
         ResourceLocation key = BuiltInRegistries.ENTITY_TYPE.getKey(t);
         Item egg = SpawnEggItem.byId(t);
         if (key.getNamespace().equals("minecraft")) {
