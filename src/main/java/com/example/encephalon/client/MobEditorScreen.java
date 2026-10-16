@@ -180,6 +180,13 @@ public class MobEditorScreen extends Screen {
     private final Set<EntityType<?>> noServerTwin = new HashSet<>();
     private boolean twinActive;
     private int twinId = -1;
+    // Companions are spawned all at once at their starting spots and then drift into place (the Void Worm even staggers
+    // them out of a portal), which looks like pieces popping in. They are only drawn once the group has stopped changing.
+    private static final int SETTLE_STABLE_TICKS = 30;  // the number of companions must not change for this long
+    private static final int SETTLE_MIN_TICKS = 70;      // and at least this long must have passed since the twin spawned
+    private long twinStartTick;
+    private int lastCompanionCount = -1;
+    private long companionCountChangedTick;
 
     private Scope scope = Scope.VANILLA;
     private Behavior behavior;
@@ -838,6 +845,7 @@ public class MobEditorScreen extends Screen {
         final double z = anchorZ;
         final AABB box = twinBox();
         final int[] id = {-1};
+        PreviewZone.zone = box;
         try {
             server.executeBlocking(() -> {
                 ServerLevel sl = server.getLevel(dim);
@@ -876,10 +884,14 @@ public class MobEditorScreen extends Screen {
         }
         if (id[0] == -1) {
             noServerTwin.add(type);
+            PreviewZone.zone = null;
             return;
         }
         twinId = id[0];
         twinActive = true;
+        twinStartTick = this.minecraft.level.getGameTime();
+        lastCompanionCount = -1;
+        companionCountChangedTick = twinStartTick;
     }
 
     /** Removes the twin and everything it spawned. */
@@ -890,6 +902,7 @@ public class MobEditorScreen extends Screen {
         twinActive = false;
         twinId = -1;
         if (server == null || this.minecraft.level == null) {
+            PreviewZone.zone = null;
             return;
         }
         var dim = this.minecraft.level.dimension();
@@ -904,6 +917,7 @@ public class MobEditorScreen extends Screen {
         } catch (RuntimeException ex) {
             EncephalonMod.LOGGER.warn("Mob Editor preview: could not remove the server twin", ex);
         }
+        PreviewZone.zone = null;
     }
 
     /** Entities around the preview mob that belong to it: parts, a head, tails. The twin's own client copy is skipped. */
@@ -911,8 +925,18 @@ public class MobEditorScreen extends Screen {
         if (!twinActive || this.minecraft.level == null) {
             return List.of();
         }
+        // Living entities only: those are the segments and heads. Other things the mob makes (the Void Worm's portal) are
+        // effects of the twin standing still up there, not part of the mob.
         List<Entity> found = this.minecraft.level.getEntities((Entity) null, twinBox(),
-                en -> en.getId() != twinId && en != previewEntity && en != this.minecraft.player);
+                en -> en instanceof LivingEntity && en.getId() != twinId && en != previewEntity && en != this.minecraft.player);
+        long now = this.minecraft.level.getGameTime();
+        if (found.size() != lastCompanionCount) {
+            lastCompanionCount = found.size();
+            companionCountChangedTick = now;
+        }
+        if (now - companionCountChangedTick < SETTLE_STABLE_TICKS || now - twinStartTick < SETTLE_MIN_TICKS) {
+            return List.of();
+        }
         return found.size() > 64 ? found.subList(0, 64) : found;
     }
 
