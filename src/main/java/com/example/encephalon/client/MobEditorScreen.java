@@ -14,10 +14,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
 import org.joml.Matrix4f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
@@ -34,7 +30,6 @@ import com.example.encephalon.scope.MobGroups;
 import com.example.encephalon.scope.Scope;
 import com.example.encephalon.scope.ScopeType;
 import com.mojang.blaze3d.platform.Lighting;
-import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -52,7 +47,6 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
-import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
@@ -100,9 +94,6 @@ public class MobEditorScreen extends Screen {
     private static final int TOP = 50;
     private static final int BOTTOM_RESERVE = 34;
     private static final int GREY = 0xAAAAAA; // vanilla ChatFormatting.GRAY
-
-    /** Mobs without a spawn egg that are still always listed (vanilla has no egg for these). */
-    private static final Set<String> ALWAYS_LISTED = Set.of("ender_dragon", "wither", "iron_golem", "snow_golem");
 
     // 3D preview tuning
     private static final long TICK_NANOS = 50_000_000L;
@@ -185,6 +176,8 @@ public class MobEditorScreen extends Screen {
     private MinecraftServer server;
     private MobConfigData data;
     private boolean editable;
+    /** Which mobs are listed in the tree (see MobListing). Built once when the editor opens. */
+    private MobListing listing;
 
     private PickList scopeList;
     private PickList behaviorList;
@@ -452,6 +445,7 @@ public class MobEditorScreen extends Screen {
             MobConfigData[] box = new MobConfigData[1];
             server.executeBlocking(() -> box[0] = MobConfigData.get(server));
             data = box[0];
+            listing = MobListing.scan(this.minecraft, server);
             setupPreviewZone();
             sweepOrphans();
         }
@@ -500,15 +494,6 @@ public class MobEditorScreen extends Screen {
         rebuildDetail();
     }
 
-    /** Mobs with a spawn egg are always listed; others only when enabled in the mod config (plus a small vanilla whitelist). */
-    private static boolean isListed(EntityType<?> t) {
-        if (EncephalonConfig.showMobsWithoutEgg() || SpawnEggItem.byId(t) != null) {
-            return true;
-        }
-        ResourceLocation key = BuiltInRegistries.ENTITY_TYPE.getKey(t);
-        return key.getNamespace().equals("minecraft") && ALWAYS_LISTED.contains(key.getPath());
-    }
-
     private static String modName(String modId) {
         return ModList.get().getModContainerById(modId)
                 .map(c -> c.getModInfo().getDisplayName())
@@ -527,7 +512,7 @@ public class MobEditorScreen extends Screen {
         Map<String, Map<String, List<EntityType<?>>>> byMod = new HashMap<>();
         for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
             String c = MobGroups.categoryOf(t);
-            if (c == null || !isListed(t)) {
+            if (c == null || !listing.isListed(t)) {
                 continue;
             }
             String ns = BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace();
@@ -1832,7 +1817,7 @@ public class MobEditorScreen extends Screen {
                 drawActive(g, p, realPartial);
             }
         } else {
-            // Vanilla Mobs / a category / a mod: no mob, just the mod's icon (or the Minecraft logo).
+            // Vanilla Mobs / a category / a mod: no mob, just the Minecraft logo or the mod's name.
             rotationNext = null;
             if (active != null) {
                 demote(active);
@@ -1843,48 +1828,12 @@ public class MobEditorScreen extends Screen {
         pumpWarm(g, realPartial);
     }
 
-    private record ModLogo(ResourceLocation texture, int w, int h) {
-    }
-
-    private static final Map<String, ModLogo> LOGOS = new HashMap<>();
     private static LogoRenderer mcLogo;
 
     /**
-     * The mod's own logo (the one the mod list shows), loaded once. Null if it has none. Small logos are enlarged with a
-     * smooth filter first (see LogoUpscaler) so they do not turn into big blocky blurs when drawn large.
+     * Vanilla scopes show the Minecraft logo. Mod and mod-category scopes show just the mod's name written out (no mod logos).
+     * All / Modded Mobs show nothing.
      */
-    private static ModLogo logoOf(String modId) {
-        if (LOGOS.containsKey(modId)) {
-            return LOGOS.get(modId);
-        }
-        ModLogo logo = null;
-        try {
-            var info = ModList.get().getModContainerById(modId).map(c -> c.getModInfo()).orElse(null);
-            if (info != null && info.getLogoFile().isPresent()) {
-                Path path = info.getOwningFile().getFile().findResource(info.getLogoFile().get());
-                try (InputStream in = Files.newInputStream(path)) {
-                    NativeImage raw = NativeImage.read(in);
-                    NativeImage img = LogoUpscaler.smooth(raw);
-                    if (img != raw) {
-                        raw.close();
-                    }
-                    int w = img.getWidth();
-                    int h = img.getHeight();
-                    DynamicTexture tex = new DynamicTexture(img);
-                    tex.setFilter(true, false);
-                    ResourceLocation id = EncephalonMod.id("logo/" + modId.replaceAll("[^a-z0-9_.-]", "_"));
-                    net.minecraft.client.Minecraft.getInstance().getTextureManager().register(id, tex);
-                    logo = new ModLogo(id, w, h);
-                }
-            }
-        } catch (Exception ex) {
-            EncephalonMod.LOGGER.debug("Mob Editor: no logo for {}", modId, ex);
-        }
-        LOGOS.put(modId, logo);
-        return logo;
-    }
-
-    /** Mod and mod-category scopes show that mod's logo; vanilla scopes the Minecraft logo; All / Modded Mobs show nothing. */
     private void drawScopeIcon(GuiGraphics g) {
         String mod = null;
         boolean vanilla = false;
@@ -1915,17 +1864,12 @@ public class MobEditorScreen extends Screen {
         if (mod == null) {
             return;
         }
-        ModLogo logo = logoOf(mod);
-        if (logo == null) {
-            g.drawCenteredString(this.font, labelOf(new Scope(ScopeType.MOD, mod)), (int) cx, (int) cy - 4, 0xC8C8C8);
-            return;
+        List<FormattedCharSequence> lines = this.font.split(labelOf(new Scope(ScopeType.MOD, mod)), Math.max(40, rw - 16));
+        int lineH = 10;
+        int y0 = (int) cy - lines.size() * lineH / 2;
+        for (int i = 0; i < lines.size(); i++) {
+            g.drawCenteredString(this.font, lines.get(i), (int) cx, y0 + i * lineH, 0xC8C8C8);
         }
-        float box = Math.min(Math.min(rw - 24, (bottom - top) - 24), 192);
-        // The texture is already enlarged to a good size, so just fit it into the box (never past 2x its own size).
-        float s = Math.min(box / Math.max(logo.w(), logo.h()), 2F);
-        int dw = Math.max(1, Math.round(logo.w() * s));
-        int dh = Math.max(1, Math.round(logo.h() * s));
-        g.blit(logo.texture(), (int) (cx - dw / 2F), (int) (cy - dh / 2F), dw, dh, 0F, 0F, logo.w(), logo.h(), logo.w(), logo.h());
     }
 
     private void drawActive(GuiGraphics g, Preview p, float realPartial) {

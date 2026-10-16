@@ -17,7 +17,9 @@ public final class EncephalonConfig {
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
         SHOW_MOBS_WITHOUT_EGG = b
-                .comment("Show mobs that have no spawn egg in the Mob Editor.")
+                .comment("List every mob in the Mob Editor, including internal ones.",
+                        "When off, vanilla mobs need a spawn egg, and modded mobs need a spawn egg that really shows up in a",
+                        "creative tab or have to spawn naturally (biome or structure spawn lists).")
                 .translation("encephalon.configuration.showMobsWithoutEgg")
                 .define("showMobsWithoutEgg", false);
         QUIET_MOBS = b
