@@ -5,7 +5,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -13,14 +12,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import com.example.encephalon.EncephalonMod;
 
-import net.minecraft.client.gui.Font;
-import net.minecraft.client.gui.GuiGraphics;
-import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.item.Item;
@@ -32,12 +27,12 @@ import net.minecraft.world.level.storage.loot.parameters.LootContextParamSets;
 import net.minecraft.world.level.storage.loot.parameters.LootContextParams;
 
 /**
- * The "Drops" part of a mob's stat sheet: every item the mob's loot table can give, how often, and how many.
+ * Works out the DEFAULT drops of a mob type: every item its loot table can give, how often, and how many.
  * <p>
  * Loot tables only exist on the (integrated) server and are built from conditions and functions that can't be summed up
  * exactly, so the table is simply rolled thousands of times for a mob killed by a player and the results are counted. That
  * works for any mod's loot table. It runs once per mob type per editor session, on the server thread, and never blocks the
- * render thread: the panel shows "loading" until the result arrives.
+ * render thread: defaults() answers null until the result has arrived. The Mob Editor shows and edits the result.
  */
 final class DropsPanel {
     record Drop(ItemStack stack, double chance, int min, int max) {
@@ -46,18 +41,14 @@ final class DropsPanel {
     private static final int ROLLS = 4000;
     private static final int MIN_ROLLS = 300;
     private static final long BUDGET_NANOS = 40_000_000L;
-    private static final int ROW_H = 18;
 
     private final Map<EntityType<?>, List<Drop>> results = new ConcurrentHashMap<>();
     private final Set<EntityType<?>> requested = new HashSet<>();
-    private int scroll;
 
-    void resetScroll() {
-        scroll = 0;
-    }
-
-    void scrollBy(int rows) {
-        scroll = Math.max(0, scroll + rows);
+    /** The default drops of the type (the same list instance every time), or null while they are still being worked out. */
+    List<Drop> defaults(MinecraftServer server, ResourceKey<Level> dim, UUID playerId, EntityType<?> type) {
+        request(server, dim, playerId, type);
+        return results.get(type);
     }
 
     private void request(MinecraftServer server, ResourceKey<Level> dim, UUID playerId, EntityType<?> type) {
@@ -130,72 +121,6 @@ final class DropsPanel {
             if (entity != null) {
                 entity.discard();
             }
-        }
-    }
-
-    private static String percent(double chance) {
-        double p = chance * 100.0;
-        if (p >= 99.95) {
-            return "100%";
-        }
-        if (p < 0.1) {
-            return "<0.1%";
-        }
-        return String.format(Locale.ROOT, "%.1f%%", p);
-    }
-
-    private static int percentColor(double chance) {
-        return chance >= 0.995 ? 0x55FF55 : chance >= 0.5 ? 0xFFFFFF : chance >= 0.1 ? 0xFFFF55 : 0xFFAA00;
-    }
-
-    /**
-     * Draws the section between top and bottom (x .. x + w); barX is where the scrollbar goes. Asks for the drops of the type
-     * the first time it is drawn.
-     */
-    void draw(GuiGraphics g, Font font, MinecraftServer server, ResourceKey<Level> dim, UUID playerId, EntityType<?> type,
-              int x, int top, int w, int bottom, int barX) {
-        request(server, dim, playerId, type);
-        g.fill(x, top, x + w, top + 1, 0x50FFFFFF);
-        g.drawString(font, Component.translatable("encephalon.screen.drops"), x, top + 4, 0xFFFFFF, true);
-        int listTop = top + 16;
-        List<Drop> list = results.get(type);
-        if (list == null) {
-            g.drawString(font, Component.translatable("encephalon.screen.drops_loading"), x, listTop + 2, 0x808080, true);
-            return;
-        }
-        if (list.isEmpty()) {
-            g.drawString(font, Component.translatable("encephalon.screen.drops_none"), x, listTop + 2, 0x808080, true);
-            return;
-        }
-        int visible = Math.max(1, (bottom - listTop) / ROW_H);
-        int max = Math.max(0, list.size() - visible);
-        scroll = Mth.clamp(scroll, 0, max);
-        int last = Math.min(list.size(), scroll + visible);
-        for (int i = scroll; i < last; i++) {
-            Drop d = list.get(i);
-            int y = listTop + (i - scroll) * ROW_H;
-            g.renderFakeItem(d.stack(), x, y);
-            String pct = percent(d.chance());
-            String count = d.max() <= 1 ? "" : d.min() == d.max() ? "x" + d.min() : "x" + d.min() + "-" + d.max();
-            int pw = font.width(pct);
-            int cw = count.isEmpty() ? 0 : font.width(count) + 6;
-            int ty = y + 5;
-            g.drawString(font, pct, x + w - pw, ty, percentColor(d.chance()), true);
-            if (!count.isEmpty()) {
-                g.drawString(font, count, x + w - pw - cw, ty, 0xA0A0A0, true);
-            }
-            String name = d.stack().getHoverName().getString();
-            int room = w - 20 - pw - cw - 6;
-            if (font.width(name) > room) {
-                name = font.plainSubstrByWidth(name, Math.max(0, room - font.width("..."))) + "...";
-            }
-            g.drawString(font, name, x + 20, ty, 0xE0E0E0, true);
-        }
-        if (max > 0) {
-            int view = bottom - listTop;
-            int thumbH = Math.max(16, Math.min(view - 4, view * visible / list.size()));
-            int thumbY = listTop + (view - thumbH) * scroll / max;
-            PickList.drawScrollbar(g, barX, listTop, bottom, thumbY, thumbH);
         }
     }
 }

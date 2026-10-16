@@ -79,7 +79,9 @@ import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.entity.monster.hoglin.Hoglin;
 import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.SpawnEggItem;
 import net.minecraft.world.level.Level;
@@ -89,8 +91,8 @@ import net.neoforged.fml.ModList;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
- * Middle: behaviors for the selected scope, with a behavior search. Right: scrollable details and settings,
- * or an animated 3D mob preview while no behavior is selected.
+ * Middle: behaviors for the selected scope, with a behavior search (a mob type also gets a "Drops" entry there).
+ * Right: scrollable details and settings (or the drops editor), or an animated 3D mob preview while nothing is selected.
  * Singleplayer only for now: it edits the integrated server's MobConfigData directly (networking is a TODO).
  * Preview mobs live in dummy worlds (PreviewLevel) and every piece of their code runs inside PreviewSandbox.
  */
@@ -201,6 +203,48 @@ public class MobEditorScreen extends Screen {
     /** Modded mobs by mod id (sorted by mod name), then by category. */
     private final Map<String, Map<String, List<EntityType<?>>>> moddedByMod = new LinkedHashMap<>();
     private final Set<String> expanded = new HashSet<>(Set.of(Scope.VANILLA.key()));
+
+    // ------------------------------------------------------------------ drops editor state
+    /** Key of the "Drops" row in the behavior list. */
+    private static final Object DROPS_KEY = new Object();
+    private static final int PICK_CELL = 18;
+    private static final int DROP_ROW_H = 24;
+    private static final int DROP_MAX_AMOUNT = 64;
+
+    /** True while the "Drops" row of the behavior list is the open entry (only for a mob type; behavior is null then). */
+    private boolean dropsOpen;
+    /** True while the item picker (add a drop) is shown instead of the drop rows. */
+    private boolean addMode;
+    /** The drops shown: the custom list, or the default loot table worked out as a list. Null while that is still being rolled. */
+    private List<MobConfigData.DropEntry> dropEntries;
+    /** What dropEntries was made from (the custom list, or the default drops of DropsPanel); a change means: rebuild. */
+    private Object dropsSource;
+    private final DropsPanel dropsPanel = new DropsPanel();
+    private List<FormattedCharSequence> dropsDesc = List.of();
+    private int dropsStateY;
+    private int dropsHeaderY;
+    private final List<Integer> dropRowYs = new ArrayList<>();
+    private final List<ItemStack> dropStacks = new ArrayList<>();
+    private final List<DropBox> dropBoxes = new ArrayList<>();
+    private Button dropsReset;
+    private int colChanceX;
+    private int colChanceW;
+    private int colMinX;
+    private int colMinW;
+    private int colMaxX;
+    private int colMaxW;
+    private int colRemoveX;
+    private EditBox pickSearch;
+    private String pickFilter = "";
+    private List<Item> pickResults = List.of();
+    private List<PickEntry> allItems;
+    private int gridY;
+    private int gridScroll;
+    /** The item the mouse is over in the drops editor; its name is drawn as a tooltip after everything else. */
+    private ItemStack hovered = ItemStack.EMPTY;
+
+    private record PickEntry(Item item, String name, String id) {
+    }
 
     // ------------------------------------------------------------------ 3D preview state
     // Animation libraries (GeckoLib and the like) drive a mob from its first render: they start from the bind pose and blend
@@ -489,24 +533,9 @@ public class MobEditorScreen extends Screen {
         return false;
     }
 
-    private final DropsPanel dropsPanel = new DropsPanel();
-
-    /** The mob preview and the drops list share the right panel while a mob is selected and no behavior is open. */
-    private int dropsTop() {
-        return TOP + (viewBottom() - TOP) * 58 / 100;
-    }
-
+    /** The mob preview takes the whole right panel (the drops live in the behavior list now). */
     private int previewBottom() {
-        return scope.type() == ScopeType.MOB_TYPE ? dropsTop() : viewBottom();
-    }
-
-    private void drawDrops(GuiGraphics g) {
-        if (scope.type() != ScopeType.MOB_TYPE || server == null || this.minecraft.level == null || this.minecraft.player == null) {
-            return;
-        }
-        dropsPanel.draw(g, this.font, server, this.minecraft.level.dimension(), this.minecraft.player.getUUID(),
-                BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())),
-                rx, dropsTop(), rw, viewBottom(), width - 7);
+        return viewBottom();
     }
 
     private int viewBottom() {
@@ -519,6 +548,9 @@ public class MobEditorScreen extends Screen {
     protected void init() {
         placed.clear();
         rows.clear();
+        dropBoxes.clear();
+        dropsReset = null;
+        pickSearch = null;
         stateButton = null;
         scroll = 0;
 
@@ -808,7 +840,9 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             scope = s;
-            dropsPanel.resetScroll();
+            addMode = false;
+            gridScroll = 0;
+            pickFilter = "";
             if (expandable && !expanded.remove(s.key())) {
                 expanded.add(s.key());
             }
@@ -822,6 +856,11 @@ public class MobEditorScreen extends Screen {
 
     private void rebuildBehaviors() {
         List<PickList.Item> items = new ArrayList<>();
+        // A mob type gets a "Drops" entry at the top of its behaviors.
+        if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
+                || Component.translatable("encephalon.screen.drops_title").getString().toLowerCase().contains(behaviorFilter))) {
+            items.add(new DropsItem());
+        }
         for (Behavior b : Behaviors.all()) {
             if (b.scopes().contains(scope.type())
                     && (behaviorFilter.isEmpty() || b.name().getString().toLowerCase().contains(behaviorFilter))) {
@@ -833,8 +872,15 @@ public class MobEditorScreen extends Screen {
             behavior = null;
             changed = true;
         }
+        if (dropsOpen && scope.type() != ScopeType.MOB_TYPE) {
+            dropsOpen = false;
+            addMode = false;
+            changed = true;
+        }
         behaviorList.setItems(items);
-        if (behavior != null) {
+        if (dropsOpen) {
+            behaviorList.select(DROPS_KEY);
+        } else if (behavior != null) {
             behaviorList.select(behavior);
         }
         if (changed && placed != null && behaviorList != null && stateButton != null) {
@@ -877,6 +923,39 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             behavior = b;
+            dropsOpen = false;
+            addMode = false;
+            rebuildDetail();
+        }
+    }
+
+    /** The "Drops" entry of a mob type's behavior list: opens the drops editor in the right panel. */
+    private final class DropsItem implements PickList.Item {
+        @Override
+        public Object key() {
+            return DROPS_KEY;
+        }
+
+        @Override
+        public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
+            g.renderFakeItem(new ItemStack(Items.CHEST), x + 1, y + (h - 16) / 2);
+            boolean custom = scope.type() == ScopeType.MOB_TYPE && data.drops(scope.id()) != null;
+            Component state = Component.translatable(custom ? "encephalon.state.custom" : "encephalon.screen.default");
+            int color = custom ? 0xFFAA00 : 0xA0A0A0;
+            int stateW = f.width(state);
+            int ty = y + (h - 8) / 2 + 1;
+            g.drawString(f, fit(Component.translatable("encephalon.screen.drops_title").getString(), w - 20 - stateW - 6),
+                    x + 20, ty, 0xFFFFFF, true);
+            g.drawString(f, state, x + w - stateW - 2, ty, color, true);
+        }
+
+        @Override
+        public void picked() {
+            behavior = null;
+            dropsOpen = true;
+            addMode = false;
+            gridScroll = 0;
+            pickFilter = "";
             rebuildDetail();
         }
     }
@@ -890,12 +969,19 @@ public class MobEditorScreen extends Screen {
         }
         placed.clear();
         rows.clear();
+        dropBoxes.clear();
+        dropsReset = null;
+        pickSearch = null;
         stateButton = null;
         descLines = List.of();
         scroll = 0;
         contentHeight = 0;
         warnLines = internalScope() ? this.font.split(Component.translatable("encephalon.screen.internal_warning"), rw) : List.of();
         warnH = warnLines.isEmpty() ? 0 : warnLines.size() * 10 + 6;
+        if (dropsOpen && scope.type() == ScopeType.MOB_TYPE && data != null) {
+            buildDropsPanel();
+            return;
+        }
         if (behavior == null) {
             return;
         }
@@ -958,8 +1044,11 @@ public class MobEditorScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
-        if (behavior == null && scope.type() == ScopeType.MOB_TYPE && mouseX >= rx && mouseY >= dropsTop() && mouseY < viewBottom()) {
-            dropsPanel.scrollBy(-(int) Math.signum(scrollY));
+        if (dropsOpen && addMode && mouseX >= rx && mouseY >= gridY && mouseY < viewBottom()) {
+            int cols = pickCols();
+            int totalRows = (pickResults.size() + cols - 1) / cols;
+            int maxRow = Math.max(0, totalRows - pickRows());
+            gridScroll = Mth.clamp(gridScroll - (int) Math.signum(scrollY), 0, maxRow);
             return true;
         }
         if (mouseX >= rx && mouseY >= TOP && mouseY < viewBottom() && maxScroll() > 0) {
@@ -968,6 +1057,23 @@ public class MobEditorScreen extends Screen {
             return true;
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (data != null && dropsOpen && addMode && editable && button == 0 && mouseX >= rx && mouseY >= gridY
+                && mouseY < viewBottom()) {
+            int col = (int) Math.floor((mouseX - rx) / PICK_CELL);
+            int row = (int) Math.floor((mouseY - gridY) / PICK_CELL);
+            if (col >= 0 && col < pickCols() && row >= 0 && row < pickRows()) {
+                int idx = (gridScroll + row) * pickCols() + col;
+                if (idx < pickResults.size()) {
+                    addDrop(pickResults.get(idx));
+                    return true;
+                }
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
     }
 
     private void refreshState() {
@@ -1052,6 +1158,394 @@ public class MobEditorScreen extends Screen {
                 return true;
             }
             return super.keyPressed(key, scan, mods);
+        }
+    }
+
+    // ------------------------------------------------------------------ drops editor
+
+    private static ItemStack stackOf(String id) {
+        try {
+            Item item = BuiltInRegistries.ITEM.getOptional(ResourceLocation.parse(id)).orElse(null);
+            return new ItemStack(item == null || item == Items.AIR ? Items.BARRIER : item);
+        } catch (RuntimeException ex) {
+            return new ItemStack(Items.BARRIER);
+        }
+    }
+
+    private int pickCols() {
+        return Math.max(1, rw / PICK_CELL);
+    }
+
+    private int pickRows() {
+        return Math.max(1, (viewBottom() - gridY) / PICK_CELL);
+    }
+
+    /** The default drops of the selected mob type, or null while they are still being rolled on the server. */
+    private List<DropsPanel.Drop> defaultDrops() {
+        if (server == null || this.minecraft.level == null || this.minecraft.player == null) {
+            return null;
+        }
+        return dropsPanel.defaults(server, this.minecraft.level.dimension(), this.minecraft.player.getUUID(),
+                BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())));
+    }
+
+    /** What the drops shown should currently be made from: the custom list, the default drops, or null (still loading). */
+    private Object currentDropsSource() {
+        List<MobConfigData.DropEntry> custom = data.drops(scope.id());
+        return custom != null ? custom : defaultDrops();
+    }
+
+    /** The drops to show: the custom list, or the default loot table turned into a list. Null while that is loading. */
+    private List<MobConfigData.DropEntry> loadDropEntries() {
+        List<MobConfigData.DropEntry> custom = data.drops(scope.id());
+        if (custom != null) {
+            dropsSource = custom;
+            return custom;
+        }
+        List<DropsPanel.Drop> def = defaultDrops();
+        dropsSource = def;
+        if (def == null) {
+            return null;
+        }
+        List<MobConfigData.DropEntry> out = new ArrayList<>();
+        for (DropsPanel.Drop d : def) {
+            double pct = Math.max(0.1, Math.round(d.chance() * 1000.0) / 10.0);
+            out.add(new MobConfigData.DropEntry(BuiltInRegistries.ITEM.getKey(d.stack().getItem()).toString(), pct, d.min(), d.max()));
+        }
+        return out;
+    }
+
+    /** Builds the drops editor in the right panel: description, add / reset buttons, then the drop rows or the item picker. */
+    private void buildDropsPanel() {
+        dropRowYs.clear();
+        dropStacks.clear();
+        dropEntries = loadDropEntries();
+        int y = TOP + 2 + warnH;
+        dropsDesc = this.font.split(Component.translatable("encephalon.screen.drops_desc"), rw);
+        y += dropsDesc.size() * 10 + 4;
+        dropsStateY = y;
+        y += 14;
+
+        int half = (rw - 4) / 2;
+        Button add = track(Button.builder(Component.translatable(addMode ? "encephalon.screen.drops_back" : "encephalon.screen.drops_add"),
+                b -> toggleAddMode()).bounds(rx, y, half, 20).build());
+        add.active = editable && (addMode || dropEntries != null);
+        dropsReset = track(Button.builder(Component.translatable("encephalon.screen.drops_reset"), b -> resetDrops())
+                .bounds(rx + half + 4, y, rw - half - 4, 20).build());
+        dropsReset.active = editable && data.drops(scope.id()) != null;
+        y += 24;
+
+        if (addMode) {
+            pickSearch = track(new EditBox(this.font, rx, y, rw, 16, Component.empty()));
+            pickSearch.setHint(Component.translatable("encephalon.screen.drops_search"));
+            pickSearch.setValue(pickFilter);
+            pickSearch.setResponder(s -> {
+                pickFilter = s.toLowerCase().trim();
+                gridScroll = 0;
+                refreshPick();
+            });
+            refreshPick();
+            gridY = y + 20;
+            contentHeight = 0; // the picker scrolls its own grid
+            layoutDetail();
+            setFocused(pickSearch);
+            return;
+        }
+
+        dropsHeaderY = y;
+        y += 12;
+        if (dropEntries == null) {
+            contentHeight = y + 14 - TOP;
+            layoutDetail();
+            return;
+        }
+
+        int rem = Math.max(30, rw - 20 - 20 - 6);
+        colChanceX = rx + 20;
+        colChanceW = rem * 42 / 100;
+        colMinX = colChanceX + colChanceW + 2;
+        colMinW = rem * 29 / 100;
+        colMaxX = colMinX + colMinW + 2;
+        colMaxW = rem - colChanceW - colMinW;
+        colRemoveX = colMaxX + colMaxW + 2;
+
+        for (int i = 0; i < dropEntries.size(); i++) {
+            final int idx = i;
+            MobConfigData.DropEntry e = dropEntries.get(i);
+            dropRowYs.add(y);
+            dropStacks.add(stackOf(e.item()));
+            DropBox chance = track(new DropBox(this.font, colChanceX, y, colChanceW, i, 0, e));
+            DropBox min = track(new DropBox(this.font, colMinX, y, colMinW, i, 1, e));
+            DropBox max = track(new DropBox(this.font, colMaxX, y, colMaxW, i, 2, e));
+            dropBoxes.add(chance);
+            dropBoxes.add(min);
+            dropBoxes.add(max);
+            chance.setEditable(editable);
+            min.setEditable(editable);
+            max.setEditable(editable);
+            Button remove = track(Button.builder(Component.literal("X"), b -> removeDrop(idx))
+                    .bounds(colRemoveX, y, 20, 20)
+                    .tooltip(Tooltip.create(Component.translatable("encephalon.screen.drops_remove"))).build());
+            remove.active = editable;
+            y += DROP_ROW_H;
+        }
+        if (dropEntries.isEmpty()) {
+            y += 14;
+        }
+        contentHeight = y + 4 - TOP;
+        layoutDetail();
+    }
+
+    /** Rebuilds the drops panel after an add / remove / reset without jumping back to the top. */
+    private void rebuildDropsKeepScroll() {
+        int keep = scroll;
+        rebuildDetail();
+        scroll = keep;
+        layoutDetail();
+    }
+
+    /** Stores the list as the custom drops of the selected mob type (the server data is shared with this screen). */
+    private void saveDrops(List<MobConfigData.DropEntry> list) {
+        String id = scope.id();
+        List<MobConfigData.DropEntry> copy = List.copyOf(list);
+        edit(() -> data.setDrops(id, copy));
+        dropEntries = data.drops(id);
+        dropsSource = dropEntries; // our own edit: no rebuild needed (it would drop the focus of the box being clicked)
+        if (dropsReset != null) {
+            dropsReset.active = editable;
+        }
+    }
+
+    private void removeDrop(int index) {
+        if (dropEntries == null || index < 0 || index >= dropEntries.size()) {
+            return;
+        }
+        List<MobConfigData.DropEntry> list = new ArrayList<>(dropEntries);
+        list.remove(index);
+        saveDrops(list);
+        rebuildDropsKeepScroll();
+    }
+
+    private void addDrop(Item item) {
+        if (dropEntries == null) {
+            return;
+        }
+        List<MobConfigData.DropEntry> list = new ArrayList<>(dropEntries);
+        list.add(new MobConfigData.DropEntry(BuiltInRegistries.ITEM.getKey(item).toString(), 100.0, 1, 1));
+        saveDrops(list);
+        addMode = false;
+        gridScroll = 0;
+        pickFilter = "";
+        rebuildDetail();
+        scroll = maxScroll(); // show the new drop at the bottom of the list
+        layoutDetail();
+    }
+
+    private void resetDrops() {
+        setFocused(null);
+        String id = scope.id();
+        edit(() -> data.clearDrops(id));
+        addMode = false;
+        rebuildDropsKeepScroll();
+    }
+
+    private void toggleAddMode() {
+        addMode = !addMode;
+        gridScroll = 0;
+        pickFilter = "";
+        rebuildDetail();
+    }
+
+    private void refreshPick() {
+        if (allItems == null) {
+            List<PickEntry> all = new ArrayList<>();
+            for (Item it : BuiltInRegistries.ITEM) {
+                if (it == Items.AIR) {
+                    continue;
+                }
+                String id = BuiltInRegistries.ITEM.getKey(it).toString();
+                String name;
+                try {
+                    name = it.getDescription().getString().toLowerCase();
+                } catch (RuntimeException ex) {
+                    name = id;
+                }
+                all.add(new PickEntry(it, name, id));
+            }
+            all.sort(Comparator.comparing(PickEntry::name));
+            allItems = all;
+        }
+        List<Item> out = new ArrayList<>();
+        for (PickEntry p : allItems) {
+            if (pickFilter.isEmpty() || p.name().contains(pickFilter) || p.id().contains(pickFilter)) {
+                out.add(p.item());
+            }
+        }
+        pickResults = out;
+    }
+
+    private static String dropText(MobConfigData.DropEntry e, int kind) {
+        return kind == 0 ? fmt(e.chance()) : String.valueOf(kind == 1 ? e.min() : e.max());
+    }
+
+    /** After a min / max edit the other box of that row may have changed too. */
+    private void syncDropBoxes() {
+        if (dropEntries == null) {
+            return;
+        }
+        for (DropBox b : dropBoxes) {
+            if (b.index < dropEntries.size()) {
+                b.setValue(dropText(dropEntries.get(b.index), b.kind));
+            }
+        }
+    }
+
+    /**
+     * One field of a drop row: kind 0 is the chance in percent, 1 the smallest amount, 2 the largest. Enter or clicking away
+     * applies it (clamped); the first edit of a mob that still uses its default loot table turns the default drops into a
+     * custom list.
+     */
+    private final class DropBox extends EditBox {
+        private final int index;
+        private final int kind;
+
+        DropBox(Font font, int x, int y, int w, int index, int kind, MobConfigData.DropEntry entry) {
+            super(font, x, y, w, 20, Component.literal("drop"));
+            this.index = index;
+            this.kind = kind;
+            setMaxLength(kind == 0 ? 6 : 3);
+            setValue(dropText(entry, kind));
+            setFilter(kind == 0 ? s -> s.matches("\\d*\\.?\\d*") : s -> s.matches("\\d*"));
+        }
+
+        void commit() {
+            if (!editable || dropEntries == null || index >= dropEntries.size()) {
+                return;
+            }
+            MobConfigData.DropEntry old = dropEntries.get(index);
+            MobConfigData.DropEntry now = old;
+            String txt = getValue().trim();
+            if (!txt.isEmpty()) {
+                try {
+                    if (kind == 0) {
+                        now = new MobConfigData.DropEntry(old.item(), Mth.clamp(Double.parseDouble(txt), 0.0, 100.0), old.min(), old.max());
+                    } else {
+                        int v = Mth.clamp(Integer.parseInt(txt), 0, DROP_MAX_AMOUNT);
+                        int lo = old.min();
+                        int hi = old.max();
+                        if (kind == 1) {
+                            lo = v;
+                            hi = Math.max(hi, v);
+                        } else {
+                            hi = v;
+                            lo = Math.min(lo, v);
+                        }
+                        now = new MobConfigData.DropEntry(old.item(), old.chance(), lo, hi);
+                    }
+                } catch (NumberFormatException ex) {
+                    now = old;
+                }
+            }
+            if (!now.equals(old)) {
+                List<MobConfigData.DropEntry> list = new ArrayList<>(dropEntries);
+                list.set(index, now);
+                saveDrops(list);
+            }
+            syncDropBoxes();
+        }
+
+        @Override
+        public void setFocused(boolean focused) {
+            boolean was = isFocused();
+            super.setFocused(focused);
+            if (was && !focused) {
+                commit();
+            }
+        }
+
+        @Override
+        public boolean keyPressed(int key, int scan, int mods) {
+            if (isFocused() && (key == 257 || key == 335)) { // Enter / keypad Enter
+                commit();
+                return true;
+            }
+            return super.keyPressed(key, scan, mods);
+        }
+    }
+
+    /** Draws the text and icons of the drops editor (the buttons and boxes are widgets). Inside the panel's scissor. */
+    private void drawDropsEditor(GuiGraphics g, int mouseX, int mouseY) {
+        hovered = ItemStack.EMPTY;
+        for (int i = 0; i < dropsDesc.size(); i++) {
+            g.drawString(this.font, dropsDesc.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
+        }
+        boolean custom = data.drops(scope.id()) != null;
+        Component state = Component.translatable(custom ? "encephalon.screen.drops_state_custom" : "encephalon.screen.drops_state_default");
+        g.drawString(this.font, fit(state.getString(), rw), rx, dropsStateY - scroll, custom ? 0xFFAA00 : 0xA0A0A0, true);
+
+        if (addMode) {
+            drawPicker(g, mouseX, mouseY);
+            return;
+        }
+        if (dropEntries == null) {
+            g.drawString(this.font, Component.translatable("encephalon.screen.drops_loading"), rx, dropsHeaderY + 2 - scroll, 0x808080, true);
+            return;
+        }
+        int hy = dropsHeaderY + 2 - scroll;
+        g.drawCenteredString(this.font, Component.translatable("encephalon.screen.drops_col_chance"), colChanceX + colChanceW / 2, hy, 0xA0A0A0);
+        g.drawCenteredString(this.font, Component.translatable("encephalon.screen.drops_col_min"), colMinX + colMinW / 2, hy, 0xA0A0A0);
+        g.drawCenteredString(this.font, Component.translatable("encephalon.screen.drops_col_max"), colMaxX + colMaxW / 2, hy, 0xA0A0A0);
+        if (dropEntries.isEmpty()) {
+            g.drawString(this.font, Component.translatable("encephalon.screen.drops_none"), rx, dropsHeaderY + 16 - scroll, 0x808080, true);
+            return;
+        }
+        for (int i = 0; i < dropRowYs.size(); i++) {
+            int y = dropRowYs.get(i) - scroll;
+            if (y < TOP || y + 20 > viewBottom()) {
+                continue;
+            }
+            ItemStack stack = dropStacks.get(i);
+            g.renderFakeItem(stack, rx + 2, y + 2);
+            if (mouseX >= rx + 2 && mouseX < rx + 18 && mouseY >= y + 2 && mouseY < y + 18) {
+                hovered = stack;
+            }
+        }
+    }
+
+    /** The item grid of the add-a-drop mode: a click adds the item (see mouseClicked), hovering shows its name. */
+    private void drawPicker(GuiGraphics g, int mouseX, int mouseY) {
+        if (pickResults.isEmpty()) {
+            g.drawString(this.font, Component.translatable("encephalon.screen.drops_no_results"), rx, gridY + 2, 0x808080, true);
+            return;
+        }
+        int cols = pickCols();
+        int cells = cols * pickRows();
+        int first = gridScroll * cols;
+        for (int i = 0; i < cells && first + i < pickResults.size(); i++) {
+            int cx = rx + (i % cols) * PICK_CELL;
+            int cy = gridY + (i / cols) * PICK_CELL;
+            boolean over = mouseX >= cx && mouseX < cx + PICK_CELL && mouseY >= cy && mouseY < cy + PICK_CELL;
+            if (over) {
+                g.fill(cx, cy, cx + PICK_CELL, cy + PICK_CELL, 0x40FFFFFF);
+            }
+            ItemStack stack = new ItemStack(pickResults.get(first + i));
+            g.renderFakeItem(stack, cx + 1, cy + 1);
+            if (over) {
+                hovered = stack;
+            }
+        }
+    }
+
+    /** Scrollbar for the right panel: spans the whole panel box, same look as the lists. */
+    private void drawPanelScrollbar(GuiGraphics g) {
+        int max = maxScroll();
+        if (max > 0) {
+            int barTop = TOP - 2;
+            int barBottom = viewBottom() + 2;
+            int view = barBottom - barTop;
+            int thumbH = Math.max(32, Math.min(view - 8, view * (viewBottom() - TOP) / contentHeight));
+            int thumbY = barTop + (view - thumbH) * scroll / max;
+            PickList.drawScrollbar(g, width - 7, barTop, barBottom, thumbY, thumbH);
         }
     }
 
@@ -2347,6 +2841,11 @@ public class MobEditorScreen extends Screen {
 
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+        // The default drops arrive from the server a moment after the editor asks for them (or the list was changed from
+        // elsewhere): rebuild the drop rows when what they are made from has changed.
+        if (data != null && dropsOpen && scope.type() == ScopeType.MOB_TYPE && currentDropsSource() != dropsSource) {
+            rebuildDropsKeepScroll();
+        }
         super.render(g, mouseX, mouseY, partialTick);
         frame++;
         g.drawCenteredString(this.font, this.title, width / 2, 5, 0xFFFFFF);
@@ -2376,21 +2875,23 @@ public class MobEditorScreen extends Screen {
             int tw = this.font.width(scopeTitle) + 6;
             g.drawString(this.font, fit(scope.id(), rw - tw), rx + tw, 28, 0x707070, true);
         }
-        if (behavior == null) {
+        if (dropsOpen) {
+            g.drawString(this.font, Component.translatable("encephalon.screen.drops_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
+        } else if (behavior == null) {
             g.drawString(this.font, Component.translatable("encephalon.screen.select"), rx, 39, 0xA0A0A0, true);
         } else {
             g.drawString(this.font, behavior.name().copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         }
         g.disableScissor();
-        if (behavior == null) {
+        if (behavior == null && !dropsOpen) {
             PreviewSandbox.run(() -> renderPreview(g, partialTick));
-            drawDrops(g);
             g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
             drawWarning(g, 0);
             g.disableScissor();
             return;
         }
-        // No preview while a behavior is open: the mob and its server twin are released until the preview is needed again.
+        // No preview while a behavior (or the drops) is open: the mob and its server twin are released until the preview is
+        // needed again.
         if (active != null) {
             release(active);
             active = null;
@@ -2398,6 +2899,16 @@ public class MobEditorScreen extends Screen {
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         drawWarning(g, scroll);
+        if (dropsOpen) {
+            drawDropsEditor(g, mouseX, mouseY);
+            g.disableScissor();
+            drawPanelScrollbar(g);
+            if (!hovered.isEmpty()) {
+                // Drawn last and outside the scissor, so the name is never cut off or covered.
+                g.renderTooltip(this.font, hovered.getHoverName(), mouseX, mouseY);
+            }
+            return;
+        }
         for (int i = 0; i < descLines.size(); i++) {
             g.drawString(this.font, descLines.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
         }
@@ -2429,16 +2940,7 @@ public class MobEditorScreen extends Screen {
         }
         g.disableScissor();
 
-        // Scrollbar for the right panel: spans the whole panel box, same look as the lists.
-        int max = maxScroll();
-        if (max > 0) {
-            int barTop = TOP - 2;
-            int barBottom = viewBottom() + 2;
-            int view = barBottom - barTop;
-            int thumbH = Math.max(32, Math.min(view - 8, view * (viewBottom() - TOP) / contentHeight));
-            int thumbY = barTop + (view - thumbH) * scroll / max;
-            PickList.drawScrollbar(g, width - 7, barTop, barBottom, thumbY, thumbH);
-        }
+        drawPanelScrollbar(g);
     }
 
     @Override
