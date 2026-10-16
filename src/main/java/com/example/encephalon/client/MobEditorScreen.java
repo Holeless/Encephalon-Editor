@@ -489,6 +489,26 @@ public class MobEditorScreen extends Screen {
         return false;
     }
 
+    private final DropsPanel dropsPanel = new DropsPanel();
+
+    /** The mob preview and the drops list share the right panel while a mob is selected and no behavior is open. */
+    private int dropsTop() {
+        return TOP + (viewBottom() - TOP) * 58 / 100;
+    }
+
+    private int previewBottom() {
+        return scope.type() == ScopeType.MOB_TYPE ? dropsTop() : viewBottom();
+    }
+
+    private void drawDrops(GuiGraphics g) {
+        if (scope.type() != ScopeType.MOB_TYPE || server == null || this.minecraft.level == null || this.minecraft.player == null) {
+            return;
+        }
+        dropsPanel.draw(g, this.font, server, this.minecraft.level.dimension(), this.minecraft.player.getUUID(),
+                BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())),
+                rx, dropsTop(), rw, viewBottom(), width - 7);
+    }
+
     private int viewBottom() {
         return height - BOTTOM_RESERVE;
     }
@@ -788,6 +808,7 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             scope = s;
+            dropsPanel.resetScroll();
             if (expandable && !expanded.remove(s.key())) {
                 expanded.add(s.key());
             }
@@ -937,6 +958,10 @@ public class MobEditorScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (behavior == null && scope.type() == ScopeType.MOB_TYPE && mouseX >= rx && mouseY >= dropsTop() && mouseY < viewBottom()) {
+            dropsPanel.scrollBy(-(int) Math.signum(scrollY));
+            return true;
+        }
         if (mouseX >= rx && mouseY >= TOP && mouseY < viewBottom() && maxScroll() > 0) {
             scroll = Mth.clamp(scroll - (int) (scrollY * 12), 0, maxScroll());
             layoutDetail();
@@ -2093,7 +2118,7 @@ public class MobEditorScreen extends Screen {
     /** Panel text for a mob whose preview could not be made or was switched off (badTypes). */
     private void drawPreviewOff(GuiGraphics g) {
         List<FormattedCharSequence> lines = this.font.split(Component.translatable("encephalon.screen.preview_off"), Math.max(40, rw - 16));
-        int y0 = (TOP + viewBottom()) / 2 - lines.size() * 5;
+        int y0 = (TOP + previewBottom()) / 2 - lines.size() * 5;
         for (int i = 0; i < lines.size(); i++) {
             g.drawCenteredString(this.font, lines.get(i), rx + rw / 2, y0 + i * 10, 0xFFAA00);
         }
@@ -2133,7 +2158,7 @@ public class MobEditorScreen extends Screen {
         boolean measured = modded && p.hasMeasure();
         boolean fitNew = modded && (measured || p.hasEnv);
         int top = TOP + 6 + warnH;
-        int bottom = viewBottom() - (fitNew ? LABEL_STRIP : 16);
+        int bottom = previewBottom() - (fitNew ? LABEL_STRIP : 16);
         float panelH = bottom - top;
         double swayDeg = dragon ? 12.0 : 40.0;
 
@@ -2282,7 +2307,7 @@ public class MobEditorScreen extends Screen {
         final List<Entity> drawExtras = extras;
 
         boolean failed = false;
-        g.enableScissor(rx, TOP, visible ? rx + rw + 6 : rx, viewBottom()); // zero width while warming up: rendered, not shown
+        g.enableScissor(rx, TOP, visible ? rx + rw + 6 : rx, previewBottom()); // zero width while warming up: rendered, not shown
         PoseStack pose = g.pose();
         pose.pushPose();
         EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
@@ -2315,7 +2340,7 @@ public class MobEditorScreen extends Screen {
         if (!p.settled && !raw.isEmpty()) {
             hiddenRender(g, p, false, partial, raw, realPartial);
         }
-        g.drawCenteredString(this.font, p.type.getDescription(), (int) cx, viewBottom() - 12, 0xC8C8C8);
+        g.drawCenteredString(this.font, p.type.getDescription(), (int) cx, previewBottom() - 12, 0xC8C8C8);
     }
 
     // ------------------------------------------------------------------ render
@@ -2359,6 +2384,7 @@ public class MobEditorScreen extends Screen {
         g.disableScissor();
         if (behavior == null) {
             PreviewSandbox.run(() -> renderPreview(g, partialTick));
+            drawDrops(g);
             g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
             drawWarning(g, 0);
             g.disableScissor();
