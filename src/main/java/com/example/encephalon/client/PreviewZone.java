@@ -1,5 +1,6 @@
 package com.example.encephalon.client;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -7,6 +8,7 @@ import com.example.encephalon.EncephalonMod;
 
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -15,6 +17,7 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.PlayLevelSoundEvent;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import net.neoforged.neoforge.event.entity.living.LivingChangeTargetEvent;
+import net.neoforged.neoforge.event.entity.living.MobDespawnEvent;
 import net.neoforged.neoforge.event.tick.EntityTickEvent;
 
 /**
@@ -27,6 +30,11 @@ import net.neoforged.neoforge.event.tick.EntityTickEvent;
  * in the sky and a sister portal at its destination, next to the player, which then teleports the player). So while a preview
  * entity is spawning or ticking on the server, every entity it tries to add to a world is vetoed unless it is a living
  * companion inside the column (a body segment or a head, which the preview draws). That is not specific to any one mod.
+ *
+ * Stability: twins are pinned to their spot after every tick (the preview draws their parts relative to that spot, and a mob
+ * that drifts, like the Void Worm, would carry its parts out of view), and mobs inside the column never despawn (a head or
+ * minion is not persistent and the column is hundreds of blocks above the player, so vanilla would remove it at once and the
+ * mod would respawn it, which shows as flicker and a missing head).
  */
 @EventBusSubscriber(modid = EncephalonMod.MOD_ID)
 public final class PreviewZone {
@@ -37,6 +45,8 @@ public final class PreviewZone {
     private static volatile int spawning;
     /** Preview entities that are in the middle of their server tick right now (server thread only). */
     private static final Set<Entity> TICKING = ConcurrentHashMap.newKeySet();
+    /** Entity id of each server twin -> the spot it is pinned to. */
+    private static final Map<Integer, Vec3> TWIN_HOME = new ConcurrentHashMap<>();
 
     private PreviewZone() {
     }
@@ -57,11 +67,17 @@ public final class PreviewZone {
         }
     }
 
+    /** Pins a server twin to its spot: after each of its ticks it is put back there with no velocity. */
+    static void pinTwin(Entity twin, Vec3 home) {
+        TWIN_HOME.put(twin.getId(), home);
+    }
+
     /** Editor closed: forget everything. */
     static void close() {
         zone = null;
         spawning = 0;
         TICKING.clear();
+        TWIN_HOME.clear();
     }
 
     /** True while preview code (a twin being created, or one ticking) is running on the server. */
@@ -79,8 +95,20 @@ public final class PreviewZone {
 
     @SubscribeEvent
     public static void onTickPost(EntityTickEvent.Post event) {
+        Entity e = event.getEntity();
         if (!TICKING.isEmpty()) {
-            TICKING.remove(event.getEntity());
+            TICKING.remove(e);
+        }
+        if (zone != null && !TWIN_HOME.isEmpty() && !e.level().isClientSide()) {
+            Vec3 home = TWIN_HOME.get(e.getId());
+            if (home != null) {
+                if (e.isRemoved()) {
+                    TWIN_HOME.remove(e.getId());
+                } else {
+                    e.setPos(home.x, home.y, home.z);
+                    e.setDeltaMovement(Vec3.ZERO);
+                }
+            }
         }
     }
 
@@ -104,6 +132,17 @@ public final class PreviewZone {
         if (!event.getLevel().isClientSide()) {
             e.setInvulnerable(true);
             e.setNoGravity(true);
+            if (e instanceof Mob mob) {
+                mob.setPersistenceRequired();
+            }
+        }
+    }
+
+    /** Nothing in the column despawns: it is far from every player, and Peaceful removes monsters even if they are persistent. */
+    @SubscribeEvent
+    public static void onDespawn(MobDespawnEvent event) {
+        if (contains(event.getEntity().position())) {
+            event.setResult(MobDespawnEvent.Result.DENY);
         }
     }
 

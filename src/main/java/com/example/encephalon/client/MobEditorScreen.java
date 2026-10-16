@@ -181,8 +181,8 @@ public class MobEditorScreen extends Screen {
     private static final String PREVIEW_TAG = "encephalon_preview";
     // Companions are spawned all at once at their starting spots and then drift into place (the Void Worm even staggers
     // them out of a portal), which looks like pieces popping in. They are only drawn once the group has stopped changing.
-    private static final int SETTLE_STABLE_TICKS = 15;  // the number of companions must not change for this long
-    private static final int SETTLE_MIN_TICKS = 30;      // and at least this long must have passed since the twin spawned
+    private static final int SETTLE_STABLE_TICKS = 10;  // the number of companions must not change for this long
+    private static final int SETTLE_MIN_TICKS = 20;      // and at least this long must have passed since the twin spawned
     private static final int SOLO_TICKS = 70;           // a twin that made no companions by now never will: drop it
     private static final int MAX_IN_FLIGHT = 4;          // mobs being warmed up at the same time
     private static final int MAX_CACHED = 12;            // warmed mobs kept around for instant picking
@@ -838,7 +838,20 @@ public class MobEditorScreen extends Screen {
             return true;
         }
         MobCategory c = e.getType().getCategory();
-        return c == MobCategory.WATER_CREATURE || c == MobCategory.WATER_AMBIENT || c == MobCategory.UNDERGROUND_WATER_CREATURE;
+        return c == MobCategory.WATER_CREATURE || c == MobCategory.WATER_AMBIENT || c == MobCategory.UNDERGROUND_WATER_CREATURE
+                || (!isVanilla(e.getType()) && placedInWater(e.getType()));
+    }
+
+    /**
+     * Modded swimmers are often filed under MONSTER (the Skelewag), so category alone misses them and they get drawn as if
+     * stranded on land (lying on their side). Their spawn placement says where they really live.
+     */
+    private static boolean placedInWater(EntityType<?> t) {
+        try {
+            return net.minecraft.world.entity.SpawnPlacements.getPlacementType(t) == net.minecraft.world.entity.SpawnPlacementTypes.IN_WATER;
+        } catch (RuntimeException ex) {
+            return false;
+        }
     }
 
     private static void forceWet(LivingEntity e) {
@@ -1001,6 +1014,7 @@ public class MobEditorScreen extends Screen {
                     mob.finalizeSpawn(sl, sl.getCurrentDifficultyAt(mob.blockPosition()), MobSpawnType.COMMAND, null);
                     if (sl.addFreshEntity(mob)) {
                         id[0] = mob.getId();
+                        PreviewZone.pinTwin(mob, new Vec3(x, y, z)); // it must not drift: its parts are drawn relative to this spot
                     }
                 } catch (RuntimeException ex) {
                     EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
