@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -52,15 +53,22 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.WalkAnimationState;
 import net.minecraft.world.entity.ambient.Bat;
+import net.minecraft.world.entity.animal.AbstractFish;
 import net.minecraft.world.entity.animal.Dolphin;
 import net.minecraft.world.entity.animal.FlyingAnimal;
+import net.minecraft.world.entity.animal.Rabbit;
+import net.minecraft.world.entity.animal.Squid;
+import net.minecraft.world.entity.animal.Turtle;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
+import net.minecraft.world.entity.monster.Ghast;
 import net.minecraft.world.entity.monster.Guardian;
+import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.entity.monster.hoglin.Hoglin;
 import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.SpawnEggItem;
+import net.neoforged.fml.ModList;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
@@ -82,6 +90,25 @@ public class MobEditorScreen extends Screen {
     private static final float DRAGON_W = 16.5F;          // blocks: wingspan plus a little sway room
     private static final float DRAGON_H = 11F;          // blocks: wing flap range
     private static final float DRAGON_CENTER_Y = 1F;    // blocks above the dragon's feet where the model's visual middle sits
+    // The turtle model multiplies the walk position by about 5, so at the normal speed its legs blur; use a slow walk.
+    private static final float TURTLE_WALK_SPEED = 0.15F;
+    // The squid's tentacles hang well below its hitbox, so it is drawn smaller and higher to stay clear of the label.
+    private static final float SQUID_EXTENT_H = 1.7F;   // blocks: body plus tentacles
+    private static final float SQUID_CENTER_Y = -0.2F;  // blocks above the squid's feet where its visual middle sits
+    private static final int RABBIT_HOP_INTERVAL = 20;  // ticks between hops (a hop lasts 10)
+    // A ghast's tentacles hang far below its hitbox, so like the squid it is drawn smaller and higher.
+    private static final float GHAST_EXTENT_H = 6.5F;   // blocks: body plus tentacles
+    private static final float GHAST_CENTER_Y = 1F;     // blocks above the ghast's feet where its visual middle sits
+
+    // Shulkers only open when the server tells them to, so the lid is driven by hand. A shulker that sees its position
+    // change also plays a 6-tick "slide in from the old spot" animation, which is pinned off.
+    private static final Field SHULKER_PEEK = field(Shulker.class, "currentPeekAmount");
+    private static final Field SHULKER_PEEK_O = field(Shulker.class, "currentPeekAmountO");
+    private static final Field SHULKER_SLIDE = field(Shulker.class, "clientSideTeleportInterpolation");
+
+    // Fish are only upright when the game thinks they are in water: out of water the renderer lays them on their side.
+    // The preview mob is far above the world, so the flag is forced on just before drawing.
+    private static final Field WET = field(Entity.class, "wasTouchingWater");
 
     // The walk animation is advanced by hand, once per preview tick. The entity's own tick also updates it (twice-updating
     // makes limbs flutter), so its state is saved before the tick and put back after, through these fields.
@@ -121,9 +148,14 @@ public class MobEditorScreen extends Screen {
     private final List<Placed> placed = new ArrayList<>();
     private final List<SettingRow> rows = new ArrayList<>();
     private List<FormattedCharSequence> descLines = List.of();
-    private final Map<String, List<EntityType<?>>> typesByCategory = new HashMap<>();
+    /** Vanilla mobs by category (hostile / neutral / passive). */
+    private final Map<String, List<EntityType<?>>> vanillaByCategory = new HashMap<>();
+    /** Modded mobs by mod id (sorted by mod name), then by category. */
+    private final Map<String, Map<String, List<EntityType<?>>>> moddedByMod = new LinkedHashMap<>();
+    private final List<EntityType<?>> vanillaTypes = new ArrayList<>();
+    private final List<EntityType<?>> moddedTypes = new ArrayList<>();
     private final List<EntityType<?>> allTypes = new ArrayList<>();
-    private final Set<String> expanded = new HashSet<>(Set.of(Scope.ALL.key()));
+    private final Set<String> expanded = new HashSet<>(Set.of(Scope.VANILLA.key()));
 
     // 3D preview
     private EntityType<?> previewType;
@@ -131,8 +163,12 @@ public class MobEditorScreen extends Screen {
     private final Set<EntityType<?>> badTypes = new HashSet<>();
     private long simTime = System.nanoTime();
     private boolean tickFailed;
+    // Where the preview mob is parked, fixed when it is created so it never counts as having moved.
+    private double anchorX;
+    private double anchorY;
+    private double anchorZ;
 
-    private Scope scope = Scope.ALL;
+    private Scope scope = Scope.VANILLA;
     private Behavior behavior;
     private String mobFilter = "";
     private String behaviorFilter = "";
@@ -233,23 +269,55 @@ public class MobEditorScreen extends Screen {
         return key.getNamespace().equals("minecraft") && ALWAYS_LISTED.contains(key.getPath());
     }
 
+    private static String modName(String modId) {
+        return ModList.get().getModContainerById(modId)
+                .map(c -> c.getModInfo().getDisplayName())
+                .orElse(modId);
+    }
+
     private void buildTypes() {
-        typesByCategory.clear();
+        vanillaByCategory.clear();
+        moddedByMod.clear();
+        vanillaTypes.clear();
+        moddedTypes.clear();
         allTypes.clear();
         for (String c : MobGroups.CATEGORIES) {
-            typesByCategory.put(c, new ArrayList<>());
+            vanillaByCategory.put(c, new ArrayList<>());
         }
+        Map<String, Map<String, List<EntityType<?>>>> byMod = new HashMap<>();
         for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
             String c = MobGroups.categoryOf(t);
-            if (c != null && isListed(t)) {
-                typesByCategory.get(c).add(t);
+            if (c == null || !isListed(t)) {
+                continue;
+            }
+            String ns = BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace();
+            if (ns.equals("minecraft")) {
+                vanillaByCategory.get(c).add(t);
+            } else {
+                byMod.computeIfAbsent(ns, k -> new HashMap<>()).computeIfAbsent(c, k -> new ArrayList<>()).add(t);
             }
         }
+        Comparator<EntityType<?>> byName = Comparator.comparing(t -> t.getDescription().getString());
         for (String c : MobGroups.CATEGORIES) {
-            List<EntityType<?>> list = typesByCategory.get(c);
-            list.sort(Comparator.comparing(t -> t.getDescription().getString()));
-            allTypes.addAll(list);
+            List<EntityType<?>> list = vanillaByCategory.get(c);
+            list.sort(byName);
+            vanillaTypes.addAll(list);
         }
+        List<String> mods = new ArrayList<>(byMod.keySet());
+        mods.sort(Comparator.comparing(MobEditorScreen::modName, String.CASE_INSENSITIVE_ORDER));
+        for (String mod : mods) {
+            Map<String, List<EntityType<?>>> cats = byMod.get(mod);
+            for (String c : MobGroups.CATEGORIES) {
+                List<EntityType<?>> list = cats.get(c);
+                if (list != null) {
+                    list.sort(byName);
+                    moddedTypes.addAll(list);
+                }
+            }
+            moddedByMod.put(mod, cats);
+        }
+        allTypes.addAll(vanillaTypes);
+        allTypes.addAll(moddedTypes);
     }
 
     private void edit(Runnable r) {
@@ -267,7 +335,10 @@ public class MobEditorScreen extends Screen {
         return switch (s.type()) {
             case WORLD -> Component.translatable("encephalon.scope.world");
             case ALL -> Component.translatable("encephalon.scope.all");
+            case ORIGIN -> Component.translatable("encephalon.scope." + s.id());
+            case MOD -> Component.literal(modName(s.id()));
             case CATEGORY -> Component.translatable("encephalon.category." + s.id());
+            case MOD_CATEGORY -> Component.translatable("encephalon.category." + s.id().substring(s.id().indexOf('/') + 1));
             case MOB_TYPE -> BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id())).getDescription();
             default -> Component.literal(s.id());
         };
@@ -291,36 +362,81 @@ public class MobEditorScreen extends Screen {
         return mobFilter.isEmpty() || labelOf(s).getString().toLowerCase().contains(mobFilter);
     }
 
+    /**
+     * Adds a category row and, when open, its mobs. While searching, a category is skipped if nothing in it matches;
+     * parentMatch means an ancestor row (Vanilla Mobs, a mod) matched, so everything under it is kept.
+     */
+    private void addCategory(List<PickList.Item> items, Scope cs, List<EntityType<?>> types, int level,
+                             boolean filtering, boolean parentMatch) {
+        boolean catMatch = parentMatch || matches(cs);
+        List<EntityType<?>> shown = new ArrayList<>();
+        for (EntityType<?> t : types) {
+            if (!filtering || catMatch || matches(mobScope(t))) {
+                shown.add(t);
+            }
+        }
+        if (filtering && shown.isEmpty()) {
+            return;
+        }
+        boolean open = filtering || expanded.contains(cs.key());
+        items.add(new ScopeItem(cs, level, true, open));
+        if (open) {
+            for (EntityType<?> t : shown) {
+                items.add(new ScopeItem(mobScope(t), level + 1, false, false));
+            }
+        }
+    }
+
     private void rebuildScopes() {
         boolean filtering = !mobFilter.isEmpty();
         List<PickList.Item> items = new ArrayList<>();
         if (matches(Scope.WORLD)) {
             items.add(new ScopeItem(Scope.WORLD, 0, false, false));
         }
-        boolean allOpen = filtering || expanded.contains(Scope.ALL.key());
-        if (!filtering || matches(Scope.ALL)) {
-            items.add(new ScopeItem(Scope.ALL, 0, true, allOpen));
-        }
-        if (allOpen) {
+
+        // Vanilla Mobs > Hostile / Neutral / Passive > mob
+        boolean vanillaMatch = filtering && matches(Scope.VANILLA);
+        boolean vanillaOpen = filtering || expanded.contains(Scope.VANILLA.key());
+        List<PickList.Item> vanilla = new ArrayList<>();
+        if (vanillaOpen) {
             for (String cat : MobGroups.CATEGORIES) {
-                Scope cs = new Scope(ScopeType.CATEGORY, cat);
-                boolean catMatch = matches(cs);
-                List<EntityType<?>> shown = new ArrayList<>();
-                for (EntityType<?> t : typesByCategory.get(cat)) {
-                    if (!filtering || catMatch || matches(mobScope(t))) {
-                        shown.add(t);
+                addCategory(vanilla, new Scope(ScopeType.CATEGORY, cat), vanillaByCategory.get(cat), 1, filtering, vanillaMatch);
+            }
+        }
+        if (!filtering || vanillaMatch || !vanilla.isEmpty()) {
+            items.add(new ScopeItem(Scope.VANILLA, 0, true, vanillaOpen));
+            items.addAll(vanilla);
+        }
+
+        // Modded Mobs > each mod > Hostile / Neutral / Passive > mob
+        if (!moddedByMod.isEmpty()) {
+            boolean moddedMatch = filtering && matches(Scope.MODDED);
+            boolean moddedOpen = filtering || expanded.contains(Scope.MODDED.key());
+            List<PickList.Item> modded = new ArrayList<>();
+            if (moddedOpen) {
+                for (Map.Entry<String, Map<String, List<EntityType<?>>>> entry : moddedByMod.entrySet()) {
+                    String mod = entry.getKey();
+                    Scope ms = new Scope(ScopeType.MOD, mod);
+                    boolean modMatch = filtering && (moddedMatch || matches(ms));
+                    boolean modOpen = filtering || expanded.contains(ms.key());
+                    List<PickList.Item> cats = new ArrayList<>();
+                    if (modOpen) {
+                        for (String cat : MobGroups.CATEGORIES) {
+                            List<EntityType<?>> types = entry.getValue().get(cat);
+                            if (types != null) {
+                                addCategory(cats, new Scope(ScopeType.MOD_CATEGORY, mod + "/" + cat), types, 2, filtering, modMatch);
+                            }
+                        }
+                    }
+                    if (!filtering || !cats.isEmpty()) {
+                        modded.add(new ScopeItem(ms, 1, true, modOpen));
+                        modded.addAll(cats);
                     }
                 }
-                if (filtering && shown.isEmpty()) {
-                    continue;
-                }
-                boolean open = filtering || expanded.contains(cs.key());
-                items.add(new ScopeItem(cs, 1, true, open));
-                if (open) {
-                    for (EntityType<?> t : shown) {
-                        items.add(new ScopeItem(mobScope(t), 2, false, false));
-                    }
-                }
+            }
+            if (!filtering || moddedMatch || !modded.isEmpty()) {
+                items.add(new ScopeItem(Scope.MODDED, 0, true, moddedOpen));
+                items.addAll(modded);
             }
         }
         scopeList.setItems(items);
@@ -639,7 +755,19 @@ public class MobEditorScreen extends Screen {
                 list = new ArrayList<>(1);
                 list.add(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())));
             }
-            case CATEGORY -> list = typesByCategory.getOrDefault(scope.id(), List.of());
+            case CATEGORY -> list = vanillaByCategory.getOrDefault(scope.id(), List.of());
+            case ORIGIN -> list = scope.id().equals("vanilla") ? vanillaTypes : moddedTypes;
+            case MOD -> {
+                list = new ArrayList<>();
+                for (List<EntityType<?>> types : moddedByMod.getOrDefault(scope.id(), Map.of()).values()) {
+                    list.addAll(types);
+                }
+            }
+            case MOD_CATEGORY -> {
+                int slash = scope.id().indexOf('/');
+                list = moddedByMod.getOrDefault(scope.id().substring(0, slash), Map.of())
+                        .getOrDefault(scope.id().substring(slash + 1), List.of());
+            }
             case ALL -> list = allTypes;
             default -> list = List.of();
         }
@@ -667,6 +795,15 @@ public class MobEditorScreen extends Screen {
                         ((Mob) living).setNoAi(true);
                     }
                     faceViewer(living);
+                    // Park it at its spot now, while tickCount is still 0: entities treat a move after that as a teleport
+                    // (a shulker, for one, slides in from its old position).
+                    if (this.minecraft.player != null) {
+                        anchorX = this.minecraft.player.getX();
+                        anchorY = this.minecraft.level.getMaxBuildHeight() + 64;
+                        anchorZ = this.minecraft.player.getZ();
+                        living.setPos(anchorX, anchorY, anchorZ);
+                        living.setOldPosAndRot();
+                    }
                     tickFailed = false;
                     previewType = t;
                     previewEntity = living;
@@ -707,9 +844,9 @@ public class MobEditorScreen extends Screen {
         boolean skipTick = e instanceof Guardian && !CAN_PIN_GUARDIAN;
         if (!tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
-                double hx = this.minecraft.player.getX();
-                double hy = this.minecraft.level.getMaxBuildHeight() + 64;
-                double hz = this.minecraft.player.getZ();
+                double hx = anchorX;
+                double hy = anchorY;
+                double hz = anchorZ;
                 float[] walk = null;
                 if (CAN_PIN_WALK) {
                     walk = new float[] {WALK_SPEED_OLD.getFloat(e.walkAnimation), WALK_SPEED_NOW.getFloat(e.walkAnimation),
@@ -722,8 +859,15 @@ public class MobEditorScreen extends Screen {
                 // only animates while it is moving.
                 e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : e instanceof Dolphin ? -0.05 : 0.0);
                 // Slimes only squish on ground transitions, so make them hop in place.
-                boolean grounded = e instanceof Slime ? e.tickCount % 24 < 16 : !isFlyer(e);
+                // Fish stay "airborne" so they do not flop about, as they would out of water.
+                // A dry dolphin on the ground also flops (random hop, random yaw), which showed as a stutter.
+                boolean grounded = e instanceof Slime ? e.tickCount % 24 < 16
+                        : !isFlyer(e) && !(e instanceof AbstractFish) && !(e instanceof Dolphin);
                 e.setOnGround(grounded);
+                // Rabbits only animate while hopping, and nothing starts a hop client-side, so start one every so often.
+                if (e instanceof Rabbit rabbit && rabbit.getJumpCompletion(0F) == 0F && e.tickCount % RABBIT_HOP_INTERVAL == 0) {
+                    rabbit.startJumping();
+                }
                 float tail = 0F;
                 boolean pinGuardian = e instanceof Guardian && CAN_PIN_GUARDIAN;
                 if (pinGuardian) {
@@ -735,6 +879,16 @@ public class MobEditorScreen extends Screen {
                 e.setPos(hx, hy, hz);
                 if (e instanceof Slime sl) {
                     sl.oSquish = squish;
+                }
+                if (e instanceof Squid squid) {
+                    // Out of water a squid slowly tips over; keep it upright with the tentacles hanging down.
+                    squid.xBodyRot = 0F;
+                    squid.xBodyRotO = 0F;
+                    squid.zBodyRot = 0F;
+                    squid.zBodyRotO = 0F;
+                }
+                if (e instanceof Shulker shulker) {
+                    pinShulker(shulker);
                 }
                 if (pinGuardian) {
                     GUARDIAN_TAIL_O.setFloat(e, tail);
@@ -751,7 +905,27 @@ public class MobEditorScreen extends Screen {
                 tickFailed = true;
             }
         }
-        e.walkAnimation.update(WALK_SPEED, 0.4F);
+        e.walkAnimation.update(e instanceof Turtle ? TURTLE_WALK_SPEED : WALK_SPEED, 0.4F);
+    }
+
+    /** How far the shulker's lid is open (0 closed, 1 fully open): a slow cycle that rests briefly at each end. */
+    private static float shulkerPeek(int tick) {
+        return Mth.clamp(0.5F + 0.7F * (float) Math.sin(tick * 0.1), 0F, 1F);
+    }
+
+    /** Opens and closes the lid by hand and cancels the slide-in animation. Best effort: a missing field is ignored. */
+    private static void pinShulker(Shulker s) {
+        try {
+            if (SHULKER_PEEK != null && SHULKER_PEEK_O != null) {
+                SHULKER_PEEK_O.setFloat(s, shulkerPeek(s.tickCount - 1));
+                SHULKER_PEEK.setFloat(s, shulkerPeek(s.tickCount));
+            }
+            if (SHULKER_SLIDE != null) {
+                SHULKER_SLIDE.setInt(s, 0);
+            }
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            // leave the shulker as it is
+        }
     }
 
     private void renderPreview(GuiGraphics g) {
@@ -787,6 +961,11 @@ public class MobEditorScreen extends Screen {
             extentW = DRAGON_W;
             fillH = 0.95F;
             fillW = 0.95F;
+        } else if (e instanceof Squid || e instanceof Ghast) {
+            extentH = e instanceof Ghast ? GHAST_EXTENT_H : SQUID_EXTENT_H;
+            extentW = bbW * 2.2F;
+            fillH = 0.7F;
+            fillW = 0.8F;
         } else {
             // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
             extentH = Math.max(bbH, bbW * 1.2F);
@@ -796,11 +975,21 @@ public class MobEditorScreen extends Screen {
         }
         float scale = Math.min(55F, Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW));
         float cx = rx + rw / 2F;
-        float centerY = dragon ? DRAGON_CENTER_Y : bbH / 2F;
+        float centerY = dragon ? DRAGON_CENTER_Y
+                : e instanceof Squid ? SQUID_CENTER_Y
+                : e instanceof Ghast ? GHAST_CENTER_Y
+                : bbH / 2F;
         float feetY = (top + bottom) / 2F + centerY * scale;
 
         // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
         faceViewer(e);
+        if (WET != null && e instanceof AbstractFish) {
+            try {
+                WET.setBoolean(e, true); // the fish renderer lays fish on their side unless they are in water
+            } catch (ReflectiveOperationException | RuntimeException ex) {
+                // leave the fish as it is
+            }
+        }
         float sway = (float) Math.toRadians((dragon ? 12.0 : 40.0) * Math.sin(Util.getMillis() / 1500.0));
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());

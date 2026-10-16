@@ -13,7 +13,7 @@ import net.minecraft.util.Mth;
 public class PickList extends ObjectSelectionList<PickList.Row> {
     /** Vanilla grey selection outline (what vanilla uses for an unfocused selected entry). */
     private static final int SELECT_BORDER = 0xFF808080;
-    private static final int SELECT_FILL = 0xFF2B1111;
+    private static final int SELECT_FILL = 0xFF373737; // vanilla dark grey (the inventory slot colour)
     private static final int SCROLL_W = 6;
 
     public interface Item {

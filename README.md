@@ -9,7 +9,9 @@ Copy `gradlew`, `gradlew.bat` and `gradle/wrapper/gradle-wrapper.jar` from anoth
 
 ## Concepts
 - **Behavior**: unit of logic (id, icon, archetype, allowed scopes, layer, settings).
-- **Scope**: WORLD, ALL, CATEGORY, GROUP, MOB_TYPE, INDIVIDUAL. Most specific wins.
+- **Scope**: WORLD, ALL, ORIGIN (Vanilla / Modded), MOD, CATEGORY (vanilla), MOD_CATEGORY, GROUP, MOB_TYPE, INDIVIDUAL. Most specific wins.
+  A vanilla mob resolves through All > Vanilla Mobs > category > mob type; a modded mob through All > Modded Mobs > its mod > the mod's category > mob type.
+  The editor tree shows Vanilla Mobs and Modded Mobs; ALL is still resolved (and set by `/mobai`) but has no row.
 - **Override**: Tri toggle (Inherit/On/Off) or setting value (absolute, or multiplier that stacks).
 - **Layer**: 0 Reflex, 1 Tactical, 2 Traversal, 3 Combat, 4 Idle.
 

@@ -25,14 +25,33 @@ public final class ConfigResolver {
 
     /** Scopes that apply to a mob, broad to specific. TODO: GROUP scopes (entity type tags / user groups). */
     public static List<Scope> chain(Mob mob) {
-        List<Scope> list = new ArrayList<>();
-        list.add(Scope.ALL);
-        String cat = MobGroups.categoryOf(mob.getType());
-        if (cat != null) {
-            list.add(new Scope(ScopeType.CATEGORY, cat));
-        }
+        List<Scope> list = ancestors(mob.getType());
         list.add(new Scope(ScopeType.MOB_TYPE, BuiltInRegistries.ENTITY_TYPE.getKey(mob.getType()).toString()));
         list.add(new Scope(ScopeType.INDIVIDUAL, mob.getUUID().toString()));
+        return list;
+    }
+
+    /**
+     * Scopes above a mob type, broad to specific. Vanilla: All > Vanilla > category. Modded: All > Modded > mod > mod's category.
+     * The list is new and mutable, so callers can append to it.
+     */
+    public static List<Scope> ancestors(EntityType<?> type) {
+        List<Scope> list = new ArrayList<>();
+        list.add(Scope.ALL);
+        String ns = BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace();
+        String cat = MobGroups.categoryOf(type);
+        if (ns.equals("minecraft")) {
+            list.add(Scope.VANILLA);
+            if (cat != null) {
+                list.add(new Scope(ScopeType.CATEGORY, cat));
+            }
+        } else {
+            list.add(Scope.MODDED);
+            list.add(new Scope(ScopeType.MOD, ns));
+            if (cat != null) {
+                list.add(new Scope(ScopeType.MOD_CATEGORY, ns + "/" + cat));
+            }
+        }
         return list;
     }
 
@@ -88,13 +107,28 @@ public final class ConfigResolver {
         switch (s.type()) {
             case WORLD -> l.add(s);
             case ALL -> l.add(s);
-            case MOB_TYPE -> {
+            case ORIGIN -> {
                 l.add(Scope.ALL);
-                EntityType<?> t = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id()));
-                String cat = MobGroups.categoryOf(t);
-                if (cat != null) {
-                    l.add(new Scope(ScopeType.CATEGORY, cat));
-                }
+                l.add(s);
+            }
+            case CATEGORY -> {
+                l.add(Scope.ALL);
+                l.add(Scope.VANILLA);
+                l.add(s);
+            }
+            case MOD -> {
+                l.add(Scope.ALL);
+                l.add(Scope.MODDED);
+                l.add(s);
+            }
+            case MOD_CATEGORY -> {
+                l.add(Scope.ALL);
+                l.add(Scope.MODDED);
+                l.add(new Scope(ScopeType.MOD, s.id().substring(0, s.id().indexOf('/'))));
+                l.add(s);
+            }
+            case MOB_TYPE -> {
+                l.addAll(ancestors(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id()))));
                 l.add(s);
             }
             default -> {

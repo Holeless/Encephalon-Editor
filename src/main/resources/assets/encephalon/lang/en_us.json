@@ -25,6 +25,8 @@
   "encephalon.state.inherit_off": "inherit: off",
   "encephalon.scope.world": "World Rules",
   "encephalon.scope.all": "All Mobs",
+  "encephalon.scope.vanilla": "Vanilla Mobs",
+  "encephalon.scope.modded": "Modded Mobs",
   "encephalon.category.hostile": "Hostile",
   "encephalon.category.neutral": "Neutral",
   "encephalon.category.passive": "Passive",
