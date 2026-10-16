@@ -126,7 +126,11 @@ public class MobEditorScreen extends Screen {
     // screen (GROUP_VIEW_ANGLE radians away from looking straight along it). So a huge snake is shown big and clipped instead
     // of tiny and complete, and no mob is ever scaled up past what fits.
     private static final float ELONGATED_RATIO = 1.6F;
-    private static final float LENGTH_CAP = 2.5F;
+    private static final float LENGTH_CAP = 3.0F;
+    // How much of the panel a measured modded mob may fill (the measurement is accurate, so little padding is needed). The
+    // panel it is fitted to also reaches a little way into the label strip, so a big mob may overlap the name slightly.
+    private static final float FILL_H = 0.92F;
+    private static final float FILL_W = 0.95F;
     private static final float GROUP_VIEW_ANGLE = 0.55F;
     private static final double GROUP_SWAY_DEG = 15.0;
     private static final float SMOOTH = 0.15F;          // how fast the shown size / angle follows the fitted one (per frame)
@@ -250,6 +254,9 @@ public class MobEditorScreen extends Screen {
         final float[] lo = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE};
         final float[] hi = {-Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
         int samples;
+        // Distance of the vertices from the mob's vertical axis (its anchor): a round mob is narrower than its box.
+        final int[] rhist = new int[MB_BINS];
+        float rmax;
         // What is shown eases toward the fitted values, so a measurement that is still growing does not make the mob jump.
         float sScale = -1F;
         float sCenterY;
@@ -331,6 +338,9 @@ public class MobEditorScreen extends Screen {
             add(0, wx);
             add(1, wy);
             add(2, wz);
+            float rr = (float) Math.sqrt(wx * wx + wz * wz);
+            rhist[Math.min(MB_BINS - 1, (int) (rr / MB_BIN))]++;
+            rmax = Math.max(rmax, rr);
             samples++;
         }
 
@@ -343,6 +353,17 @@ public class MobEditorScreen extends Screen {
 
         boolean hasMeasure() {
             return samples >= 200;
+        }
+
+        /** Distance from the anchor's vertical axis that nearly all vertices are within (outermost 0.2% ignored). */
+        float radius() {
+            int cut = Math.max(1, samples / 500);
+            int c = 0;
+            int j = MB_BINS - 1;
+            while (j > 0 && (c += rhist[j]) < cut) {
+                j--;
+            }
+            return Math.min(rmax, (j + 1) * MB_BIN);
         }
 
         /** The extent along an axis, ignoring the outermost 0.2% of vertices at each end (stray bits of a model). */
@@ -1925,14 +1946,15 @@ public class MobEditorScreen extends Screen {
         List<Entity> extras = p.settled && !raw.isEmpty() ? (raw.size() > 64 ? raw.subList(0, 64) : raw) : List.of();
         boolean visible = revealable(p);
 
-        int top = TOP + 6;
-        int bottom = viewBottom() - 16;
-        float panelH = bottom - top;
         float bbH = Math.max(e.getBbHeight(), 0.4F);
         float bbW = Math.max(e.getBbWidth(), 0.4F);
         boolean dragon = e instanceof EnderDragon;
         boolean modded = !isVanilla(p.type);
         boolean measured = modded && p.hasMeasure();
+        boolean fitNew = modded && (measured || !extras.isEmpty());
+        int top = fitNew ? TOP + 2 : TOP + 6;
+        int bottom = fitNew ? viewBottom() - 4 : viewBottom() - 16;
+        float panelH = bottom - top;
         double swayDeg = dragon ? 12.0 : 40.0;
 
         float tScale;
@@ -1940,7 +1962,7 @@ public class MobEditorScreen extends Screen {
         float tPivX = 0F;
         float tPivZ = 0F;
         float tYaw = 0F;
-        if (modded && (measured || !extras.isEmpty())) {
+        if (fitNew) {
             // Bounds of what is really drawn (blocks around the anchor); the hitbox only stands in until it has been measured.
             float minX = -bbW / 2F;
             float maxX = bbW / 2F;
@@ -1989,7 +2011,13 @@ public class MobEditorScreen extends Screen {
                 double a = tYaw + k * swayRad;
                 worstW = Math.max(worstW, fitX * Math.abs(Math.cos(a)) + fitZ * Math.abs(Math.sin(a)));
             }
-            tScale = Math.min(55F, Math.min(panelH * 0.7F / spanH, rw * 0.8F / (float) Math.max(worstW, 0.4)));
+            if (!elongated && measured && extras.isEmpty()) {
+                // A round mob is narrower than its box: turning it about the middle of the box, no vertex gets farther from
+                // the middle than the farthest one is from the anchor plus the offset of the middle.
+                double radial = 2.0 * (p.radius() + Math.hypot((minX + maxX) / 2.0, (minZ + maxZ) / 2.0));
+                worstW = Math.min(worstW, Math.max(radial, spanH * 0.0 + 0.4));
+            }
+            tScale = Math.min(55F, Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
             tCenterY = (minY + maxY) / 2F;
             tPivX = (minX + maxX) / 2F;
             tPivZ = (minZ + maxZ) / 2F;
