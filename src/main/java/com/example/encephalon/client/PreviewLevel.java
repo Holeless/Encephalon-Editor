@@ -83,7 +83,7 @@ public final class PreviewLevel extends ClientLevel {
     }
 
     /** Editor closed: drop the worlds (and with them every entity a preview mob made in them). */
-    public static void close() {
+    public static void closeAll() {
         air = null;
         water = null;
         owner = null;
