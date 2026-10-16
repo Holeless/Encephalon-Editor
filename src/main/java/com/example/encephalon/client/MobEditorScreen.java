@@ -50,6 +50,7 @@ import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -210,12 +211,17 @@ public class MobEditorScreen extends Screen {
     // into idle, then blend again into the walk once the walk state kicks in. A modded mob is therefore drawn off-screen
     // (empty scissor) for this long first, so those blends finish before anyone sees it.
     private static final int WARMUP_TICKS = 10;      // simulated ticks of animation before a modded mob may be shown
-    private static final int FAST_STEPS = 3;         // warm-up ticks simulated (and rendered off-screen) per frame, at most
+    // Warm-up ticks simulated per frame, at most. They are all stepped first and the mob is then drawn off-screen ONCE for the
+    // whole batch: the draw is by far the expensive part (a big GeckoLib model costs far more than its tick), and animation
+    // libraries read the mob's tick count when they draw, so a draw per batch blends exactly as well as a draw per tick.
+    private static final int FAST_STEPS = 5;
     // Warming up a many-part mob (a worm with dozens of animated segments) costs a lot per hidden draw. All the warm-up work of
-    // one frame shares this time budget; once it is spent each mob still gets one step (so it keeps progressing) but no more,
-    // which keeps the editor from stuttering while a worm is being prepared.
+    // one frame shares this time budget; once it is spent the shown mob still gets a single step (so it keeps progressing),
+    // and background warm-ups wait for a later frame (see pumpWarm), which keeps the editor from stuttering.
     private static final long WARM_BUDGET_NANOS = 4_000_000L;
     private long warmDeadline;
+    /** Counts rendered editor frames; lets per-frame work (the companion scan) be done once and shared. */
+    private long frame;
     // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
     // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
     // entities it makes show up in the client level near the anchor and are drawn together with the preview mob.
@@ -226,9 +232,18 @@ public class MobEditorScreen extends Screen {
     private static final String PREVIEW_TAG = "encephalon_preview";
     // Companions are spawned all at once at their starting spots and then drift into place (the Void Worm even staggers
     // them out of a portal), which looks like pieces popping in. They are only drawn once the group has stopped changing.
-    private static final int SETTLE_STABLE_TICKS = 10;  // the number of companions must not change for this long
-    private static final int SETTLE_MIN_TICKS = 20;      // and at least this long must have passed since the twin spawned
-    private static final int SOLO_TICKS = 70;           // a twin that made no companions by now never will: drop it
+    // The twin is fast-forwarded on the server right after it is spawned (see preTickTwin), so all of that has already
+    // happened by the time the client first sees it, and these waits only have to cover the network round trip.
+    private static final int SETTLE_STABLE_TICKS = 5;  // the number of companions must not change for this long
+    private static final int SETTLE_MIN_TICKS = 8;      // and at least this long must have passed since the twin spawned
+    private static final int SOLO_TICKS = 30;           // a twin that made no companions by now never will: drop it
+    // Server-side fast-forward of a fresh twin: up to this many ticks of the twin and everything it made, within this time.
+    // It runs on the server thread without blocking the render thread.
+    private static final int TWIN_PRETICKS = 48;
+    private static final long TWIN_PRETICK_BUDGET_NANOS = 60_000_000L;
+    // A preview mob whose own tick takes longer than this several times is drawn without being ticked from then on.
+    private static final long SLOW_TICK_NANOS = 8_000_000L;
+    private static final int SLOW_TICK_LIMIT = 4;
     private static final int MAX_IN_FLIGHT = 2;          // mobs being warmed up at the same time
     private static final boolean PREWARM_VISIBLE = false; // true = also warm every visible row (smoother picking, more spikes)
     private static final int MAX_CACHED = 12;            // warmed mobs kept around for instant picking
@@ -255,6 +270,11 @@ public class MobEditorScreen extends Screen {
         long countChangedTick;
         boolean settled;
         boolean tickFailed;
+        /** Entity ticks that were slow (see SLOW_TICK_NANOS); at SLOW_TICK_LIMIT the mob stops being ticked. */
+        int slowTicks;
+        /** The companion list of the last scan and the frame it was made in (one scan per frame, shared by every caller). */
+        long compFrame = -1;
+        List<Entity> compCache = List.of();
         int warmTicks;
         // How far the model really reaches along each axis (x, y, z), in blocks from the mob's anchor, recorded from the
         // vertices that are actually drawn. The histograms let a few stray vertices be ignored.
@@ -323,8 +343,11 @@ public class MobEditorScreen extends Screen {
             return forceMeasure || (!isVanilla(type) && !stable);
         }
 
-        /** Called after each simulated, rendered warm-up tick: decides when the model's size has settled. */
-        void trackStable() {
+        /**
+         * Called after each rendered warm-up batch of `steps` simulated ticks: decides when the model's size has settled.
+         * The extent only changes when the mob is drawn, so a batch counts as `steps` ticks of steadiness or none.
+         */
+        void trackStable(int steps) {
             if (stable) {
                 return;
             }
@@ -355,7 +378,8 @@ public class MobEditorScreen extends Screen {
                 }
             }
             if (same) {
-                if (++stableTicks >= STABLE_TICKS) {
+                stableTicks += Math.max(1, steps);
+                if (stableTicks >= STABLE_TICKS) {
                     stable = true;
                 }
             } else {
@@ -433,6 +457,8 @@ public class MobEditorScreen extends Screen {
     private final Set<EntityType<?>> wantedNow = new LinkedHashSet<>();
     private final boolean[] slotUsed = new boolean[SLOTS];
     private final Set<EntityType<?>> badTypes = new HashSet<>();
+    /** quiet() answers, per type (the config lookup and tag check are too slow to repeat on every tick). */
+    private final Map<EntityType<?>, Boolean> quietCache = new HashMap<>();
     private EntityType<?> hoverType;
     private long hoverStamp;
     private EntityType<?> rotationNext;
@@ -1058,16 +1084,21 @@ public class MobEditorScreen extends Screen {
                 || (!isVanilla(e.getType()) && placedInWater(e.getType()));
     }
 
+    /** placedInWater answers, per type (asked several times per preview tick, and the answer never changes). */
+    private static final Map<EntityType<?>, Boolean> IN_WATER = new ConcurrentHashMap<>();
+
     /**
      * Modded swimmers are often filed under MONSTER (the Skelewag), so category alone misses them and they get drawn as if
      * stranded on land (lying on their side). Their spawn placement says where they really live.
      */
     private static boolean placedInWater(EntityType<?> t) {
-        try {
-            return net.minecraft.world.entity.SpawnPlacements.getPlacementType(t) == net.minecraft.world.entity.SpawnPlacementTypes.IN_WATER;
-        } catch (RuntimeException ex) {
-            return false;
-        }
+        return IN_WATER.computeIfAbsent(t, k -> {
+            try {
+                return net.minecraft.world.entity.SpawnPlacements.getPlacementType(k) == net.minecraft.world.entity.SpawnPlacementTypes.IN_WATER;
+            } catch (RuntimeException ex) {
+                return false;
+            }
+        });
     }
 
     /** Modded swimmers are made in the flooded dummy world (see PreviewLevel); everything else in the dry one. */
@@ -1179,9 +1210,18 @@ public class MobEditorScreen extends Screen {
     /**
      * Modded mobs the preview must draw but never tick, and give no server twin: the ones in the built-in / config list, modded
      * bosses (tagged c:bosses), and anything whose class holds a boss bar. Their own code changes the sky, starts music and
-     * so on when they merely exist.
+     * so on when they merely exist. Asked on every preview tick, so the answer is cached per type for this editor session.
      */
     private boolean quiet(EntityType<?> t) {
+        Boolean known = quietCache.get(t);
+        if (known == null) {
+            known = quietUncached(t);
+            quietCache.put(t, known);
+        }
+        return known;
+    }
+
+    private boolean quietUncached(EntityType<?> t) {
         if (isVanilla(t)) {
             return false;
         }
@@ -1338,10 +1378,11 @@ public class MobEditorScreen extends Screen {
         final double y = p.ay;
         final double z = p.az;
         final AABB box = p.box();
+        final String namespace = BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace();
         final int[] id = {-1};
         try {
             server.executeBlocking(() -> {
-                PreviewZone.beginSpawn(BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace()); // anything this mob creates outside the column, or that is not from its own mod, is vetoed
+                PreviewZone.beginSpawn(namespace); // anything this mob creates outside the column, or that is not from its own mod, is vetoed
                 try {
                 ServerLevel sl = server.getLevel(dim);
                 if (sl == null) {
@@ -1394,6 +1435,56 @@ public class MobEditorScreen extends Screen {
         p.lastCount = -1;
         p.countChangedTick = p.twinStartTick;
         p.settled = false;
+        // Do not wait for the real-time server ticks that build the body (segments, heads, ...): run them now, off the render thread.
+        final int twinId = id[0];
+        try {
+            server.execute(() -> preTickTwin(dim, box, x, y, z, twinId, namespace));
+        } catch (RuntimeException ex) {
+            // the twin is simply built at normal speed
+        }
+    }
+
+    /**
+     * Server thread. Fast-forwards a freshly spawned twin: the twin and everything it has made so far (each pass re-reads the
+     * box, so parts created by earlier passes are ticked too) are ticked up to TWIN_PRETICKS times, within a time budget,
+     * without waiting 50 ms per tick. A body that a mod assembles over a second or two of ticks is therefore complete (or
+     * nearly) when the client first sees it. Runs inside the same containment as spawning (PreviewZone.beginSpawn), so
+     * everything that is not a body part of the twin is still vetoed. A tick that throws just skips that entity this pass.
+     * Works for any mod: nothing here knows what the twin makes.
+     */
+    private void preTickTwin(ResourceKey<Level> dim, AABB box, double x, double y, double z, int twinId, String namespace) {
+        ServerLevel sl = server == null ? null : server.getLevel(dim);
+        if (sl == null || PreviewZone.zone == null) {
+            return;
+        }
+        Entity twin = sl.getEntity(twinId);
+        if (twin == null || twin.isRemoved() || !twin.getTags().contains(PREVIEW_TAG)) {
+            return;
+        }
+        long deadline = System.nanoTime() + TWIN_PRETICK_BUDGET_NANOS;
+        PreviewZone.beginSpawn(namespace);
+        try {
+            for (int i = 0; i < TWIN_PRETICKS && System.nanoTime() < deadline && !twin.isRemoved(); i++) {
+                for (Entity e : sl.getEntities((Entity) null, box, c -> !(c instanceof Player))) {
+                    if (e.isRemoved()) {
+                        continue;
+                    }
+                    try {
+                        e.setOldPosAndRot();
+                        e.tickCount++;
+                        e.tick();
+                    } catch (RuntimeException | LinkageError ex) {
+                        // skip this one for this pass
+                    }
+                }
+                if (!twin.isRemoved()) {
+                    twin.setPos(x, y, z); // same pin PreviewZone applies after each real tick
+                    twin.setDeltaMovement(Vec3.ZERO);
+                }
+            }
+        } finally {
+            PreviewZone.endSpawn();
+        }
     }
 
     /** Removes a mob's twin and everything it spawned, and gives its slot back. */
@@ -1468,10 +1559,14 @@ public class MobEditorScreen extends Screen {
     /**
      * Entities around a preview mob that belong to it: parts, a head, tails, orbiting bones. Also decides when the group has settled
      * (and learns which mob types have companions at all, so later previews know whether a twin is worth it).
+     * Scanned once per frame and shared by every caller of that frame (the scan walks a big box of the client level).
      */
     private List<Entity> rawCompanions(Preview p) {
         if (p.slot < 0 || this.minecraft.level == null) {
             return List.of();
+        }
+        if (p.compFrame == frame) {
+            return p.compCache;
         }
         // Companions of the twin's own mod (see PreviewZone.isPart). Things the twin made that are not part of the mob (the
         // Void Worm's portal) are effects of the twin standing still up there, and are left out.
@@ -1493,6 +1588,8 @@ public class MobEditorScreen extends Screen {
                 p.settled = true;
             }
         }
+        p.compFrame = frame;
+        p.compCache = found;
         return found;
     }
 
@@ -1725,6 +1822,11 @@ public class MobEditorScreen extends Screen {
             if (isDone(p)) {
                 continue;
             }
+            // The shown mob has first call on the frame's time budget. If it (or an earlier mob) used it up, a background
+            // warm-up only gets every fourth frame, so several big mobs never stack their hidden draws into one slow frame.
+            if (System.nanoTime() > warmDeadline && (frame & 3L) != 0L) {
+                continue;
+            }
             long now = System.nanoTime();
             if (p.firstRender == 0L) {
                 p.firstRender = now;
@@ -1816,22 +1918,19 @@ public class MobEditorScreen extends Screen {
 
     /**
      * Animation libraries (GeckoLib and the like) blend from the bind pose into idle over a number of ticks of the mob's age.
-     * Instead of waiting for that in real time, a few ticks are simulated and rendered off-screen in one frame, each one
-     * advancing tickCount, so the blend is over before the mob is ever shown. Rendered at partial 0 so the animation
-     * clock never runs backwards when the real-time stepping takes over. Returns false if drawing failed.
+     * Instead of waiting for that in real time, a batch of ticks is simulated in one frame, each one advancing tickCount, and the
+     * mob is then rendered off-screen once, so the blend is over before the mob is ever shown. The draw is the expensive part,
+     * so there is one per frame whatever the batch size; when the frame's time budget is already spent the batch is cut to one
+     * tick. Rendered at partial 0 so the animation clock never runs backwards when the real-time stepping takes over.
+     * Returns false if drawing failed.
      */
     private boolean fastForward(GuiGraphics g, Preview p, List<Entity> raw, float realPartial) {
-        boolean ok = true;
-        for (int i = 0; i < FAST_STEPS && ok && !warmedUp(p); i++) {
+        int steps = System.nanoTime() > warmDeadline ? 1 : FAST_STEPS;
+        for (int i = 0; i < steps; i++) {
             stepPreview(p);
-            // The companions (body segments) only need drawing once per frame, not once per simulated tick.
-            boolean last = i == FAST_STEPS - 1 || System.nanoTime() > warmDeadline;
-            ok = hiddenRender(g, p, true, 0F, last ? raw : List.of(), realPartial);
-            p.trackStable();
-            if (last) {
-                break;
-            }
         }
+        boolean ok = hiddenRender(g, p, true, 0F, raw, realPartial);
+        p.trackStable(steps);
         p.sim = System.nanoTime();
         return ok;
     }
@@ -1983,7 +2082,19 @@ public class MobEditorScreen extends Screen {
                 }
                 // Slimes set oSquish = squish every tick, which makes the squish step at 20 Hz; keep the previous value to lerp.
                 float squish = e instanceof Slime sl ? sl.squish : 0F;
+                long tickStart = System.nanoTime();
                 e.tick();
+                // A mob whose own tick is expensive (a big modded model that scans blocks or entities around it, say) is a
+                // frame-time problem on every frame, so after a few slow ticks it is drawn but no longer ticked.
+                if (System.nanoTime() - tickStart > SLOW_TICK_NANOS) {
+                    if (++p.slowTicks >= SLOW_TICK_LIMIT) {
+                        p.tickFailed = true;
+                        EncephalonMod.LOGGER.warn("Mob Editor preview: {} has a slow tick; it is drawn without being ticked",
+                                BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()));
+                    }
+                } else if (p.slowTicks > 0 && (e.tickCount & 15) == 0) {
+                    p.slowTicks--;
+                }
                 e.setPos(hx, hy, hz);
                 forceWet(e);
                 // Some mobs hide themselves until something server-side reveals them (the Farseer stays invisible until a
@@ -2335,6 +2446,7 @@ public class MobEditorScreen extends Screen {
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
         super.render(g, mouseX, mouseY, partialTick);
+        frame++;
         warmDeadline = System.nanoTime() + WARM_BUDGET_NANOS;
         g.drawCenteredString(this.font, this.title, width / 2, 5, 0xFFFFFF);
         if (data == null) {
