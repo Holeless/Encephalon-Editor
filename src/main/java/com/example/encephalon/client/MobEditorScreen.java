@@ -1438,7 +1438,7 @@ public class MobEditorScreen extends Screen {
             }
         }
         PreviewZone.close();
-        PreviewLevel.close();
+        PreviewLevel.closeAll();
         super.removed();
     }
 
