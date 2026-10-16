@@ -14,7 +14,12 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 import org.joml.Quaternionf;
+import org.joml.Vector3f;
 
 import com.example.encephalon.EncephalonMod;
 import com.example.encephalon.behavior.Behavior;
@@ -28,6 +33,8 @@ import com.example.encephalon.scope.MobGroups;
 import com.example.encephalon.scope.Scope;
 import com.example.encephalon.scope.ScopeType;
 import com.mojang.blaze3d.platform.Lighting;
+import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.vertex.VertexConsumer;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 
@@ -38,9 +45,13 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.components.LogoRenderer;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
@@ -117,6 +128,7 @@ public class MobEditorScreen extends Screen {
     // Fish are only upright when the game thinks they are in water: out of water the renderer lays them on their side.
     // The preview mob is far above the world, so the flag is forced on just before drawing.
     private static final Field WET = field(Entity.class, "wasTouchingWater");
+    private static final Field WET_EYES = field(Entity.class, "wasEyeInWater");
 
     // The walk animation is advanced by hand, once per preview tick. The entity's own tick also updates it (twice-updating
     // makes limbs flutter), so its state is saved before the tick and put back after, through these fields.
@@ -143,6 +155,9 @@ public class MobEditorScreen extends Screen {
             EncephalonMod.LOGGER.warn("Mob Editor preview: Guardian animation fields not found; guardians are not animated");
         }
     }
+
+    /** True while the main mob is drawn through an ExtentProbe (off-screen warm-up of a modded mob). */
+    private boolean measuring;
 
     private MinecraftServer server;
     private MobConfigData data;
@@ -210,6 +225,10 @@ public class MobEditorScreen extends Screen {
         boolean settled;
         boolean tickFailed;
         int warmTicks;
+        // How far the model really reaches, in blocks (recorded while it is drawn off-screen during warm-up).
+        float mMinY = Float.MAX_VALUE;
+        float mMaxY = -Float.MAX_VALUE;
+        float mMaxR2;
 
         Preview(EntityType<?> type, LivingEntity entity, double ay, int slot) {
             this.type = type;
@@ -223,6 +242,21 @@ public class MobEditorScreen extends Screen {
 
         AABB box() {
             return new AABB(ax - 64, ay - 48, az - 64, ax + 64, ay + 48, az + 64);
+        }
+
+        /** Records a vertex of the model: height above the feet, and distance from the mob's vertical axis. */
+        void measure(float wx, float wy, float wz) {
+            // The first warm-up ticks are the bind pose (limbs wherever the model file left them); only the settled ones count.
+            if (warmTicks < WARMUP_TICKS - 4 || Float.isNaN(wx + wy + wz) || Math.abs(wy) > 300F || wx * wx + wz * wz > 90000F) {
+                return;
+            }
+            mMinY = Math.min(mMinY, wy);
+            mMaxY = Math.max(mMaxY, wy);
+            mMaxR2 = Math.max(mMaxR2, wx * wx + wz * wz);
+        }
+
+        boolean hasMeasure() {
+            return mMaxY > mMinY;
         }
     }
 
@@ -858,6 +892,9 @@ public class MobEditorScreen extends Screen {
         if (WET != null && isFish(e)) {
             try {
                 WET.setBoolean(e, true);
+                if (WET_EYES != null) {
+                    WET_EYES.setBoolean(e, true);
+                }
             } catch (ReflectiveOperationException | RuntimeException ex) {
                 // leave it as it is
             }
@@ -1394,11 +1431,13 @@ public class MobEditorScreen extends Screen {
             pose.mulPose(new Quaternionf().rotateZ((float) Math.PI));
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
+            measuring = withMain && !isVanilla(p.type);
             RenderSystem.runAsFancy(() -> drawModels(g, p, withMain, partial, extras, realPartial, pose, dispatcher));
             g.flush();
         } catch (Exception ex) {
             ok = false;
         } finally {
+            measuring = false;
             dispatcher.setRenderShadow(true);
             pose.popPose();
             Lighting.setupFor3DItems();
@@ -1411,7 +1450,12 @@ public class MobEditorScreen extends Screen {
     private void drawModels(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras,
                             float realPartial, PoseStack pose, EntityRenderDispatcher dispatcher) {
         if (withMain) {
-            dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880);
+            MultiBufferSource source = g.bufferSource();
+            if (measuring) {
+                Vector3f o = pose.last().pose().transformPosition(new Vector3f());
+                source = new ExtentProbe(source, p, o.x(), o.y(), o.z());
+            }
+            dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, source, 15728880);
         }
         for (Entity c : extras) {
             // These are ticked by the real client clock. A companion that fails to draw is skipped; it should not take
@@ -1442,6 +1486,76 @@ public class MobEditorScreen extends Screen {
         }
         p.sim = System.nanoTime();
         return ok;
+    }
+
+    /**
+     * Passes everything through to the real buffer and records where the vertices land. The off-screen warm-up pose is a plain
+     * 1 pixel = 1 block flip around the mob's origin, so (origin - vertex) is the model's own position in blocks.
+     */
+    private static final class ExtentProbe implements MultiBufferSource {
+        private final MultiBufferSource delegate;
+        private final Preview p;
+        private final float ox;
+        private final float oy;
+        private final float oz;
+
+        ExtentProbe(MultiBufferSource delegate, Preview p, float ox, float oy, float oz) {
+            this.delegate = delegate;
+            this.p = p;
+            this.ox = ox;
+            this.oy = oy;
+            this.oz = oz;
+        }
+
+        @Override
+        public VertexConsumer getBuffer(RenderType type) {
+            return new Tap(delegate.getBuffer(type));
+        }
+
+        private final class Tap implements VertexConsumer {
+            private final VertexConsumer out;
+
+            Tap(VertexConsumer out) {
+                this.out = out;
+            }
+
+            @Override
+            public VertexConsumer addVertex(float x, float y, float z) {
+                p.measure(ox - x, oy - y, oz - z);
+                out.addVertex(x, y, z);
+                return this;
+            }
+
+            @Override
+            public VertexConsumer setColor(int r, int g, int b, int a) {
+                out.setColor(r, g, b, a);
+                return this;
+            }
+
+            @Override
+            public VertexConsumer setUv(float u, float v) {
+                out.setUv(u, v);
+                return this;
+            }
+
+            @Override
+            public VertexConsumer setUv1(int u, int v) {
+                out.setUv1(u, v);
+                return this;
+            }
+
+            @Override
+            public VertexConsumer setUv2(int u, int v) {
+                out.setUv2(u, v);
+                return this;
+            }
+
+            @Override
+            public VertexConsumer setNormal(float x, float y, float z) {
+                out.setNormal(x, y, z);
+                return this;
+            }
+        }
     }
 
     // ------------------------------------------------------------------ stepping
@@ -1475,7 +1589,9 @@ public class MobEditorScreen extends Screen {
         boolean dragon = e instanceof EnderDragon;
         e.tickCount++;
         p.warmTicks++;
-        boolean skipTick = e instanceof Guardian && !CAN_PIN_GUARDIAN;
+        // A modded fish is not ticked at all: the game resets the water flag to dry at the start of every tick, before the
+        // mod's own tick code runs, and code like "if (!isInWaterOrBubble()) onLandProgress++" then lays the model on its side.
+        boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN) || (!isVanilla(e.getType()) && isFish(e));
         if (!p.tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
                 double hx = p.ax;
@@ -1571,11 +1687,98 @@ public class MobEditorScreen extends Screen {
 
     private void renderPreview(GuiGraphics g, float realPartial) {
         computeWanted();
-        Preview p = current();
-        if (p != null) {
-            drawActive(g, p, realPartial);
+        if (scope.type() == ScopeType.MOB_TYPE) {
+            Preview p = current();
+            if (p != null) {
+                drawActive(g, p, realPartial);
+            }
+        } else {
+            // Vanilla Mobs / a category / a mod: no mob, just the mod's icon (or the Minecraft logo).
+            rotationNext = null;
+            if (active != null) {
+                demote(active);
+                active = null;
+            }
+            drawScopeIcon(g);
         }
         pumpWarm(g, realPartial);
+    }
+
+    private record ModLogo(ResourceLocation texture, int w, int h) {
+    }
+
+    private static final Map<String, ModLogo> LOGOS = new HashMap<>();
+    private static LogoRenderer mcLogo;
+
+    /** The mod's own logo (the one the mod list shows), loaded once. Null if it has none. */
+    private static ModLogo logoOf(String modId) {
+        if (LOGOS.containsKey(modId)) {
+            return LOGOS.get(modId);
+        }
+        ModLogo logo = null;
+        try {
+            var info = ModList.get().getModContainerById(modId).map(c -> c.getModInfo()).orElse(null);
+            if (info != null && info.getLogoFile().isPresent()) {
+                Path path = info.getOwningFile().getFile().findResource(info.getLogoFile().get());
+                try (InputStream in = Files.newInputStream(path)) {
+                    NativeImage img = NativeImage.read(in);
+                    int w = img.getWidth();
+                    int h = img.getHeight();
+                    DynamicTexture tex = new DynamicTexture(img);
+                    tex.setFilter(true, false);
+                    ResourceLocation id = EncephalonMod.id("logo/" + modId.replaceAll("[^a-z0-9_.-]", "_"));
+                    net.minecraft.client.Minecraft.getInstance().getTextureManager().register(id, tex);
+                    logo = new ModLogo(id, w, h);
+                }
+            }
+        } catch (Exception ex) {
+            EncephalonMod.LOGGER.debug("Mob Editor: no logo for {}", modId, ex);
+        }
+        LOGOS.put(modId, logo);
+        return logo;
+    }
+
+    /** Mod and mod-category scopes show that mod's logo; vanilla scopes the Minecraft logo; All / Modded Mobs show nothing. */
+    private void drawScopeIcon(GuiGraphics g) {
+        String mod = null;
+        boolean vanilla = false;
+        switch (scope.type()) {
+            case MOD -> mod = scope.id();
+            case MOD_CATEGORY -> mod = scope.id().substring(0, scope.id().indexOf('/'));
+            case CATEGORY -> vanilla = true;
+            case ORIGIN -> vanilla = scope.id().equals("vanilla");
+            default -> {
+            }
+        }
+        int top = TOP + 6;
+        int bottom = viewBottom() - 16;
+        float cx = rx + rw / 2F;
+        float cy = (top + bottom) / 2F;
+        if (vanilla) {
+            if (mcLogo == null) {
+                mcLogo = new LogoRenderer(false);
+            }
+            float s = Math.min(1F, (rw - 12) / 256F);
+            g.pose().pushPose();
+            g.pose().translate(cx, cy, 0F);
+            g.pose().scale(s, s, 1F);
+            mcLogo.renderLogo(g, 0, 1F, -26); // screen width 0 centres it on the origin
+            g.pose().popPose();
+            return;
+        }
+        if (mod == null) {
+            return;
+        }
+        ModLogo logo = logoOf(mod);
+        if (logo == null) {
+            g.drawCenteredString(this.font, labelOf(new Scope(ScopeType.MOD, mod)), (int) cx, (int) cy - 4, 0xC8C8C8);
+            return;
+        }
+        float box = Math.min(Math.min(rw - 24, (bottom - top) - 24), 192);
+        float s = Math.min(box / Math.max(logo.w(), logo.h()), 2F);
+        int dw = Math.max(1, Math.round(logo.w() * s));
+        int dh = Math.max(1, Math.round(logo.h() * s));
+        g.blit(logo.texture(), (int) (cx - dw / 2F), (int) (cy - dh / 2F), dw, dh, 0F, 0F, logo.w(), logo.h(), logo.w(), logo.h());
     }
 
     private void drawActive(GuiGraphics g, Preview p, float realPartial) {
@@ -1626,6 +1829,18 @@ public class MobEditorScreen extends Screen {
                 : e instanceof Squid ? SQUID_CENTER_Y
                 : e instanceof Ghast ? GHAST_CENTER_Y
                 : bbH / 2F;
+        // The hitbox is only a guess at the size of the model. A mob whose model reaches well past it (a kraken's tentacles) is
+        // fitted by the extent that was measured while it was drawn off-screen; mobs that fit their hitbox keep the usual fit.
+        // (Mobs with parts are fitted from the union of their parts' hitboxes below.)
+        if (!dragon && !(e instanceof Squid) && !(e instanceof Ghast) && p.hasMeasure()) {
+            float measuredH = p.mMaxY - p.mMinY;
+            float measuredW = 2F * (float) Math.sqrt(p.mMaxR2);
+            if (measuredH > extentH || measuredW > extentW) {
+                extentH = Math.max(extentH, measuredH);
+                extentW = Math.max(extentW, measuredW);
+                centerY = (p.mMinY + p.mMaxY) / 2F;
+            }
+        }
 
         // When the mob has companions (body segments, a detached head) the whole group is fitted and centred, and turned
         // side-on so a long body is seen along its length.
