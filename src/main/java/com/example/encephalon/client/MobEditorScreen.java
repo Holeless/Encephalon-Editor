@@ -117,10 +117,12 @@ public class MobEditorScreen extends Screen {
     // screen (GROUP_VIEW_ANGLE radians away from looking straight along it). So a huge snake is shown big and clipped instead
     // of tiny and complete, and no mob is ever scaled up past what fits.
     private static final float ELONGATED_RATIO = 1.6F;
-    private static final float LENGTH_CAP = 3.0F;
+    private static final float LENGTH_CAP = 1.7F;
     // How much of the panel a measured modded mob may fill (the measurement is accurate, so little padding is needed). The
-    // panel it is fitted to also reaches a little way into the label strip, so a big mob may overlap the name slightly.
-    private static final float FILL_H = 0.92F;
+    // panel it is fitted to stops above the name label, so nothing overlaps the text.
+    private static final float FILL_H = 0.90F;
+    private static final float MAX_FIT_SCALE = 80F;     // pixels per block at most for a measured modded mob (small ones are enlarged)
+    private static final int LABEL_STRIP = 18;          // pixels kept free above the bottom of the panel for the name label
     private static final float FILL_W = 0.95F;
     private static final float GROUP_VIEW_ANGLE = 0.55F;
     private static final double GROUP_SWAY_DEG = 15.0;
@@ -1896,8 +1898,8 @@ public class MobEditorScreen extends Screen {
         boolean modded = !isVanilla(p.type);
         boolean measured = modded && p.hasMeasure();
         boolean fitNew = modded && (measured || !extras.isEmpty());
-        int top = fitNew ? TOP + 2 : TOP + 6;
-        int bottom = fitNew ? viewBottom() - 4 : viewBottom() - 16;
+        int top = TOP + 6;
+        int bottom = viewBottom() - (fitNew ? LABEL_STRIP : 16);
         float panelH = bottom - top;
         double swayDeg = dragon ? 12.0 : 40.0;
 
@@ -1961,7 +1963,7 @@ public class MobEditorScreen extends Screen {
                 double radial = 2.0 * (p.radius() + Math.hypot((minX + maxX) / 2.0, (minZ + maxZ) / 2.0));
                 worstW = Math.min(worstW, Math.max(radial, spanH * 0.0 + 0.4));
             }
-            tScale = Math.min(55F, Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
+            tScale = Math.min(MAX_FIT_SCALE, Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
             tCenterY = (minY + maxY) / 2F;
             tPivX = (minX + maxX) / 2F;
             tPivZ = (minZ + maxZ) / 2F;
