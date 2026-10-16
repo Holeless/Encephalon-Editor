@@ -7,7 +7,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,7 +26,6 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.storage.loot.LootContext;
 import net.minecraft.world.level.storage.loot.LootParams;
 import net.minecraft.world.level.storage.loot.LootTable;
 import net.minecraft.world.level.storage.loot.parameters.LootContextParamSets;
@@ -98,14 +96,13 @@ final class DropsPanel {
                     .withOptionalParameter(LootContextParams.DIRECT_ATTACKING_ENTITY, player)
                     .withOptionalParameter(LootContextParams.LAST_DAMAGE_PLAYER, player)
                     .create(LootContextParamSets.ENTITY);
-            LootContext context = new LootContext.Builder(params).create(Optional.empty());
 
             Map<Item, int[]> stats = new HashMap<>(); // hits, smallest and largest count in one kill
             long deadline = System.nanoTime() + BUDGET_NANOS;
             int rolls = 0;
             while (rolls < ROLLS && (rolls < MIN_ROLLS || System.nanoTime() < deadline)) {
                 Map<Item, Integer> got = new HashMap<>();
-                for (ItemStack stack : table.getRandomItems(context)) {
+                for (ItemStack stack : table.getRandomItems(params)) {
                     if (!stack.isEmpty()) {
                         got.merge(stack.getItem(), stack.getCount(), Integer::sum);
                     }
