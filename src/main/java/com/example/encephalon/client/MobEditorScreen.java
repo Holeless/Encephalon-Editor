@@ -169,7 +169,8 @@ public class MobEditorScreen extends Screen {
     // Animation libraries (GeckoLib and the like) drive a mob from its first render: they start from the bind pose and blend
     // into idle, then blend again into the walk once the walk state kicks in. A modded mob is therefore drawn off-screen
     // (empty scissor) for this long first, so those blends finish before anyone sees it.
-    private static final long WARMUP_NANOS = 500_000_000L;
+    private static final int WARMUP_TICKS = 10;      // simulated ticks of animation before a modded mob may be shown
+    private static final int FAST_STEPS = 6;         // warm-up ticks simulated (and rendered off-screen) per frame
     // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
     // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
     // entities it makes show up in the client level near the anchor and are drawn together with the preview mob.
@@ -180,10 +181,10 @@ public class MobEditorScreen extends Screen {
     private static final String PREVIEW_TAG = "encephalon_preview";
     // Companions are spawned all at once at their starting spots and then drift into place (the Void Worm even staggers
     // them out of a portal), which looks like pieces popping in. They are only drawn once the group has stopped changing.
-    private static final int SETTLE_STABLE_TICKS = 20;  // the number of companions must not change for this long
-    private static final int SETTLE_MIN_TICKS = 40;      // and at least this long must have passed since the twin spawned
-    private static final int SOLO_TICKS = 100;           // a twin that made no companions by now never will: drop it
-    private static final int MAX_IN_FLIGHT = 3;          // mobs being warmed up at the same time
+    private static final int SETTLE_STABLE_TICKS = 15;  // the number of companions must not change for this long
+    private static final int SETTLE_MIN_TICKS = 30;      // and at least this long must have passed since the twin spawned
+    private static final int SOLO_TICKS = 70;           // a twin that made no companions by now never will: drop it
+    private static final int MAX_IN_FLIGHT = 4;          // mobs being warmed up at the same time
     private static final int MAX_CACHED = 12;            // warmed mobs kept around for instant picking
 
     /** Modded types known to have no companions (no twin needed) / to have companions (hold the reveal until settled). */
@@ -208,6 +209,7 @@ public class MobEditorScreen extends Screen {
         long countChangedTick;
         boolean settled;
         boolean tickFailed;
+        int warmTicks;
 
         Preview(EntityType<?> type, LivingEntity entity, double ay, int slot) {
             this.type = type;
@@ -973,6 +975,8 @@ public class MobEditorScreen extends Screen {
         final int[] id = {-1};
         try {
             server.executeBlocking(() -> {
+                PreviewZone.beginSpawn(); // anything this mob creates outside the preview column is vetoed
+                try {
                 ServerLevel sl = server.getLevel(dim);
                 if (sl == null) {
                     return;
@@ -1002,6 +1006,9 @@ public class MobEditorScreen extends Screen {
                     EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
                     mob.discard();
                     discardAll(sl, box);
+                }
+                } finally {
+                    PreviewZone.endSpawn();
                 }
             });
         } catch (RuntimeException ex) {
@@ -1078,7 +1085,7 @@ public class MobEditorScreen extends Screen {
         clearAllTwins();
         warm.clear();
         active = null;
-        PreviewZone.zone = null;
+        PreviewZone.close();
         super.removed();
     }
 
@@ -1119,7 +1126,7 @@ public class MobEditorScreen extends Screen {
         if (isVanilla(p.type)) {
             return true;
         }
-        return p.firstRender != 0L && System.nanoTime() - p.firstRender >= WARMUP_NANOS;
+        return p.warmTicks >= WARMUP_TICKS;
     }
 
     /** Finished warming: animation blends done and, for mobs with parts, the group has settled. Nothing more to do off-screen. */
@@ -1339,9 +1346,16 @@ public class MobEditorScreen extends Screen {
             if (p.firstRender == 0L) {
                 p.firstRender = now;
             }
+            List<Entity> raw = rawCompanions(p);
+            if (!warmedUp(p)) {
+                if (!fastForward(g, p, raw, realPartial)) {
+                    badTypes.add(p.type);
+                    dispose(p);
+                }
+                continue;
+            }
             stepFrames(p, now);
             float partial = (now - p.sim) / (float) TICK_NANOS;
-            List<Entity> raw = rawCompanions(p);
             if (!hiddenRender(g, p, true, partial, raw, realPartial)) {
                 badTypes.add(p.type);
                 dispose(p);
@@ -1400,6 +1414,22 @@ public class MobEditorScreen extends Screen {
         }
     }
 
+    /**
+     * Animation libraries (GeckoLib and the like) blend from the bind pose into idle over a number of ticks of the mob's age.
+     * Instead of waiting for that in real time, a few ticks are simulated and rendered off-screen in one frame, each one
+     * advancing tickCount, so the blend is over before the mob is ever shown. Rendered at partial 0 so the animation
+     * clock never runs backwards when the real-time stepping takes over. Returns false if drawing failed.
+     */
+    private boolean fastForward(GuiGraphics g, Preview p, List<Entity> raw, float realPartial) {
+        boolean ok = true;
+        for (int i = 0; i < FAST_STEPS && ok && !warmedUp(p); i++) {
+            stepPreview(p);
+            ok = hiddenRender(g, p, true, 0F, raw, realPartial);
+        }
+        p.sim = System.nanoTime();
+        return ok;
+    }
+
     // ------------------------------------------------------------------ stepping
 
     /** Fixed-timestep simulation driven by the real clock, so age = tickCount + partial never goes backwards. */
@@ -1430,6 +1460,7 @@ public class MobEditorScreen extends Screen {
         LivingEntity e = p.entity;
         boolean dragon = e instanceof EnderDragon;
         e.tickCount++;
+        p.warmTicks++;
         boolean skipTick = e instanceof Guardian && !CAN_PIN_GUARDIAN;
         if (!p.tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
@@ -1538,6 +1569,10 @@ public class MobEditorScreen extends Screen {
         long now = System.nanoTime();
         if (p.firstRender == 0L) {
             p.firstRender = now;
+        }
+        if (!warmedUp(p)) {
+            fastForward(g, p, rawCompanions(p), realPartial);
+            now = System.nanoTime();
         }
         stepFrames(p, now);
         float partial = (now - p.sim) / (float) TICK_NANOS;

@@ -1,8 +1,12 @@
 package com.example.encephalon.client;
 
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 import com.example.encephalon.EncephalonMod;
 
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -11,17 +15,28 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.PlayLevelSoundEvent;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import net.neoforged.neoforge.event.entity.living.LivingChangeTargetEvent;
+import net.neoforged.neoforge.event.tick.EntityTickEvent;
 
 /**
  * The column of sky where the Mob Editor parks the previews (and the server-side twins of modded mobs, see MobEditorScreen).
  * Anything that appears in it while the editor is open belongs to the preview: the twin, and whatever it spawns
  * (body segments, a detached head, a portal, ...). Those must not hunt the player, take damage or make noise.
  * Sounds are silenced by position rather than per mob, so it works for any mod. Uses no client classes, so it is safe on any side.
+ *
+ * Containment: a twin runs its mod's real server code, and that code can reach outside the column (the Void Worm opens a portal
+ * in the sky and a sister portal at its destination, next to the player, which then teleports the player). So while a preview
+ * entity is spawning or ticking on the server, every entity it tries to add to a world is vetoed unless it is a living
+ * companion inside the column (a body segment or a head, which the preview draws). That is not specific to any one mod.
  */
 @EventBusSubscriber(modid = EncephalonMod.MOD_ID)
 public final class PreviewZone {
     /** Null while the editor is closed. */
     static volatile AABB zone;
+
+    /** Greater than zero while a twin is being created on the server thread (MobEditorScreen#startTwin). */
+    private static volatile int spawning;
+    /** Preview entities that are in the middle of their server tick right now (server thread only). */
+    private static final Set<Entity> TICKING = ConcurrentHashMap.newKeySet();
 
     private PreviewZone() {
     }
@@ -31,10 +46,58 @@ public final class PreviewZone {
         return z != null && z.contains(pos);
     }
 
+    /** Call on the server thread around code that creates a twin. */
+    static void beginSpawn() {
+        spawning++;
+    }
+
+    static void endSpawn() {
+        if (spawning > 0) {
+            spawning--;
+        }
+    }
+
+    /** Editor closed: forget everything. */
+    static void close() {
+        zone = null;
+        spawning = 0;
+        TICKING.clear();
+    }
+
+    /** True while preview code (a twin being created, or one ticking) is running on the server. */
+    private static boolean previewCodeRunning() {
+        return zone != null && (spawning > 0 || !TICKING.isEmpty());
+    }
+
+    @SubscribeEvent
+    public static void onTickPre(EntityTickEvent.Pre event) {
+        Entity e = event.getEntity();
+        if (zone != null && !e.level().isClientSide() && !(e instanceof Player) && contains(e.position())) {
+            TICKING.add(e);
+        }
+    }
+
+    @SubscribeEvent
+    public static void onTickPost(EntityTickEvent.Post event) {
+        if (!TICKING.isEmpty()) {
+            TICKING.remove(event.getEntity());
+        }
+    }
+
     @SubscribeEvent
     public static void onJoin(EntityJoinLevelEvent event) {
         Entity e = event.getEntity();
-        if (e instanceof Player || !contains(e.position())) {
+        if (e instanceof Player) {
+            return;
+        }
+        boolean inside = contains(e.position());
+        // Whatever a preview entity creates is vetoed, except living companions inside the column. This is what stops portals,
+        // their sister portals next to the player, projectiles, area clouds, items and minions from ever existing.
+        if (!event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !(e instanceof LivingEntity))) {
+            event.setCanceled(true);
+            return;
+        }
+        if (!inside) {
             return;
         }
         e.setSilent(true); // both sides: the client copy of a part makes its own noises
