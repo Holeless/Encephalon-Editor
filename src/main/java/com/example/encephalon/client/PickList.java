@@ -1,6 +1,7 @@
 package com.example.encephalon.client;
 
 import java.util.List;
+import java.util.function.Consumer;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
@@ -49,6 +50,27 @@ public class PickList extends ObjectSelectionList<PickList.Row> {
                 setSelected(row);
                 return;
             }
+        }
+    }
+
+    /** Calls out for every item in view, plus `margin` rows above and below (so scrolling lands on items that are already warm). */
+    public void forEachVisible(int margin, Consumer<Item> out) {
+        List<Row> rows = children();
+        int first = -1;
+        int last = -1;
+        for (int i = 0; i < rows.size(); i++) {
+            if (getRowBottom(i) > getY() && getRowTop(i) < getBottom()) {
+                if (first < 0) {
+                    first = i;
+                }
+                last = i;
+            }
+        }
+        if (first < 0) {
+            return;
+        }
+        for (int i = Math.max(0, first - margin); i <= Math.min(rows.size() - 1, last + margin); i++) {
+            out.accept(rows.get(i).item);
         }
     }
 

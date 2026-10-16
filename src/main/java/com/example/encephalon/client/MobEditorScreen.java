@@ -7,10 +7,12 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.joml.Quaternionf;
 
@@ -163,43 +165,79 @@ public class MobEditorScreen extends Screen {
     private final List<EntityType<?>> allTypes = new ArrayList<>();
     private final Set<String> expanded = new HashSet<>(Set.of(Scope.VANILLA.key()));
 
-    // 3D preview
-    private EntityType<?> previewType;
-    private LivingEntity previewEntity;
-    private final Set<EntityType<?>> badTypes = new HashSet<>();
-    private long simTime = System.nanoTime();
-    private boolean tickFailed;
+    // ------------------------------------------------------------------ 3D preview state
     // Animation libraries (GeckoLib and the like) drive a mob from its first render: they start from the bind pose and blend
     // into idle, then blend again into the walk once the walk state kicks in. A modded mob is therefore drawn off-screen
     // (empty scissor) for this long first, so those blends finish before anyone sees it.
     private static final long WARMUP_NANOS = 500_000_000L;
-    private static final long HOVER_DELAY_MS = 120L;    // how long the pointer rests on a mob row before it is warmed up
-    private long warmUntil;
-    // A second mob being warmed up off-screen (hovered in the list, or next in a rotation) so picking it shows no delay.
-    private EntityType<?> prewarmType;
-    private LivingEntity prewarmEntity;
-    private long prewarmSim;
-    private long prewarmFirstRender;
-    private EntityType<?> hoverType;
-    private long hoverSince;
-    // Where the preview mob is parked, fixed when it is created so it never counts as having moved.
-    private double anchorX;
-    private double anchorY;
-    private double anchorZ;
     // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
     // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
     // entities it makes show up in the client level near the anchor and are drawn together with the preview mob.
+    // Each twin lives in its own "slot", stacked vertically, so the parts of different mobs never mix and several mobs
+    // can be warmed up at once.
+    private static final int SLOTS = 6;
+    private static final double SLOT_SPACING = 96.0;
     private static final String PREVIEW_TAG = "encephalon_preview";
-    private final Set<EntityType<?>> noServerTwin = new HashSet<>();
-    private boolean twinActive;
-    private int twinId = -1;
     // Companions are spawned all at once at their starting spots and then drift into place (the Void Worm even staggers
     // them out of a portal), which looks like pieces popping in. They are only drawn once the group has stopped changing.
-    private static final int SETTLE_STABLE_TICKS = 30;  // the number of companions must not change for this long
-    private static final int SETTLE_MIN_TICKS = 70;      // and at least this long must have passed since the twin spawned
-    private long twinStartTick;
-    private int lastCompanionCount = -1;
-    private long companionCountChangedTick;
+    private static final int SETTLE_STABLE_TICKS = 20;  // the number of companions must not change for this long
+    private static final int SETTLE_MIN_TICKS = 40;      // and at least this long must have passed since the twin spawned
+    private static final int SOLO_TICKS = 100;           // a twin that made no companions by now never will: drop it
+    private static final int MAX_IN_FLIGHT = 3;          // mobs being warmed up at the same time
+    private static final int MAX_CACHED = 12;            // warmed mobs kept around for instant picking
+
+    /** Modded types known to have no companions (no twin needed) / to have companions (hold the reveal until settled). */
+    private static final Set<EntityType<?>> SOLO = ConcurrentHashMap.newKeySet();
+    private static final Set<EntityType<?>> MULTI = ConcurrentHashMap.newKeySet();
+    /** Types a server twin could not be made for. */
+    private static final Set<EntityType<?>> NO_TWIN = ConcurrentHashMap.newKeySet();
+
+    /** One preview mob: the client entity, the animation clock it is stepped with, and its server twin (if any). */
+    private final class Preview {
+        final EntityType<?> type;
+        final LivingEntity entity;
+        final double ax;
+        final double ay;
+        final double az;
+        int slot;
+        int twinId = -1;
+        long sim = System.nanoTime();
+        long firstRender;
+        long twinStartTick;
+        int lastCount = -1;
+        long countChangedTick;
+        boolean settled;
+        boolean tickFailed;
+
+        Preview(EntityType<?> type, LivingEntity entity, double ay, int slot) {
+            this.type = type;
+            this.entity = entity;
+            this.ax = anchorX;
+            this.ay = ay;
+            this.az = anchorZ;
+            this.slot = slot;
+            this.settled = slot < 0;
+        }
+
+        AABB box() {
+            return new AABB(ax - 64, ay - 48, az - 64, ax + 64, ay + 48, az + 64);
+        }
+    }
+
+    private Preview active;
+    /** Mobs warmed (or warming) off-screen, oldest first. */
+    private final Map<EntityType<?>, Preview> warm = new LinkedHashMap<>();
+    private final Set<EntityType<?>> wantedNow = new LinkedHashSet<>();
+    private final boolean[] slotUsed = new boolean[SLOTS];
+    private final Set<EntityType<?>> badTypes = new HashSet<>();
+    private EntityType<?> hoverType;
+    private long hoverStamp;
+    private EntityType<?> rotationNext;
+    // Where the previews are parked (x/z fixed when the editor opens, y is slot 0), so they never count as having moved.
+    private boolean anchorReady;
+    private double anchorX;
+    private double anchorY;
+    private double anchorZ;
 
     private Scope scope = Scope.VANILLA;
     private Behavior behavior;
@@ -247,6 +285,7 @@ public class MobEditorScreen extends Screen {
             MobConfigData[] box = new MobConfigData[1];
             server.executeBlocking(() -> box[0] = MobConfigData.get(server));
             data = box[0];
+            setupPreviewZone();
             sweepOrphans();
         }
 
@@ -767,7 +806,7 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    // ------------------------------------------------------------------ 3D preview
+    // ------------------------------------------------------------------ 3D preview helpers
 
     private static void faceViewer(LivingEntity e) {
         e.yBodyRot = 180F;
@@ -819,10 +858,33 @@ public class MobEditorScreen extends Screen {
         return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : 0.0);
     }
 
-    // ------------------------------------------------------------------ server twin (parts / companions)
+    private static boolean isVanilla(EntityType<?> t) {
+        return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
+    }
 
-    private AABB twinBox() {
-        return new AABB(anchorX - 64, anchorY - 48, anchorZ - 64, anchorX + 64, anchorY + 48, anchorZ + 64);
+    private static Field field(Class<?> owner, String name) {
+        try {
+            Field f = owner.getDeclaredField(name);
+            f.setAccessible(true);
+            return f;
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------------ preview zone / server twins
+
+    /** Fixes where previews are parked and tells PreviewZone to silence / protect everything that appears there. */
+    private void setupPreviewZone() {
+        if (anchorReady || this.minecraft.player == null || this.minecraft.level == null) {
+            return;
+        }
+        anchorX = this.minecraft.player.getX();
+        anchorZ = this.minecraft.player.getZ();
+        anchorY = this.minecraft.level.getMaxBuildHeight() + 64;
+        anchorReady = true;
+        PreviewZone.zone = new AABB(anchorX - 80, anchorY - 60, anchorZ - 80,
+                anchorX + 80, anchorY + SLOT_SPACING * SLOTS + 60, anchorZ + 80);
     }
 
     private static void discardAll(ServerLevel sl, AABB box) {
@@ -840,11 +902,12 @@ public class MobEditorScreen extends Screen {
         double px = this.minecraft.player.getX();
         double pz = this.minecraft.player.getZ();
         double low = this.minecraft.level.getMaxBuildHeight() + 16;
+        double high = low + 48 + SLOT_SPACING * SLOTS + 80;
         try {
             server.executeBlocking(() -> {
                 ServerLevel sl = server.getLevel(dim);
                 if (sl != null) {
-                    discardAll(sl, new AABB(px - 160, low, pz - 160, px + 160, low + 400, pz + 160));
+                    discardAll(sl, new AABB(px - 160, low, pz - 160, px + 160, high, pz + 160));
                 }
             });
         } catch (RuntimeException ex) {
@@ -852,20 +915,62 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Spawns the hidden twin of a modded mob so the entities its server logic creates exist for the preview. */
-    private void startTwin(EntityType<?> type) {
-        stopTwin();
-        if (server == null || this.minecraft.level == null
-                || BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace().equals("minecraft") || noServerTwin.contains(type)) {
-            return;
+    private int freeSlot() {
+        for (int i = 0; i < SLOTS; i++) {
+            if (!slotUsed[i]) {
+                slotUsed[i] = true;
+                return i;
+            }
         }
+        return -1;
+    }
+
+    /** A slot for a new twin. With evict, a cached mob gives its slot up (one nobody is looking at first). */
+    private int takeSlot(boolean evict) {
+        int s = freeSlot();
+        if (s >= 0 || !evict) {
+            return s;
+        }
+        Preview victim = null;
+        for (Preview p : warm.values()) {
+            if (p.slot < 0) {
+                continue;
+            }
+            if (!wantedNow.contains(p.type)) {
+                victim = p;
+                break;
+            }
+            if (victim == null) {
+                victim = p;
+            }
+        }
+        if (victim == null) {
+            return -1;
+        }
+        dispose(victim);
+        return freeSlot();
+    }
+
+    /** Frees the slot of a cached mob nobody needs any more. */
+    private boolean evictUnwanted() {
+        for (Preview p : warm.values()) {
+            if (p.slot >= 0 && !wantedNow.contains(p.type)) {
+                dispose(p);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Spawns the hidden twin of a modded mob so the entities its server logic creates exist for the preview. */
+    private void startTwin(Preview p) {
+        EntityType<?> type = p.type;
         var dim = this.minecraft.level.dimension();
-        final double x = anchorX;
-        final double y = anchorY;
-        final double z = anchorZ;
-        final AABB box = twinBox();
+        final double x = p.ax;
+        final double y = p.ay;
+        final double z = p.az;
+        final AABB box = p.box();
         final int[] id = {-1};
-        PreviewZone.zone = box;
         try {
             server.executeBlocking(() -> {
                 ServerLevel sl = server.getLevel(dim);
@@ -903,30 +1008,32 @@ public class MobEditorScreen extends Screen {
             EncephalonMod.LOGGER.warn("Mob Editor preview: server twin failed for {}", type, ex);
         }
         if (id[0] == -1) {
-            noServerTwin.add(type);
-            PreviewZone.zone = null;
+            NO_TWIN.add(type);
+            slotUsed[p.slot] = false;
+            p.slot = -1;
+            p.settled = true;
             return;
         }
-        twinId = id[0];
-        twinActive = true;
-        twinStartTick = this.minecraft.level.getGameTime();
-        lastCompanionCount = -1;
-        companionCountChangedTick = twinStartTick;
+        p.twinId = id[0];
+        p.twinStartTick = this.minecraft.level.getGameTime();
+        p.lastCount = -1;
+        p.countChangedTick = p.twinStartTick;
+        p.settled = false;
     }
 
-    /** Removes the twin and everything it spawned. */
-    private void stopTwin() {
-        if (!twinActive) {
+    /** Removes a mob's twin and everything it spawned, and gives its slot back. */
+    private void stopTwin(Preview p) {
+        if (p.slot < 0) {
             return;
         }
-        twinActive = false;
-        twinId = -1;
+        slotUsed[p.slot] = false;
+        p.slot = -1;
+        p.twinId = -1;
         if (server == null || this.minecraft.level == null) {
-            PreviewZone.zone = null;
             return;
         }
         var dim = this.minecraft.level.dimension();
-        final AABB box = twinBox();
+        final AABB box = p.box();
         try {
             server.executeBlocking(() -> {
                 ServerLevel sl = server.getLevel(dim);
@@ -937,37 +1044,106 @@ public class MobEditorScreen extends Screen {
         } catch (RuntimeException ex) {
             EncephalonMod.LOGGER.warn("Mob Editor preview: could not remove the server twin", ex);
         }
-        PreviewZone.zone = null;
     }
 
-    /** Entities around the preview mob that belong to it: parts, a head, tails. The twin's own client copy is skipped. */
-    private List<Entity> companions() {
-        if (!twinActive || this.minecraft.level == null) {
-            return List.of();
+    private void dispose(Preview p) {
+        stopTwin(p);
+        warm.remove(p.type, p);
+    }
+
+    private void clearAllTwins() {
+        boolean any = false;
+        for (int i = 0; i < SLOTS; i++) {
+            any |= slotUsed[i];
+            slotUsed[i] = false;
         }
-        // Living entities only: those are the segments and heads. Other things the mob makes (the Void Worm's portal) are
-        // effects of the twin standing still up there, not part of the mob.
-        List<Entity> found = this.minecraft.level.getEntities((Entity) null, twinBox(),
-                en -> en instanceof LivingEntity && en.getId() != twinId && en != previewEntity && en != this.minecraft.player);
-        long now = this.minecraft.level.getGameTime();
-        if (found.size() != lastCompanionCount) {
-            lastCompanionCount = found.size();
-            companionCountChangedTick = now;
+        AABB z = PreviewZone.zone;
+        if (any && z != null && server != null && this.minecraft.level != null) {
+            var dim = this.minecraft.level.dimension();
+            try {
+                server.executeBlocking(() -> {
+                    ServerLevel sl = server.getLevel(dim);
+                    if (sl != null) {
+                        discardAll(sl, z);
+                    }
+                });
+            } catch (RuntimeException ex) {
+                EncephalonMod.LOGGER.warn("Mob Editor preview: could not remove the server twins", ex);
+            }
         }
-        if (now - companionCountChangedTick < SETTLE_STABLE_TICKS || now - twinStartTick < SETTLE_MIN_TICKS) {
-            return List.of();
-        }
-        return found.size() > 64 ? found.subList(0, 64) : found;
     }
 
     @Override
     public void removed() {
-        stopTwin();
+        clearAllTwins();
+        warm.clear();
+        active = null;
+        PreviewZone.zone = null;
         super.removed();
     }
 
+    /**
+     * Entities around a preview mob that belong to it: parts, a head, tails. Also decides when the group has settled
+     * (and learns which mob types have companions at all, so later previews know whether a twin is worth it).
+     */
+    private List<Entity> rawCompanions(Preview p) {
+        if (p.slot < 0 || this.minecraft.level == null) {
+            return List.of();
+        }
+        // Living entities only: those are the segments and heads. Other things the mob makes (the Void Worm's portal) are
+        // effects of the twin standing still up there, not part of the mob.
+        List<Entity> found = this.minecraft.level.getEntities((Entity) null, p.box(),
+                en -> en instanceof LivingEntity && en.getId() != p.twinId && en != p.entity && en != this.minecraft.player);
+        long now = this.minecraft.level.getGameTime();
+        if (found.size() != p.lastCount) {
+            p.lastCount = found.size();
+            p.countChangedTick = now;
+        }
+        long age = now - p.twinStartTick;
+        p.settled = now - p.countChangedTick >= SETTLE_STABLE_TICKS && age >= SETTLE_MIN_TICKS;
+        if (p.settled) {
+            if (!found.isEmpty()) {
+                MULTI.add(p.type);
+            } else if (age >= SOLO_TICKS) {
+                SOLO.add(p.type);
+                stopTwin(p);
+                p.settled = true;
+            }
+        }
+        return found;
+    }
+
+    // ------------------------------------------------------------------ preview selection and caching
+
+    private static boolean warmedUp(Preview p) {
+        if (isVanilla(p.type)) {
+            return true;
+        }
+        return p.firstRender != 0L && System.nanoTime() - p.firstRender >= WARMUP_NANOS;
+    }
+
+    /** Finished warming: animation blends done and, for mobs with parts, the group has settled. Nothing more to do off-screen. */
+    private boolean isDone(Preview p) {
+        return warmedUp(p) && (p.slot < 0 || p.settled);
+    }
+
+    /**
+     * Whether the mob may be shown. A mob known to have parts waits until they have settled so it never appears piecemeal;
+     * one not known to have any shows after the warm-up (parts that turn up later still wait to appear together).
+     */
+    private boolean revealable(Preview p) {
+        if (!warmedUp(p)) {
+            return false;
+        }
+        if (p.slot < 0 || p.settled) {
+            return true;
+        }
+        return p.lastCount <= 0 && !MULTI.contains(p.type);
+    }
+
     /** The mob to show: the selected mob type, or a rotating pick from the selected category / all mobs. */
-    private LivingEntity previewEntity() {
+    private Preview current() {
+        rotationNext = null;
         if (this.minecraft.level == null) {
             return null;
         }
@@ -999,66 +1175,82 @@ public class MobEditorScreen extends Screen {
         }
         if (scope.type() != ScopeType.MOB_TYPE) {
             start = (int) ((Util.getMillis() / 4000L) % list.size());
-            // Warm the next mob up during the last moments of this one's turn, so the swap is seamless.
-            if (list.size() > 1 && Util.getMillis() % 4000L > 3300L) {
-                prewarm(list.get((start + 1) % list.size()));
+            if (list.size() > 1) {
+                // Warm the next mob of the rotation for the whole turn of this one, so the swap is seamless.
+                rotationNext = list.get((start + 1) % list.size());
             }
         }
         for (int i = 0; i < list.size(); i++) {
             EntityType<?> t = list.get((start + i) % list.size());
-            if (t == previewType && previewEntity != null) {
-                return previewEntity;
+            if (active != null && active.type == t) {
+                return active;
             }
             if (badTypes.contains(t)) {
                 continue;
             }
-            long ready;
-            LivingEntity living;
-            if (prewarmEntity != null && prewarmType == t) {
-                // Already warmed up off-screen (hovered, or the next one in a rotation): show it straight away.
-                living = prewarmEntity;
-                ready = prewarmFirstRender == 0L ? System.nanoTime() + WARMUP_NANOS : prewarmFirstRender + WARMUP_NANOS;
-                simTime = prewarmSim;
-                clearPrewarm();
-                updateAnchor();
-                living.setPos(anchorX, anchorY, anchorZ);
-                living.setOldPosAndRot();
-            } else {
-                updateAnchor();
-                living = createPreview(t);
-                if (living == null) {
-                    continue;
-                }
-                ready = isVanilla(t) ? 0L : System.nanoTime() + WARMUP_NANOS;
-                simTime = System.nanoTime();
+            Preview p = warm.remove(t);
+            if (p == null) {
+                p = create(t, true);
             }
-            warmUntil = ready;
-            tickFailed = false;
-            previewType = t;
-            previewEntity = living;
-            startTwin(t);
-            return living;
+            if (p == null) {
+                continue;
+            }
+            demote(active);
+            active = p;
+            return p;
         }
         return null;
     }
 
-    private static boolean isVanilla(EntityType<?> t) {
-        return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
+    /** A mob that is no longer shown goes back into the cache if it is fully warmed, so picking it again is instant. */
+    private void demote(Preview old) {
+        if (old == null) {
+            return;
+        }
+        if (isVanilla(old.type) || !isDone(old) || badTypes.contains(old.type)) {
+            stopTwin(old);
+            return;
+        }
+        warm.remove(old.type);
+        warm.put(old.type, old);
+        trimCache();
     }
 
-    private void updateAnchor() {
-        if (this.minecraft.player != null && this.minecraft.level != null) {
-            anchorX = this.minecraft.player.getX();
-            anchorY = this.minecraft.level.getMaxBuildHeight() + 64;
-            anchorZ = this.minecraft.player.getZ();
+    private void trimCache() {
+        while (warm.size() > MAX_CACHED) {
+            Preview oldest = warm.values().iterator().next();
+            dispose(oldest);
         }
     }
 
-    /** Creates and sets up a preview mob at the anchor, or returns null (and blacklists the type) if it can't be made. */
-    private LivingEntity createPreview(EntityType<?> t) {
+    /** Creates and sets up a preview mob (and its twin when it may need one), or returns null if it can't be made. */
+    private Preview create(EntityType<?> t, boolean evict) {
         if (this.minecraft.level == null || badTypes.contains(t)) {
             return null;
         }
+        int slot = -1;
+        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t)) {
+            slot = takeSlot(evict);
+            if (slot < 0 && !evict) {
+                return null; // no room to warm it yet
+            }
+        }
+        double ay = anchorY + Math.max(slot, 0) * SLOT_SPACING;
+        LivingEntity e = makeEntity(t, anchorX, ay, anchorZ);
+        if (e == null) {
+            if (slot >= 0) {
+                slotUsed[slot] = false;
+            }
+            return null;
+        }
+        Preview p = new Preview(t, e, ay, slot);
+        if (slot >= 0) {
+            startTwin(p);
+        }
+        return p;
+    }
+
+    private LivingEntity makeEntity(EntityType<?> t, double x, double y, double z) {
         try {
             Entity e = t.create(this.minecraft.level);
             if (e instanceof LivingEntity living) {
@@ -1071,7 +1263,7 @@ public class MobEditorScreen extends Screen {
                 faceViewer(living);
                 // Park it at its spot now, while tickCount is still 0: entities treat a move after that as a teleport
                 // (a shulker, for one, slides in from its old position).
-                living.setPos(anchorX, anchorY, anchorZ);
+                living.setPos(x, y, z);
                 living.setOldPosAndRot();
                 living.setDeltaMovement(previewMotion(living));
                 // Start in the steady walking state instead of ramping up to it after the first frame.
@@ -1085,67 +1277,85 @@ public class MobEditorScreen extends Screen {
         return null;
     }
 
-    // ------------------------------------------------------------------ off-screen warm-up
+    // ------------------------------------------------------------------ background warm-up
 
-    private void clearPrewarm() {
-        prewarmEntity = null;
-        prewarmType = null;
-        prewarmFirstRender = 0L;
-    }
-
-    /** Starts warming a modded mob up off-screen so it is already settled when it is picked. */
-    private void prewarm(EntityType<?> t) {
-        if (t == previewType || t == prewarmType || isVanilla(t) || badTypes.contains(t) || this.minecraft.level == null) {
-            return;
-        }
-        if (previewEntity == null) {
-            updateAnchor();
-        }
-        LivingEntity e = createPreview(t);
-        if (e == null) {
-            return;
-        }
-        prewarmType = t;
-        prewarmEntity = e;
-        prewarmSim = System.nanoTime();
-        prewarmFirstRender = 0L;
-    }
-
-    /** Called every frame a mob row is hovered; warming starts once the pointer has rested on it for a moment. */
+    /** Called every frame a mob row is hovered: that mob goes to the front of the warm-up queue straight away. */
     void hoverPrewarm(EntityType<?> t) {
-        long now = Util.getMillis();
-        if (t != hoverType) {
-            hoverType = t;
-            hoverSince = now;
-        } else if (now - hoverSince >= HOVER_DELAY_MS) {
-            prewarm(t);
-        }
+        hoverType = t;
+        hoverStamp = Util.getMillis();
     }
 
-    /** Steps and draws the warming mob with an empty clip area: the animation library runs, nothing is shown. */
-    private void warmRender(GuiGraphics g) {
-        LivingEntity p = prewarmEntity;
-        if (p == null) {
+    /** Mobs worth having warm, most important first: the hovered row, the next in a rotation, then everything in view. */
+    private void computeWanted() {
+        wantedNow.clear();
+        if (hoverType != null && Util.getMillis() - hoverStamp < 250L) {
+            wantedNow.add(hoverType);
+        }
+        if (rotationNext != null) {
+            wantedNow.add(rotationNext);
+        }
+        if (scopeList != null) {
+            scopeList.forEachVisible(4, it -> {
+                if (it instanceof ScopeItem si && si.s.type() == ScopeType.MOB_TYPE) {
+                    wantedNow.add(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(si.s.id())));
+                }
+            });
+        }
+        wantedNow.removeIf(MobEditorScreen::isVanilla);
+    }
+
+    /** Starts at most one new warm-up per frame (a few run at once) and steps / draws the running ones off-screen. */
+    private void pumpWarm(GuiGraphics g, float realPartial) {
+        if (this.minecraft.level == null) {
             return;
         }
-        long now = System.nanoTime();
-        if (prewarmFirstRender == 0L) {
-            prewarmFirstRender = now;
-        }
-        if (now - prewarmSim > 1_000_000_000L) {
-            prewarmSim = now;
-        }
-        int steps = 0;
-        while (now - prewarmSim >= TICK_NANOS) {
-            prewarmSim += TICK_NANOS;
-            if (steps++ < 4) {
-                stepPreview(p);
+        int inFlight = 0;
+        for (Preview p : warm.values()) {
+            if (!isDone(p)) {
+                inFlight++;
             }
         }
-        float partial = (now - prewarmSim) / (float) TICK_NANOS;
-        faceViewer(p);
-        forceWet(p);
-        p.setInvisible(false);
+        if (inFlight < MAX_IN_FLIGHT) {
+            for (EntityType<?> t : wantedNow) {
+                if ((active != null && active.type == t) || warm.containsKey(t) || badTypes.contains(t)) {
+                    continue;
+                }
+                Preview p = create(t, false);
+                if (p == null && !badTypes.contains(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && evictUnwanted()) {
+                    p = create(t, false);
+                }
+                if (p != null) {
+                    warm.put(t, p);
+                    trimCache();
+                }
+                break;
+            }
+        }
+        for (Preview p : new ArrayList<>(warm.values())) {
+            if (isDone(p)) {
+                continue;
+            }
+            long now = System.nanoTime();
+            if (p.firstRender == 0L) {
+                p.firstRender = now;
+            }
+            stepFrames(p, now);
+            float partial = (now - p.sim) / (float) TICK_NANOS;
+            List<Entity> raw = rawCompanions(p);
+            if (!hiddenRender(g, p, true, partial, raw, realPartial)) {
+                badTypes.add(p.type);
+                dispose(p);
+            }
+        }
+    }
+
+    /** Draws with an empty clip area: the animation library runs, nothing is shown. Returns false if drawing failed. */
+    private boolean hiddenRender(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras, float realPartial) {
+        LivingEntity e = p.entity;
+        faceViewer(e);
+        forceWet(e);
+        e.setInvisible(false);
+        boolean ok = true;
         g.enableScissor(rx, TOP, rx, viewBottom());
         PoseStack pose = g.pose();
         pose.pushPose();
@@ -1156,26 +1366,53 @@ public class MobEditorScreen extends Screen {
             pose.mulPose(new Quaternionf().rotateZ((float) Math.PI));
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
-            RenderSystem.runAsFancy(() -> dispatcher.render(p, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880));
+            RenderSystem.runAsFancy(() -> drawModels(g, p, withMain, partial, extras, realPartial, pose, dispatcher));
             g.flush();
         } catch (Exception ex) {
-            badTypes.add(prewarmType);
-            clearPrewarm();
+            ok = false;
         } finally {
             dispatcher.setRenderShadow(true);
             pose.popPose();
             Lighting.setupFor3DItems();
         }
         g.disableScissor();
+        return ok;
     }
 
-    private static Field field(Class<?> owner, String name) {
-        try {
-            Field f = owner.getDeclaredField(name);
-            f.setAccessible(true);
-            return f;
-        } catch (ReflectiveOperationException | RuntimeException ex) {
-            return null;
+    /** Draws the mob and its companions. Companions are placed relative to the mob, which sits at its anchor. */
+    private void drawModels(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras,
+                            float realPartial, PoseStack pose, EntityRenderDispatcher dispatcher) {
+        if (withMain) {
+            dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880);
+        }
+        for (Entity c : extras) {
+            // These are ticked by the real client clock. A companion that fails to draw is skipped; it should not take
+            // the whole preview down with it.
+            try {
+                double dx = Mth.lerp(realPartial, c.xOld, c.getX()) - p.ax;
+                double dy = Mth.lerp(realPartial, c.yOld, c.getY()) - p.ay;
+                double dz = Mth.lerp(realPartial, c.zOld, c.getZ()) - p.az;
+                dispatcher.render(c, dx, dy, dz, Mth.lerp(realPartial, c.yRotO, c.getYRot()), realPartial, pose,
+                        g.bufferSource(), 15728880);
+            } catch (RuntimeException ex) {
+                // skip this one
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ stepping
+
+    /** Fixed-timestep simulation driven by the real clock, so age = tickCount + partial never goes backwards. */
+    private void stepFrames(Preview p, long now) {
+        if (now - p.sim > 1_000_000_000L) {
+            p.sim = now; // was not rendering for a while (cached, or a behavior was open); don't fast-forward
+        }
+        int steps = 0;
+        while (now - p.sim >= TICK_NANOS) {
+            p.sim += TICK_NANOS;
+            if (steps++ < 4) {
+                stepPreview(p);
+            }
         }
     }
 
@@ -1186,18 +1423,19 @@ public class MobEditorScreen extends Screen {
      * The level normally does the per-tick bookkeeping (old position and tickCount) before entity.tick(); tickCount is the
      * "age" that rods, tentacles, wings and segments animate from, so it must advance here or those mobs vibrate.
      */
-    private void stepPreview(LivingEntity e) {
+    private void stepPreview(Preview p) {
         if (this.minecraft.level == null || this.minecraft.player == null) {
             return;
         }
+        LivingEntity e = p.entity;
         boolean dragon = e instanceof EnderDragon;
         e.tickCount++;
         boolean skipTick = e instanceof Guardian && !CAN_PIN_GUARDIAN;
-        if (!tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
+        if (!p.tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
-                double hx = anchorX;
-                double hy = anchorY;
-                double hz = anchorZ;
+                double hx = p.ax;
+                double hy = p.ay;
+                double hz = p.az;
                 float[] walk = null;
                 if (CAN_PIN_WALK) {
                     walk = new float[] {WALK_SPEED_OLD.getFloat(e.walkAnimation), WALK_SPEED_NOW.getFloat(e.walkAnimation),
@@ -1258,7 +1496,7 @@ public class MobEditorScreen extends Screen {
                     WALK_POS.setFloat(e.walkAnimation, walk[2]);
                 }
             } catch (Exception ex) {
-                tickFailed = true;
+                p.tickFailed = true;
             }
         }
         e.walkAnimation.update(e instanceof Turtle ? TURTLE_WALK_SPEED : WALK_SPEED, 0.4F);
@@ -1284,25 +1522,30 @@ public class MobEditorScreen extends Screen {
         }
     }
 
+    // ------------------------------------------------------------------ preview drawing
+
     private void renderPreview(GuiGraphics g, float realPartial) {
-        LivingEntity e = previewEntity();
-        if (e == null) {
-            warmRender(g);
-            return;
+        computeWanted();
+        Preview p = current();
+        if (p != null) {
+            drawActive(g, p, realPartial);
         }
-        // Fixed-timestep simulation driven by the real clock, so age = tickCount + partial never goes backwards.
+        pumpWarm(g, realPartial);
+    }
+
+    private void drawActive(GuiGraphics g, Preview p, float realPartial) {
+        LivingEntity e = p.entity;
         long now = System.nanoTime();
-        if (now - simTime > 1_000_000_000L) {
-            simTime = now; // was not rendering for a while (e.g. a behavior was open); don't fast-forward
+        if (p.firstRender == 0L) {
+            p.firstRender = now;
         }
-        int steps = 0;
-        while (now - simTime >= TICK_NANOS) {
-            simTime += TICK_NANOS;
-            if (steps++ < 4) {
-                stepPreview(e);
-            }
-        }
-        float partial = (now - simTime) / (float) TICK_NANOS;
+        stepFrames(p, now);
+        float partial = (now - p.sim) / (float) TICK_NANOS;
+
+        List<Entity> raw = rawCompanions(p);
+        // Companions are only drawn together once the group has settled; until then they are just warmed up hidden.
+        List<Entity> extras = p.settled && !raw.isEmpty() ? (raw.size() > 64 ? raw.subList(0, 64) : raw) : List.of();
+        boolean visible = revealable(p);
 
         int top = TOP + 6;
         int bottom = viewBottom() - 16;
@@ -1335,9 +1578,8 @@ public class MobEditorScreen extends Screen {
                 : e instanceof Ghast ? GHAST_CENTER_Y
                 : bbH / 2F;
 
-        // Entities that belong to the mob but are separate (body segments, a detached head). When there are any, the whole
-        // group is fitted and centred, and turned side-on so a long body is seen along its length.
-        List<Entity> extras = companions();
+        // When the mob has companions (body segments, a detached head) the whole group is fitted and centred, and turned
+        // side-on so a long body is seen along its length.
         boolean group = !extras.isEmpty();
         float pivotX = 0F;
         float pivotZ = 0F;
@@ -1350,12 +1592,12 @@ public class MobEditorScreen extends Screen {
             double maxY = bbH;
             for (Entity c : extras) {
                 AABB b = c.getBoundingBox();
-                minX = Math.min(minX, b.minX - anchorX);
-                maxX = Math.max(maxX, b.maxX - anchorX);
-                minZ = Math.min(minZ, b.minZ - anchorZ);
-                maxZ = Math.max(maxZ, b.maxZ - anchorZ);
-                minY = Math.min(minY, b.minY - anchorY);
-                maxY = Math.max(maxY, b.maxY - anchorY);
+                minX = Math.min(minX, b.minX - p.ax);
+                maxX = Math.max(maxX, b.maxX - p.ax);
+                minZ = Math.min(minZ, b.minZ - p.az);
+                maxZ = Math.max(maxZ, b.maxZ - p.az);
+                minY = Math.min(minY, b.minY - p.ay);
+                maxY = Math.max(maxY, b.maxY - p.ay);
             }
             pivotX = (float) ((minX + maxX) / 2.0);
             pivotZ = (float) ((minZ + maxZ) / 2.0);
@@ -1377,8 +1619,8 @@ public class MobEditorScreen extends Screen {
         final float pz = pivotZ;
         final List<Entity> drawExtras = extras;
 
-        boolean warming = now < warmUntil;
-        g.enableScissor(rx, TOP, warming ? rx : rx + rw + 6, viewBottom()); // zero width while warming up: rendered, not shown
+        boolean failed = false;
+        g.enableScissor(rx, TOP, visible ? rx + rw + 6 : rx, viewBottom()); // zero width while warming up: rendered, not shown
         PoseStack pose = g.pose();
         pose.pushPose();
         EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
@@ -1389,38 +1631,27 @@ public class MobEditorScreen extends Screen {
             pose.translate(-px, 0.0F, -pz); // turn around the middle of the group, not the head
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
-            RenderSystem.runAsFancy(() -> {
-                dispatcher.render(e, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880);
-                for (Entity c : drawExtras) {
-                    // Placed relative to the preview mob, which sits at the anchor. These are ticked by the real client clock.
-                    // A companion that fails to draw is skipped; it should not take the whole preview down with it.
-                    try {
-                        double dx = Mth.lerp(realPartial, c.xOld, c.getX()) - anchorX;
-                        double dy = Mth.lerp(realPartial, c.yOld, c.getY()) - anchorY;
-                        double dz = Mth.lerp(realPartial, c.zOld, c.getZ()) - anchorZ;
-                        dispatcher.render(c, dx, dy, dz, Mth.lerp(realPartial, c.yRotO, c.getYRot()), realPartial, pose,
-                                g.bufferSource(), 15728880);
-                    } catch (RuntimeException ex) {
-                        // skip this one
-                    }
-                }
-            });
+            RenderSystem.runAsFancy(() -> drawModels(g, p, true, partial, drawExtras, realPartial, pose, dispatcher));
             g.flush();
         } catch (Exception ex) {
-            badTypes.add(previewType);
-            previewEntity = null;
-            previewType = null;
+            failed = true;
         } finally {
             dispatcher.setRenderShadow(true);
             pose.popPose();
             Lighting.setupFor3DItems();
         }
         g.disableScissor();
-        warmRender(g);
-
-        if (previewType != null) {
-            g.drawCenteredString(this.font, previewType.getDescription(), (int) cx, viewBottom() - 12, 0xC8C8C8);
+        if (failed) {
+            badTypes.add(p.type);
+            dispose(p);
+            active = null;
+            return;
         }
+        // Companions that are not shown yet still have to be rendered, so their animation library has settled by the reveal.
+        if (!p.settled && !raw.isEmpty()) {
+            hiddenRender(g, p, false, partial, raw, realPartial);
+        }
+        g.drawCenteredString(this.font, p.type.getDescription(), (int) cx, viewBottom() - 12, 0xC8C8C8);
     }
 
     // ------------------------------------------------------------------ render
@@ -1460,6 +1691,9 @@ public class MobEditorScreen extends Screen {
             renderPreview(g, partialTick);
             return;
         }
+        // No preview while a behavior is open, but mobs in view keep warming up in the background.
+        computeWanted();
+        pumpWarm(g, partialTick);
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         for (int i = 0; i < descLines.size(); i++) {
