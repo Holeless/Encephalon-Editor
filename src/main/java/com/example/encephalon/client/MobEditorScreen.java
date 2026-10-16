@@ -55,6 +55,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
+import net.minecraft.world.BossEvent;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.FlyingMob;
@@ -126,6 +127,11 @@ public class MobEditorScreen extends Screen {
     // ...unless they are microscopic: a mob whose core size would come out smaller than this many pixels is enlarged until
     // it is that big (so a 0.3 block mob is visible, but a normal small mob is left at its natural size).
     private static final float MIN_SHOWN_PX = 30F;
+    // So that mobs keep their size relative to each other, nothing is drawn bigger than the size at which a zombie (1.95 blocks)
+    // fills REF_FILL of the panel height; only mobs too big for the panel are shrunk below that. (On a small panel, i.e. a big
+    // GUI scale, this is below MAX_FIT_SCALE, which is what leaves room for a giant to look bigger than a zombie.)
+    private static final float REF_HEIGHT = 1.95F;
+    private static final float REF_FILL = 0.5F;
     private static final int LABEL_STRIP = 18;          // pixels kept free above the bottom of the panel for the name label
     private static final float FILL_W = 0.95F;
     private static final float GROUP_VIEW_ANGLE = 0.55F;
@@ -314,8 +320,12 @@ public class MobEditorScreen extends Screen {
             return new AABB(ax - 64, ay - 48, az - 64, ax + 64, ay + 48, az + 64);
         }
 
+        /** Vanilla mobs are measured once, off-screen, with this set (see drawActive), so their size is the drawn size. */
+        boolean forceMeasure;
+        boolean vanillaMeasured;
+
         boolean canMeasure() {
-            return !isVanilla(type) && !stable;
+            return forceMeasure || (!isVanilla(type) && !stable);
         }
 
         /** Called after each simulated, rendered warm-up tick: decides when the model's size has settled. */
@@ -362,7 +372,7 @@ public class MobEditorScreen extends Screen {
         /** Records a vertex of the model, in blocks from the anchor (x, z horizontal, y up). */
         void measure(float wx, float wy, float wz) {
             // The first warm-up ticks are the bind pose (limbs wherever the model file left them); only the settled ones count.
-            if (warmTicks < WARMUP_TICKS - 4 || Float.isNaN(wx + wy + wz)
+            if ((!forceMeasure && warmTicks < WARMUP_TICKS - 4) || Float.isNaN(wx + wy + wz)
                     || Math.abs(wx) > 250F || Math.abs(wy) > 250F || Math.abs(wz) > 250F) {
                 return;
             }
@@ -383,7 +393,7 @@ public class MobEditorScreen extends Screen {
         }
 
         boolean hasMeasure() {
-            return samples >= 200;
+            return samples >= (isVanilla(type) ? 24 : 200);
         }
 
         /** Distance from the anchor's vertical axis that nearly all vertices are within (outermost 0.2% ignored). */
@@ -551,6 +561,10 @@ public class MobEditorScreen extends Screen {
         for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
             String c = MobGroups.categoryOf(t);
             if (c == null || !listing.isListed(t)) {
+                continue;
+            }
+            // Modded mobs filed under MISC are kept (see MobGroups), but MISC also holds things that are not mobs at all.
+            if (t.getCategory() == MobCategory.MISC && !isVanilla(t) && !isMobClass(t)) {
                 continue;
             }
             String ns = BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace();
@@ -1090,9 +1104,69 @@ public class MobEditorScreen extends Screen {
         return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
     }
 
-    /** Modded mobs listed in the mod config (quietMobs): drawn but never ticked, and given no server twin. */
-    private static boolean isQuiet(EntityType<?> t) {
-        return !isVanilla(t) && EncephalonConfig.isQuiet(t);
+    /** The entity class of a type (made once, never added to the level), or null if one can't be made. */
+    private static final Map<EntityType<?>, Class<?>> CLASS_OF = new ConcurrentHashMap<>();
+    private static final Map<Class<?>, Boolean> HAS_BOSS_BAR = new ConcurrentHashMap<>();
+
+    private Class<?> classOf(EntityType<?> t) {
+        Class<?> c = CLASS_OF.get(t);
+        if (c == null && this.minecraft.level != null) {
+            c = Void.class; // "unknown", so a type that can't be made is not tried again every frame
+            try {
+                Entity e = t.create(this.minecraft.level);
+                if (e != null) {
+                    c = e.getClass();
+                    e.discard();
+                }
+            } catch (Exception | LinkageError ex) {
+                // unknown
+            }
+            CLASS_OF.put(t, c);
+        }
+        return c == null || c == Void.class ? null : c;
+    }
+
+    /** Whether the class (or one it extends) holds a boss bar: a boss, whatever the mod calls it or tags it as. */
+    private static boolean hasBossBar(Class<?> c) {
+        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
+            try {
+                for (Field f : k.getDeclaredFields()) {
+                    if (BossEvent.class.isAssignableFrom(f.getType())) {
+                        return true;
+                    }
+                }
+            } catch (LinkageError | RuntimeException ex) {
+                // a field type from a mod that is not installed
+            }
+        }
+        return false;
+    }
+
+    private boolean isMobClass(EntityType<?> t) {
+        Class<?> c = classOf(t);
+        return c != null && Mob.class.isAssignableFrom(c);
+    }
+
+    /**
+     * Modded mobs the preview must draw but never tick, and give no server twin: the ones in the built-in / config list, modded
+     * bosses (tagged c:bosses), and anything whose class holds a boss bar. Their own code changes the sky, starts music and
+     * so on when they merely exist.
+     */
+    private boolean quiet(EntityType<?> t) {
+        if (isVanilla(t)) {
+            return false;
+        }
+        if (EncephalonConfig.isQuiet(t)) {
+            return true;
+        }
+        Class<?> c = classOf(t);
+        return c != null && HAS_BOSS_BAR.computeIfAbsent(c, MobEditorScreen::hasBossBar);
+    }
+
+    /** The biggest scale a mob of this size (blocks) is drawn at; see REF_FILL. Microscopic mobs may go past it. */
+    private static float baseScale(float panelH, float size) {
+        float cap = Math.min(MAX_FIT_SCALE, panelH * REF_FILL / REF_HEIGHT);
+        return Math.max(cap, MIN_SHOWN_PX / Math.max(size, 0.05F));
     }
 
     private static Field field(Class<?> owner, String name) {
@@ -1235,7 +1309,7 @@ public class MobEditorScreen extends Screen {
                         id[0] = mob.getId();
                         PreviewZone.pinTwin(mob, new Vec3(x, y, z)); // it must not drift: its parts are drawn relative to this spot
                     }
-                } catch (RuntimeException ex) {
+                } catch (RuntimeException | LinkageError ex) {
                     EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
                     mob.discard();
                     discardAll(sl, box);
@@ -1244,7 +1318,7 @@ public class MobEditorScreen extends Screen {
                     PreviewZone.endSpawn();
                 }
             });
-        } catch (RuntimeException ex) {
+        } catch (RuntimeException | LinkageError ex) {
             EncephalonMod.LOGGER.warn("Mob Editor preview: server twin failed for {}", type, ex);
         }
         if (id[0] == -1) {
@@ -1318,6 +1392,13 @@ public class MobEditorScreen extends Screen {
         clearAllTwins();
         warm.clear();
         active = null;
+        // Anything a preview mob's client code added to the client level up there (the server twins are removed above).
+        AABB zone = PreviewZone.zone;
+        if (zone != null && this.minecraft.level != null) {
+            for (Entity stray : this.minecraft.level.getEntities((Entity) null, zone, c -> !(c instanceof Player))) {
+                stray.discard();
+            }
+        }
         PreviewZone.close();
         super.removed();
     }
@@ -1469,7 +1550,7 @@ public class MobEditorScreen extends Screen {
             return null;
         }
         int slot = -1;
-        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && !EncephalonConfig.isQuiet(t)) {
+        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && !quiet(t)) {
             slot = takeSlot(evict);
             if (slot < 0 && !evict) {
                 return null; // no room to warm it yet
@@ -1510,7 +1591,7 @@ public class MobEditorScreen extends Screen {
                 living.walkAnimation.update(WALK_SPEED, 1.0F);
                 return living;
             }
-        } catch (Exception ex) {
+        } catch (Exception | LinkageError ex) {
             // fall through and blacklist
         }
         badTypes.add(t);
@@ -1617,7 +1698,7 @@ public class MobEditorScreen extends Screen {
             measuring = withMain && p.canMeasure();
             RenderSystem.runAsFancy(() -> drawModels(g, p, withMain, partial, extras, realPartial, pose, dispatcher));
             g.flush();
-        } catch (Exception ex) {
+        } catch (Exception | LinkageError ex) {
             ok = false;
         } finally {
             measuring = false;
@@ -1781,7 +1862,7 @@ public class MobEditorScreen extends Screen {
         // Quiet mobs (listed in the config) are not ticked either: their client tick code can start boss music or
         // change the sky, which a preview must never do.
         boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN) || (!isVanilla(e.getType()) && isFish(e))
-                || isQuiet(e.getType());
+                || quiet(e.getType());
         if (!p.tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
                 double hx = p.ax;
@@ -1846,7 +1927,7 @@ public class MobEditorScreen extends Screen {
                     WALK_SPEED_NOW.setFloat(e.walkAnimation, walk[1]);
                     WALK_POS.setFloat(e.walkAnimation, walk[2]);
                 }
-            } catch (Exception ex) {
+            } catch (Exception | LinkageError ex) {
                 p.tickFailed = true;
             }
         }
@@ -1961,6 +2042,14 @@ public class MobEditorScreen extends Screen {
         float bbW = Math.max(e.getBbWidth(), 0.4F);
         boolean dragon = e instanceof EnderDragon;
         boolean modded = !isVanilla(p.type);
+        if (!modded && !p.vanillaMeasured && !dragon && !(e instanceof Squid || e instanceof Ghast)) {
+            // Size a vanilla mob by what is really drawn (a giant's model is six times its type's default, say), not by its
+            // hitbox: one hidden draw, before anything is shown, so nothing jumps afterwards.
+            p.vanillaMeasured = true;
+            p.forceMeasure = true;
+            hiddenRender(g, p, true, 0F, List.of(), realPartial);
+            p.forceMeasure = false;
+        }
         boolean measured = modded && p.hasMeasure();
         boolean fitNew = modded && (measured || p.hasEnv);
         int top = TOP + 6 + warnH;
@@ -2033,7 +2122,7 @@ public class MobEditorScreen extends Screen {
                 double radial = 2.0 * (p.radius() + Math.hypot((minX + maxX) / 2.0, (minZ + maxZ) / 2.0));
                 worstW = Math.min(worstW, Math.max(radial, spanH * 0.0 + 0.4));
             }
-            tScale = Math.min(Math.max(MAX_FIT_SCALE, MIN_SHOWN_PX / core), Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
+            tScale = Math.min(baseScale(panelH, core), Math.min(panelH * FILL_H / spanH, rw * FILL_W / (float) Math.max(worstW, 0.4)));
             tCenterY = (minY + maxY) / 2F;
             tPivX = (minX + maxX) / 2F;
             tPivZ = (minZ + maxZ) / 2F;
@@ -2050,6 +2139,8 @@ public class MobEditorScreen extends Screen {
             float extentW;
             float fillH;
             float fillW;
+            boolean useMeasured = false;
+            float measuredCenter = 0F;
             if (dragon) {
                 extentH = DRAGON_H;
                 extentW = DRAGON_W;
@@ -2064,14 +2155,23 @@ public class MobEditorScreen extends Screen {
                 // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
                 extentH = Math.max(bbH, bbW * 1.2F);
                 extentW = bbW * 2.2F;
-                fillH = 0.7F;
+                fillH = 0.8F;
                 fillW = 0.8F;
+                if (!modded && p.vanillaMeasured && p.hasMeasure()) {
+                    float[] mr = new float[2];
+                    p.range(1, mr);
+                    extentH = Math.max(mr[1] - mr[0], 0.3F);
+                    // Turning about the anchor, nothing gets farther from the middle than the farthest vertex.
+                    extentW = Math.max(2F * p.radius(), 0.3F) * 1.15F;
+                    useMeasured = true;
+                    measuredCenter = (mr[0] + mr[1]) / 2F;
+                }
             }
             tCenterY = dragon ? DRAGON_CENTER_Y
                     : e instanceof Squid ? SQUID_CENTER_Y
                     : e instanceof Ghast ? GHAST_CENTER_Y
-                    : bbH / 2F;
-            tScale = Math.min(Math.max(MAX_FIT_SCALE, MIN_SHOWN_PX / extentH), Math.min(panelH * fillH / extentH, rw * fillW / extentW));
+                    : useMeasured ? measuredCenter : bbH / 2F;
+            tScale = Math.min(baseScale(panelH, extentH), Math.min(panelH * fillH / extentH, rw * fillW / extentW));
         }
 
         if (p.sScale < 0F || !visible) { // while it is not shown yet there is nothing to ease
@@ -2116,7 +2216,7 @@ public class MobEditorScreen extends Screen {
             measuring = p.canMeasure();
             RenderSystem.runAsFancy(() -> drawModels(g, p, true, partial, drawExtras, realPartial, pose, dispatcher));
             g.flush();
-        } catch (Exception ex) {
+        } catch (Exception | LinkageError ex) {
             failed = true;
         } finally {
             measuring = false;

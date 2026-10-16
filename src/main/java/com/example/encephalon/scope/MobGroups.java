@@ -27,7 +27,9 @@ public final class MobGroups {
         }
         return switch (type.getCategory()) {
             case MONSTER -> "hostile";
-            case MISC -> vanilla && MISC_MOBS.contains(key.getPath()) ? "passive" : null;
+            // Vanilla's MISC is mostly not mobs (arrows, items, boats). Modded mobs and bosses are often filed under MISC, though,
+            // so they are kept as "neutral" here and the editor drops the ones that are not mobs at all.
+            case MISC -> vanilla ? (MISC_MOBS.contains(key.getPath()) ? "passive" : null) : "neutral";
             default -> "passive";
         };
     }

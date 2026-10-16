@@ -40,6 +40,9 @@ import net.neoforged.neoforge.event.tick.EntityTickEvent;
  * that drifts, like the Void Worm, would carry its parts out of view), and mobs inside the column never despawn (a head or
  * minion is not persistent and the column is hundreds of blocks above the player, so vanilla would remove it at once and the
  * mod would respawn it, which shows as flicker and a missing head).
+ *
+ * Leftovers: if the game is closed or crashes with the editor open, twins and parts are saved with their chunk. While the editor
+ * is closed, a living entity that joins a level above the build limit (or carries the preview tag) is dropped on the spot.
  */
 @EventBusSubscriber(modid = EncephalonMod.MOD_ID)
 public final class PreviewZone {
@@ -171,6 +174,13 @@ public final class PreviewZone {
     public static void onJoin(EntityJoinLevelEvent event) {
         Entity e = event.getEntity();
         if (e instanceof Player) {
+            return;
+        }
+        // Editor closed: anything living this high is a twin or body part left behind by a crash (they are saved with the
+        // chunk). Nothing else lives above the build limit, so it is dropped as it loads instead of running its mod's code.
+        if (zone == null && !event.getLevel().isClientSide() && e instanceof LivingEntity
+                && (e.getTags().contains("encephalon_preview") || e.getY() > event.getLevel().getMaxBuildHeight() + 48)) {
+            event.setCanceled(true);
             return;
         }
         boolean inside = contains(e.position());
