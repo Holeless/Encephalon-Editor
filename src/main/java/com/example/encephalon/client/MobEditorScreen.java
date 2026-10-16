@@ -44,6 +44,7 @@ import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
@@ -51,6 +52,8 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.FlyingMob;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.MobSpawnType;
 import net.minecraft.world.entity.WalkAnimationState;
 import net.minecraft.world.entity.ambient.Bat;
 import net.minecraft.world.entity.animal.AbstractFish;
@@ -67,7 +70,10 @@ import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.entity.monster.hoglin.Hoglin;
 import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.SpawnEggItem;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.neoforged.fml.ModList;
 
 /**
@@ -167,6 +173,13 @@ public class MobEditorScreen extends Screen {
     private double anchorX;
     private double anchorY;
     private double anchorZ;
+    // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
+    // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
+    // entities it makes show up in the client level near the anchor and are drawn together with the preview mob.
+    private static final String PREVIEW_TAG = "encephalon_preview";
+    private final Set<EntityType<?>> noServerTwin = new HashSet<>();
+    private boolean twinActive;
+    private int twinId = -1;
 
     private Scope scope = Scope.VANILLA;
     private Behavior behavior;
@@ -214,6 +227,7 @@ public class MobEditorScreen extends Screen {
             MobConfigData[] box = new MobConfigData[1];
             server.executeBlocking(() -> box[0] = MobConfigData.get(server));
             data = box[0];
+            sweepOrphans();
         }
 
         addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, b -> onClose())
@@ -743,6 +757,171 @@ public class MobEditorScreen extends Screen {
         return e instanceof FlyingAnimal || e instanceof FlyingMob || e instanceof Bat || e instanceof EnderDragon;
     }
 
+    /**
+     * Fish-like mobs, vanilla or modded: renderers lay them on their side whenever isInWater() is false, so they need the
+     * wet flag. Judged by mob category rather than class so modded fish that do not extend AbstractFish are covered.
+     * Dolphins and squids are left out: they are handled separately and animate fine as they are.
+     */
+    private static boolean isFish(LivingEntity e) {
+        if (e instanceof Dolphin || e instanceof Squid) {
+            return false;
+        }
+        if (e instanceof AbstractFish) {
+            return true;
+        }
+        MobCategory c = e.getType().getCategory();
+        return c == MobCategory.WATER_CREATURE || c == MobCategory.WATER_AMBIENT || c == MobCategory.UNDERGROUND_WATER_CREATURE;
+    }
+
+    private static void forceWet(LivingEntity e) {
+        if (WET != null && isFish(e)) {
+            try {
+                WET.setBoolean(e, true);
+            } catch (ReflectiveOperationException | RuntimeException ex) {
+                // leave it as it is
+            }
+        }
+    }
+
+    /**
+     * The velocity the preview mob is given each step. It is also applied when the mob is created: models such as the
+     * dolphin's switch between a still and a swimming pose depending on whether the mob is moving, so a mob that starts
+     * with zero velocity jolts from one pose to the other on its first step.
+     */
+    private static Vec3 previewMotion(LivingEntity e) {
+        return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : 0.0);
+    }
+
+    // ------------------------------------------------------------------ server twin (parts / companions)
+
+    private AABB twinBox() {
+        return new AABB(anchorX - 64, anchorY - 48, anchorZ - 64, anchorX + 64, anchorY + 48, anchorZ + 64);
+    }
+
+    private static void discardAll(ServerLevel sl, AABB box) {
+        for (Entity victim : sl.getEntities((Entity) null, box, candidate -> !(candidate instanceof Player))) {
+            victim.discard();
+        }
+    }
+
+    /** Removes anything left over from a preview that never got cleaned up (a crash, say): nothing else lives this high. */
+    private void sweepOrphans() {
+        if (server == null || this.minecraft.level == null || this.minecraft.player == null) {
+            return;
+        }
+        var dim = this.minecraft.level.dimension();
+        double px = this.minecraft.player.getX();
+        double pz = this.minecraft.player.getZ();
+        double low = this.minecraft.level.getMaxBuildHeight() + 16;
+        try {
+            server.executeBlocking(() -> {
+                ServerLevel sl = server.getLevel(dim);
+                if (sl != null) {
+                    discardAll(sl, new AABB(px - 160, low, pz - 160, px + 160, low + 400, pz + 160));
+                }
+            });
+        } catch (RuntimeException ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: could not sweep leftover preview entities", ex);
+        }
+    }
+
+    /** Spawns the hidden twin of a modded mob so the entities its server logic creates exist for the preview. */
+    private void startTwin(EntityType<?> type) {
+        stopTwin();
+        if (server == null || this.minecraft.level == null
+                || BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace().equals("minecraft") || noServerTwin.contains(type)) {
+            return;
+        }
+        var dim = this.minecraft.level.dimension();
+        final double x = anchorX;
+        final double y = anchorY;
+        final double z = anchorZ;
+        final AABB box = twinBox();
+        final int[] id = {-1};
+        try {
+            server.executeBlocking(() -> {
+                ServerLevel sl = server.getLevel(dim);
+                if (sl == null) {
+                    return;
+                }
+                discardAll(sl, box);
+                Entity made = type.create(sl);
+                if (!(made instanceof Mob mob)) {
+                    if (made != null) {
+                        made.discard();
+                    }
+                    return;
+                }
+                try {
+                    mob.moveTo(x, y, z, 180F, 0F);
+                    mob.setNoAi(true);
+                    mob.setNoGravity(true);
+                    mob.setInvulnerable(true);
+                    mob.setSilent(true);
+                    mob.setPersistenceRequired();
+                    mob.addTag(PREVIEW_TAG);
+                    // Same as /summon: lets mods set up what they normally set up on spawn (emerge state, riders, ...).
+                    mob.finalizeSpawn(sl, sl.getCurrentDifficultyAt(mob.blockPosition()), MobSpawnType.COMMAND, null);
+                    if (sl.addFreshEntity(mob)) {
+                        id[0] = mob.getId();
+                    }
+                } catch (RuntimeException ex) {
+                    EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
+                    mob.discard();
+                    discardAll(sl, box);
+                }
+            });
+        } catch (RuntimeException ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: server twin failed for {}", type, ex);
+        }
+        if (id[0] == -1) {
+            noServerTwin.add(type);
+            return;
+        }
+        twinId = id[0];
+        twinActive = true;
+    }
+
+    /** Removes the twin and everything it spawned. */
+    private void stopTwin() {
+        if (!twinActive) {
+            return;
+        }
+        twinActive = false;
+        twinId = -1;
+        if (server == null || this.minecraft.level == null) {
+            return;
+        }
+        var dim = this.minecraft.level.dimension();
+        final AABB box = twinBox();
+        try {
+            server.executeBlocking(() -> {
+                ServerLevel sl = server.getLevel(dim);
+                if (sl != null) {
+                    discardAll(sl, box);
+                }
+            });
+        } catch (RuntimeException ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: could not remove the server twin", ex);
+        }
+    }
+
+    /** Entities around the preview mob that belong to it: parts, a head, tails. The twin's own client copy is skipped. */
+    private List<Entity> companions() {
+        if (!twinActive || this.minecraft.level == null) {
+            return List.of();
+        }
+        List<Entity> found = this.minecraft.level.getEntities((Entity) null, twinBox(),
+                en -> en.getId() != twinId && en != previewEntity && en != this.minecraft.player);
+        return found.size() > 64 ? found.subList(0, 64) : found;
+    }
+
+    @Override
+    public void removed() {
+        stopTwin();
+        super.removed();
+    }
+
     /** The mob to show: the selected mob type, or a rotating pick from the selected category / all mobs. */
     private LivingEntity previewEntity() {
         if (this.minecraft.level == null) {
@@ -804,10 +983,12 @@ public class MobEditorScreen extends Screen {
                         living.setPos(anchorX, anchorY, anchorZ);
                         living.setOldPosAndRot();
                     }
+                    living.setDeltaMovement(previewMotion(living));
                     tickFailed = false;
                     previewType = t;
                     previewEntity = living;
                     simTime = System.nanoTime();
+                    startTwin(t);
                     return living;
                 }
             } catch (Exception ex) {
@@ -857,13 +1038,14 @@ public class MobEditorScreen extends Screen {
                 e.setOldPosAndRot();
                 // The dragon's wing flap rate depends on its speed (a stationary one flaps far too fast), and the dolphin
                 // only animates while it is moving.
-                e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : e instanceof Dolphin ? -0.05 : 0.0);
+                e.setDeltaMovement(previewMotion(e));
                 // Slimes only squish on ground transitions, so make them hop in place.
                 // Fish stay "airborne" so they do not flop about, as they would out of water.
                 // A dry dolphin on the ground also flops (random hop, random yaw), which showed as a stutter.
                 boolean grounded = e instanceof Slime ? e.tickCount % 24 < 16
-                        : !isFlyer(e) && !(e instanceof AbstractFish) && !(e instanceof Dolphin);
+                        : !isFlyer(e) && !isFish(e) && !(e instanceof Dolphin);
                 e.setOnGround(grounded);
+                forceWet(e);
                 // Rabbits only animate while hopping, and nothing starts a hop client-side, so start one every so often.
                 if (e instanceof Rabbit rabbit && rabbit.getJumpCompletion(0F) == 0F && e.tickCount % RABBIT_HOP_INTERVAL == 0) {
                     rabbit.startJumping();
@@ -877,6 +1059,10 @@ public class MobEditorScreen extends Screen {
                 float squish = e instanceof Slime sl ? sl.squish : 0F;
                 e.tick();
                 e.setPos(hx, hy, hz);
+                forceWet(e);
+                // Some mobs hide themselves until something server-side reveals them (the Farseer stays invisible until a
+                // player walks up); the preview has no such trigger, so keep it visible.
+                e.setInvisible(false);
                 if (e instanceof Slime sl) {
                     sl.oSquish = squish;
                 }
@@ -928,7 +1114,7 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    private void renderPreview(GuiGraphics g) {
+    private void renderPreview(GuiGraphics g, float realPartial) {
         LivingEntity e = previewEntity();
         if (e == null) {
             return;
@@ -973,24 +1159,52 @@ public class MobEditorScreen extends Screen {
             fillH = 0.7F;
             fillW = 0.8F;
         }
-        float scale = Math.min(55F, Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW));
-        float cx = rx + rw / 2F;
         float centerY = dragon ? DRAGON_CENTER_Y
                 : e instanceof Squid ? SQUID_CENTER_Y
                 : e instanceof Ghast ? GHAST_CENTER_Y
                 : bbH / 2F;
+
+        // Entities that belong to the mob but are separate (body segments, a detached head). When there are any, the whole
+        // group is fitted and centred, and turned side-on so a long body is seen along its length.
+        List<Entity> extras = companions();
+        boolean group = !extras.isEmpty();
+        float pivotX = 0F;
+        float pivotZ = 0F;
+        if (group) {
+            double minX = -bbW / 2.0;
+            double maxX = bbW / 2.0;
+            double minZ = -bbW / 2.0;
+            double maxZ = bbW / 2.0;
+            double minY = 0.0;
+            double maxY = bbH;
+            for (Entity c : extras) {
+                AABB b = c.getBoundingBox();
+                minX = Math.min(minX, b.minX - anchorX);
+                maxX = Math.max(maxX, b.maxX - anchorX);
+                minZ = Math.min(minZ, b.minZ - anchorZ);
+                maxZ = Math.max(maxZ, b.maxZ - anchorZ);
+                minY = Math.min(minY, b.minY - anchorY);
+                maxY = Math.max(maxY, b.maxY - anchorY);
+            }
+            pivotX = (float) ((minX + maxX) / 2.0);
+            pivotZ = (float) ((minZ + maxZ) / 2.0);
+            extentH = Math.max(extentH, (float) (maxY - minY));
+            extentW = (float) Math.hypot(maxX - minX, maxZ - minZ) + bbW;
+            centerY = (float) ((minY + maxY) / 2.0);
+        }
+        float scale = Math.min(55F, Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW));
+        float cx = rx + rw / 2F;
         float feetY = (top + bottom) / 2F + centerY * scale;
 
         // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
         faceViewer(e);
-        if (WET != null && e instanceof AbstractFish) {
-            try {
-                WET.setBoolean(e, true); // the fish renderer lays fish on their side unless they are in water
-            } catch (ReflectiveOperationException | RuntimeException ex) {
-                // leave the fish as it is
-            }
-        }
+        forceWet(e); // the fish renderer lays fish on their side unless they are in water
+        e.setInvisible(false);
         float sway = (float) Math.toRadians((dragon ? 12.0 : 40.0) * Math.sin(Util.getMillis() / 1500.0));
+        float sideOn = group ? (float) (Math.PI / 2.0) : 0F;
+        final float px = pivotX;
+        final float pz = pivotZ;
+        final List<Entity> drawExtras = extras;
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         PoseStack pose = g.pose();
@@ -999,10 +1213,26 @@ public class MobEditorScreen extends Screen {
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
-            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + sideOn + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
+            pose.translate(-px, 0.0F, -pz); // turn around the middle of the group, not the head
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
-            RenderSystem.runAsFancy(() -> dispatcher.render(e, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880));
+            RenderSystem.runAsFancy(() -> {
+                dispatcher.render(e, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880);
+                for (Entity c : drawExtras) {
+                    // Placed relative to the preview mob, which sits at the anchor. These are ticked by the real client clock.
+                    // A companion that fails to draw is skipped; it should not take the whole preview down with it.
+                    try {
+                        double dx = Mth.lerp(realPartial, c.xOld, c.getX()) - anchorX;
+                        double dy = Mth.lerp(realPartial, c.yOld, c.getY()) - anchorY;
+                        double dz = Mth.lerp(realPartial, c.zOld, c.getZ()) - anchorZ;
+                        dispatcher.render(c, dx, dy, dz, Mth.lerp(realPartial, c.yRotO, c.getYRot()), realPartial, pose,
+                                g.bufferSource(), 15728880);
+                    } catch (RuntimeException ex) {
+                        // skip this one
+                    }
+                }
+            });
             g.flush();
         } catch (Exception ex) {
             badTypes.add(previewType);
@@ -1054,7 +1284,7 @@ public class MobEditorScreen extends Screen {
         }
         g.disableScissor();
         if (behavior == null) {
-            renderPreview(g);
+            renderPreview(g, partialTick);
             return;
         }
 
