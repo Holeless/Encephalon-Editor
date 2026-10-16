@@ -1,5 +1,6 @@
 package com.example.encephalon.client;
 
+import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -47,6 +48,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.FlyingMob;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.WalkAnimationState;
 import net.minecraft.world.entity.ambient.Bat;
 import net.minecraft.world.entity.animal.FlyingAnimal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
@@ -69,9 +71,17 @@ public class MobEditorScreen extends Screen {
 
     // 3D preview tuning
     private static final long TICK_NANOS = 50_000_000L;
-    private static final double WALK_STEP = 0.05; // blocks per tick the preview mob walks (walk speed = WALK_STEP * 4)
-    private static final float DRAGON_W = 24F;    // lower these two if the dragon crops on your layout
-    private static final float DRAGON_H = 13F;
+    private static final float WALK_SPEED = 0.25F;      // limb swing amount; the walk cycle advances about this much per tick
+    private static final float DRAGON_W = 19F;          // blocks: wingspan plus a little sway room
+    private static final float DRAGON_H = 13F;          // blocks: wing flap range
+    private static final float DRAGON_CENTER_Y = 1F;    // blocks above the dragon's feet where the model's visual middle sits
+
+    // The walk animation is advanced by hand, once per preview tick. The entity's own tick also updates it (twice-updating
+    // makes limbs flutter), so its state is saved before the tick and put back after, through these fields.
+    private static final Field WALK_SPEED_OLD = walkField("speedOld");
+    private static final Field WALK_SPEED_NOW = walkField("speed");
+    private static final Field WALK_POS = walkField("position");
+    private static final boolean CAN_PIN_WALK = WALK_SPEED_OLD != null && WALK_SPEED_NOW != null && WALK_POS != null;
 
     private MinecraftServer server;
     private MobConfigData data;
@@ -628,31 +638,57 @@ public class MobEditorScreen extends Screen {
         return null;
     }
 
+    private static Field walkField(String name) {
+        try {
+            Field f = WalkAnimationState.class.getDeclaredField(name);
+            f.setAccessible(true);
+            return f;
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return null;
+        }
+    }
+
     /**
-     * One 20 Hz step of the preview mob so its own animations run (bat wings, dragon, camel, ...). It lives far above the
-     * world and is nudged forward by the lerp, so the game's own walk-animation code sees it moving and animates naturally.
+     * One 20 Hz step of the preview mob. The entity is ticked so its own animations run (dragon wings, bat, guardian, ...),
+     * but the walk cycle is driven here at a fixed gentle speed. If the walk state can't be pinned, only the dragon is
+     * ticked and everything else is animated by hand.
      */
     private void stepPreview(LivingEntity e) {
         if (this.minecraft.level == null || this.minecraft.player == null) {
             return;
         }
-        double hx = this.minecraft.player.getX();
-        double hy = this.minecraft.level.getMaxBuildHeight() + 64;
-        double hz = this.minecraft.player.getZ();
-        if (!tickFailed) {
+        boolean dragon = e instanceof EnderDragon;
+        boolean ticked = false;
+        if (!tickFailed && (CAN_PIN_WALK || dragon)) {
             try {
+                double hx = this.minecraft.player.getX();
+                double hy = this.minecraft.level.getMaxBuildHeight() + 64;
+                double hz = this.minecraft.player.getZ();
+                float[] walk = null;
+                if (CAN_PIN_WALK) {
+                    walk = new float[] {WALK_SPEED_OLD.getFloat(e.walkAnimation), WALK_SPEED_NOW.getFloat(e.walkAnimation),
+                            WALK_POS.getFloat(e.walkAnimation)};
+                }
                 e.setPos(hx, hy, hz);
+                // The dragon's wing flap rate depends on its speed; a stationary dragon flaps far too fast, so give it a cruise.
+                e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : 0.0);
                 e.setOnGround(!isFlyer(e));
-                e.lerpTo(hx, hy, hz - WALK_STEP, 180F, 0F, 1);
                 e.tick();
                 e.setPos(hx, hy, hz);
-                return;
+                if (walk != null) {
+                    WALK_SPEED_OLD.setFloat(e.walkAnimation, walk[0]);
+                    WALK_SPEED_NOW.setFloat(e.walkAnimation, walk[1]);
+                    WALK_POS.setFloat(e.walkAnimation, walk[2]);
+                }
+                ticked = true;
             } catch (Exception ex) {
                 tickFailed = true;
             }
         }
-        e.tickCount++;
-        e.walkAnimation.update((float) (WALK_STEP * 4.0), 0.4F);
+        if (!ticked) {
+            e.tickCount++;
+        }
+        e.walkAnimation.update(WALK_SPEED, 0.4F);
     }
 
     private void renderPreview(GuiGraphics g) {
@@ -682,7 +718,8 @@ public class MobEditorScreen extends Screen {
         float extentW;
         float fillH;
         float fillW;
-        if (e instanceof EnderDragon) {
+        boolean dragon = e instanceof EnderDragon;
+        if (dragon) {
             extentH = DRAGON_H;
             extentW = DRAGON_W;
             fillH = 0.9F;
@@ -696,7 +733,8 @@ public class MobEditorScreen extends Screen {
         }
         float scale = Math.min(55F, Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW));
         float cx = rx + rw / 2F;
-        float feetY = (top + bottom) / 2F + bbH * scale / 2F;
+        float centerY = dragon ? DRAGON_CENTER_Y : bbH / 2F;
+        float feetY = (top + bottom) / 2F + centerY * scale;
 
         // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
         e.yBodyRot = 180F;
@@ -707,7 +745,7 @@ public class MobEditorScreen extends Screen {
         e.yHeadRotO = 180F;
         e.setXRot(0F);
         e.xRotO = 0F;
-        float sway = (float) Math.toRadians(40.0 * Math.sin(Util.getMillis() / 1500.0));
+        float sway = (float) Math.toRadians((dragon ? 12.0 : 40.0) * Math.sin(Util.getMillis() / 1500.0));
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         PoseStack pose = g.pose();

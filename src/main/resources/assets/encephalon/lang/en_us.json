@@ -32,5 +32,5 @@
   "encephalon.screen.search": "Search mobs...",
   "encephalon.configuration.title": "Encephalon Editor Settings",
   "encephalon.configuration.showMobsWithoutEgg": "Show mobs without spawn egg",
-  "encephalon.configuration.showMobsWithoutEgg.tooltip": "Lists Giant, Illusioner and other mobs that have no spawn egg in the Mob Editor."
+  "encephalon.configuration.showMobsWithoutEgg.tooltip": "Shows mobs that have no spawn egg in the Mob Editor."
 }

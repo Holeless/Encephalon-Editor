@@ -10,7 +10,7 @@ public final class EncephalonConfig {
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
         SHOW_MOBS_WITHOUT_EGG = b
-                .comment("List mobs that have no spawn egg (Giant, Illusioner, ...) in the Mob Editor.")
+                .comment("Show mobs that have no spawn egg in the Mob Editor.")
                 .translation("encephalon.configuration.showMobsWithoutEgg")
                 .define("showMobsWithoutEgg", false);
         SPEC = b.build();
