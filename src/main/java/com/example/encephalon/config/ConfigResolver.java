@@ -18,6 +18,7 @@ import net.minecraft.world.entity.Mob;
 /**
  * Walks scopes broad to specific; the most specific non-inherit entry wins.
  * Handlers call this instead of CurseData.isActive. TODO: cache per entity type, invalidated by MobConfigData.version().
+ * A mob's category scope (hostile / neutral / passive) is the one set in the Mob Editor when there is one, else its default.
  */
 public final class ConfigResolver {
     private ConfigResolver() {
@@ -25,21 +26,32 @@ public final class ConfigResolver {
 
     /** Scopes that apply to a mob, broad to specific. TODO: GROUP scopes (entity type tags / user groups). */
     public static List<Scope> chain(Mob mob) {
-        List<Scope> list = ancestors(mob.getType());
+        MinecraftServer server = mob.getServer();
+        List<Scope> list = ancestors(mob.getType(), server == null ? null : MobConfigData.get(server));
         list.add(new Scope(ScopeType.MOB_TYPE, BuiltInRegistries.ENTITY_TYPE.getKey(mob.getType()).toString()));
         list.add(new Scope(ScopeType.INDIVIDUAL, mob.getUUID().toString()));
         return list;
     }
 
+    /** Same as ancestors(type, null): the default category only. */
+    public static List<Scope> ancestors(EntityType<?> type) {
+        return ancestors(type, null);
+    }
+
     /**
      * Scopes above a mob type, broad to specific. Vanilla: All > Vanilla > category. Modded: All > Modded > mod > mod's category.
+     * The category is the one set for the mob in the editor (data may be null), else the default one.
      * The list is new and mutable, so callers can append to it.
      */
-    public static List<Scope> ancestors(EntityType<?> type) {
+    public static List<Scope> ancestors(EntityType<?> type, MobConfigData data) {
         List<Scope> list = new ArrayList<>();
         list.add(Scope.ALL);
+        String key = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
         String ns = BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace();
-        String cat = MobGroups.categoryOf(type);
+        String cat = data == null ? null : data.category(key);
+        if (cat == null) {
+            cat = MobGroups.categoryOf(type);
+        }
         if (ns.equals("minecraft")) {
             list.add(Scope.VANILLA);
             if (cat != null) {
@@ -101,8 +113,13 @@ public final class ConfigResolver {
     public record Val(double value, Scope from) {
     }
 
-    /** Scopes that apply when looking at a scope in the editor, broad to specific (ending with the scope itself). */
+    /** Scopes that apply when looking at a scope in the editor, broad to specific (default categories only). */
     public static List<Scope> chainFor(Scope s) {
+        return chainFor(s, null);
+    }
+
+    /** Scopes that apply when looking at a scope in the editor, broad to specific (ending with the scope itself). */
+    public static List<Scope> chainFor(Scope s, MobConfigData data) {
         List<Scope> l = new ArrayList<>();
         switch (s.type()) {
             case WORLD -> l.add(s);
@@ -128,7 +145,7 @@ public final class ConfigResolver {
                 l.add(s);
             }
             case MOB_TYPE -> {
-                l.addAll(ancestors(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id()))));
+                l.addAll(ancestors(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id())), data));
                 l.add(s);
             }
             default -> {

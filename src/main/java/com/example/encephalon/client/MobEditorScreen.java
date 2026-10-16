@@ -210,6 +210,12 @@ public class MobEditorScreen extends Screen {
     private static final int PICK_CELL = 18;
     private static final int DROP_ROW_H = 24;
     private static final int DROP_MAX_AMOUNT = 64;
+    /** Key of the "Category" row in the behavior list. */
+    private static final Object CATEGORY_KEY = new Object();
+    /** True while the "Category" row is the open entry (only for a mob type; behavior is null then). */
+    private boolean categoryOpen;
+    /** When the default drops of the shown mob were first asked for (0 = not waiting); the loading text only shows after a pause. */
+    private long loadingSince;
 
     /** True while the "Drops" row of the behavior list is the open entry (only for a mob type; behavior is null then). */
     private boolean dropsOpen;
@@ -623,7 +629,7 @@ public class MobEditorScreen extends Screen {
         }
         Map<String, Map<String, List<EntityType<?>>>> byMod = new HashMap<>();
         for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
-            String c = MobGroups.categoryOf(t);
+            String c = categoryOf(t);
             if (c == null || !listing.isListed(t)) {
                 continue;
             }
@@ -841,6 +847,7 @@ public class MobEditorScreen extends Screen {
         public void picked() {
             scope = s;
             addMode = false;
+            loadingSince = 0L;
             gridScroll = 0;
             pickFilter = "";
             if (expandable && !expanded.remove(s.key())) {
@@ -861,6 +868,10 @@ public class MobEditorScreen extends Screen {
                 || Component.translatable("encephalon.screen.drops_title").getString().toLowerCase().contains(behaviorFilter))) {
             items.add(new DropsItem());
         }
+        if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
+                || Component.translatable("encephalon.screen.category_title").getString().toLowerCase().contains(behaviorFilter))) {
+            items.add(new CategoryItem());
+        }
         for (Behavior b : Behaviors.all()) {
             if (b.scopes().contains(scope.type())
                     && (behaviorFilter.isEmpty() || b.name().getString().toLowerCase().contains(behaviorFilter))) {
@@ -877,9 +888,15 @@ public class MobEditorScreen extends Screen {
             addMode = false;
             changed = true;
         }
+        if (categoryOpen && scope.type() != ScopeType.MOB_TYPE) {
+            categoryOpen = false;
+            changed = true;
+        }
         behaviorList.setItems(items);
         if (dropsOpen) {
             behaviorList.select(DROPS_KEY);
+        } else if (categoryOpen) {
+            behaviorList.select(CATEGORY_KEY);
         } else if (behavior != null) {
             behaviorList.select(behavior);
         }
@@ -910,7 +927,7 @@ public class MobEditorScreen extends Screen {
                 state = Component.translatable("encephalon.state." + own.name().toLowerCase());
                 color = own == Tri.ON ? 0x55FF55 : 0xFF5555;
             } else {
-                boolean on = ConfigResolver.toggleFor(data, ConfigResolver.chainFor(scope), b).on();
+                boolean on = ConfigResolver.toggleFor(data, ConfigResolver.chainFor(scope, data), b).on();
                 state = Component.translatable("encephalon.state.inherit_" + (on ? "on" : "off"));
                 color = 0xA0A0A0;
             }
@@ -924,6 +941,7 @@ public class MobEditorScreen extends Screen {
         public void picked() {
             behavior = b;
             dropsOpen = false;
+            categoryOpen = false;
             addMode = false;
             rebuildDetail();
         }
@@ -953,9 +971,41 @@ public class MobEditorScreen extends Screen {
         public void picked() {
             behavior = null;
             dropsOpen = true;
+            categoryOpen = false;
             addMode = false;
             gridScroll = 0;
             pickFilter = "";
+            rebuildDetail();
+        }
+    }
+
+    /** The "Category" entry of a mob type's behavior list: opens the category picker in the right panel. */
+    private final class CategoryItem implements PickList.Item {
+        @Override
+        public Object key() {
+            return CATEGORY_KEY;
+        }
+
+        @Override
+        public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
+            g.renderFakeItem(new ItemStack(Items.NAME_TAG), x + 1, y + (h - 16) / 2);
+            boolean custom = scope.type() == ScopeType.MOB_TYPE && data.category(scope.id()) != null;
+            String eff = effectiveCategory();
+            Component state = Component.translatable("encephalon.category." + eff);
+            int color = !custom ? 0xA0A0A0 : eff.equals("hostile") ? 0xFF5555 : eff.equals("passive") ? 0x55FF55 : 0xFFFF55;
+            int stateW = f.width(state);
+            int ty = y + (h - 8) / 2 + 1;
+            g.drawString(f, fit(Component.translatable("encephalon.screen.category_title").getString(), w - 20 - stateW - 6),
+                    x + 20, ty, 0xFFFFFF, true);
+            g.drawString(f, state, x + w - stateW - 2, ty, color, true);
+        }
+
+        @Override
+        public void picked() {
+            behavior = null;
+            dropsOpen = false;
+            categoryOpen = true;
+            addMode = false;
             rebuildDetail();
         }
     }
@@ -982,6 +1032,10 @@ public class MobEditorScreen extends Screen {
             buildDropsPanel();
             return;
         }
+        if (categoryOpen && scope.type() == ScopeType.MOB_TYPE && data != null) {
+            buildCategoryPanel();
+            return;
+        }
         if (behavior == null) {
             return;
         }
@@ -994,7 +1048,7 @@ public class MobEditorScreen extends Screen {
         explainY = y + 24;
         y += 44;
 
-        List<Scope> chain = ConfigResolver.chainFor(scope);
+        List<Scope> chain = ConfigResolver.chainFor(scope, data);
         List<Scope> above = chain.subList(0, chain.size() - 1);
         for (Setting s : behavior.settings()) {
             ConfigResolver.Val inherited = ConfigResolver.valueFor(data, above, behavior, s);
@@ -1094,6 +1148,9 @@ public class MobEditorScreen extends Screen {
         setFocused(null);
         Scope sc = scope;
         edit(() -> data.clearScope(sc));
+        if (sc.type() == ScopeType.MOB_TYPE) {
+            refreshTree(); // its category may have changed back
+        }
         rebuildDetail();
     }
 
@@ -1220,6 +1277,13 @@ public class MobEditorScreen extends Screen {
         dropRowYs.clear();
         dropStacks.clear();
         dropEntries = loadDropEntries();
+        if (dropEntries == null) {
+            if (loadingSince == 0L) {
+                loadingSince = System.nanoTime();
+            }
+        } else {
+            loadingSince = 0L;
+        }
         int y = TOP + 2 + warnH;
         dropsDesc = this.font.split(Component.translatable("encephalon.screen.drops_desc"), rw);
         y += dropsDesc.size() * 10 + 4;
@@ -1229,7 +1293,7 @@ public class MobEditorScreen extends Screen {
         int half = (rw - 4) / 2;
         Button add = track(Button.builder(Component.translatable(addMode ? "encephalon.screen.drops_back" : "encephalon.screen.drops_add"),
                 b -> toggleAddMode()).bounds(rx, y, half, 20).build());
-        add.active = editable && (addMode || dropEntries != null);
+        add.active = editable; // not tied to the loading state: the button must not flash grey while the drops are worked out
         dropsReset = track(Button.builder(Component.translatable("encephalon.screen.drops_reset"), b -> resetDrops())
                 .bounds(rx + half + 4, y, rw - half - 4, 20).build());
         dropsReset.active = editable && data.drops(scope.id()) != null;
@@ -1488,7 +1552,10 @@ public class MobEditorScreen extends Screen {
             return;
         }
         if (dropEntries == null) {
-            g.drawString(this.font, Component.translatable("encephalon.screen.drops_loading"), rx, dropsHeaderY + 2 - scroll, 0x808080, true);
+            // Usually answered within a few frames: only say "working" if it really takes a while, so switching mobs does not flash text.
+            if (loadingSince != 0L && System.nanoTime() - loadingSince > 400_000_000L) {
+                g.drawString(this.font, Component.translatable("encephalon.screen.drops_loading"), rx, dropsHeaderY + 2 - scroll, 0x808080, true);
+            }
             return;
         }
         int hy = dropsHeaderY + 2 - scroll;
@@ -1547,6 +1614,112 @@ public class MobEditorScreen extends Screen {
             int thumbY = barTop + (view - thumbH) * scroll / max;
             PickList.drawScrollbar(g, width - 7, barTop, barBottom, thumbY, thumbH);
         }
+    }
+
+    // ------------------------------------------------------------------ category editor
+
+    private static final String[] CATEGORY_CHOICES = {"hostile", "neutral", "passive"};
+    private List<FormattedCharSequence> categoryDesc = List.of();
+    private int categoryStateY;
+
+    private EntityType<?> selectedType() {
+        return BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id()));
+    }
+
+    /** The category a mob type is filed under: the one set in the editor, else its default (null if it has none). */
+    private String categoryOf(EntityType<?> t) {
+        String own = data == null ? null : data.category(BuiltInRegistries.ENTITY_TYPE.getKey(t).toString());
+        return own != null ? own : MobGroups.categoryOf(t);
+    }
+
+    private String defaultCategory() {
+        String c = MobGroups.categoryOf(selectedType());
+        return c == null ? "neutral" : c;
+    }
+
+    private String effectiveCategory() {
+        if (scope.type() != ScopeType.MOB_TYPE) {
+            return "neutral";
+        }
+        String c = categoryOf(selectedType());
+        return c == null ? "neutral" : c;
+    }
+
+    private void buildCategoryPanel() {
+        categoryDesc = this.font.split(Component.translatable("encephalon.screen.category_desc"), rw);
+        int y = TOP + 2 + warnH + categoryDesc.size() * 10 + 4;
+        categoryStateY = y;
+        y += 14;
+        String own = data.category(scope.id());
+        categoryButton(null, y, own == null);
+        y += 24;
+        for (String c : CATEGORY_CHOICES) {
+            categoryButton(c, y, c.equals(own));
+            y += 24;
+        }
+        contentHeight = y + 4 - TOP;
+        layoutDetail();
+    }
+
+    private void categoryButton(String cat, int y, boolean current) {
+        Component name = cat == null
+                ? Component.translatable("encephalon.screen.category_default", Component.translatable("encephalon.category." + defaultCategory()))
+                : Component.translatable("encephalon.category." + cat);
+        Component label = current ? Component.literal("> ").append(name).append(Component.literal(" <")).withStyle(ChatFormatting.YELLOW) : name;
+        Button b = track(Button.builder(label, btn -> pickCategory(cat)).bounds(rx, y, rw, 20).build());
+        b.active = editable && !current;
+    }
+
+    private void pickCategory(String cat) {
+        if (!editable) {
+            return;
+        }
+        String id = scope.id();
+        edit(() -> {
+            if (cat == null) {
+                data.clearCategory(id);
+            } else {
+                data.setCategory(id, cat);
+            }
+        });
+        refreshTree();
+        rebuildDetail();
+    }
+
+    /** Re-sorts the tree after a category changed, and opens the folder the selected mob moved into so it stays in view. */
+    private void refreshTree() {
+        PreviewSandbox.run(this::buildTypes);
+        if (scope.type() == ScopeType.MOB_TYPE) {
+            expandToMob(selectedType());
+        }
+        rebuildScopes();
+        rebuildBehaviors();
+    }
+
+    private void expandToMob(EntityType<?> t) {
+        String cat = categoryOf(t);
+        if (cat == null) {
+            return;
+        }
+        String ns = BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace();
+        if (ns.equals("minecraft")) {
+            expanded.add(Scope.VANILLA.key());
+            expanded.add(new Scope(ScopeType.CATEGORY, cat).key());
+        } else {
+            expanded.add(Scope.MODDED.key());
+            expanded.add(new Scope(ScopeType.MOD, ns).key());
+            expanded.add(new Scope(ScopeType.MOD_CATEGORY, ns + "/" + cat).key());
+        }
+    }
+
+    private void drawCategoryEditor(GuiGraphics g) {
+        for (int i = 0; i < categoryDesc.size(); i++) {
+            g.drawString(this.font, categoryDesc.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
+        }
+        String own = data.category(scope.id());
+        Component state = Component.translatable(own != null ? "encephalon.screen.category_state_custom" : "encephalon.screen.category_state_default",
+                Component.translatable("encephalon.category." + effectiveCategory()));
+        g.drawString(this.font, fit(state.getString(), rw), rx, categoryStateY - scroll, own != null ? 0xFFAA00 : 0xA0A0A0, true);
     }
 
     // ------------------------------------------------------------------ 3D preview helpers
@@ -2877,13 +3050,15 @@ public class MobEditorScreen extends Screen {
         }
         if (dropsOpen) {
             g.drawString(this.font, Component.translatable("encephalon.screen.drops_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
+        } else if (categoryOpen) {
+            g.drawString(this.font, Component.translatable("encephalon.screen.category_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         } else if (behavior == null) {
             g.drawString(this.font, Component.translatable("encephalon.screen.select"), rx, 39, 0xA0A0A0, true);
         } else {
             g.drawString(this.font, behavior.name().copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         }
         g.disableScissor();
-        if (behavior == null && !dropsOpen) {
+        if (behavior == null && !dropsOpen && !categoryOpen) {
             PreviewSandbox.run(() -> renderPreview(g, partialTick));
             g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
             drawWarning(g, 0);
@@ -2909,11 +3084,17 @@ public class MobEditorScreen extends Screen {
             }
             return;
         }
+        if (categoryOpen) {
+            drawCategoryEditor(g);
+            g.disableScissor();
+            drawPanelScrollbar(g);
+            return;
+        }
         for (int i = 0; i < descLines.size(); i++) {
             g.drawString(this.font, descLines.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
         }
 
-        ConfigResolver.Toggle t = ConfigResolver.toggleFor(data, ConfigResolver.chainFor(scope), behavior);
+        ConfigResolver.Toggle t = ConfigResolver.toggleFor(data, ConfigResolver.chainFor(scope, data), behavior);
         Component why;
         int whyColor;
         if (t.from() == null) {

@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.example.encephalon.behavior.Behavior;
+import com.example.encephalon.scope.MobGroups;
 import com.example.encephalon.scope.Scope;
 import com.example.encephalon.scope.ScopeType;
 
@@ -32,6 +33,8 @@ public class MobConfigData extends SavedData {
     private final Map<String, Double> values = new ConcurrentHashMap<>();
     /** Mob type id -> its custom drop list. No entry means "use the default loot table"; an empty list means "drops nothing". */
     private final Map<String, List<DropEntry>> drops = new ConcurrentHashMap<>();
+    /** Mob type id -> the category (hostile / neutral / passive) the editor files it under. No entry means its default one. */
+    private final Map<String, String> categories = new ConcurrentHashMap<>();
     /** Bumped on every edit so resolved-config caches know when to rebuild. */
     private volatile int version;
 
@@ -60,6 +63,13 @@ public class MobConfigData extends SavedData {
             }
             d.drops.put(k, List.copyOf(entries));
         }
+        CompoundTag ct = tag.getCompound("Categories");
+        for (String k : ct.getAllKeys()) {
+            String c = ct.getString(k);
+            if (MobGroups.CATEGORIES.contains(c)) {
+                d.categories.put(k, c);
+            }
+        }
         return d;
     }
 
@@ -85,6 +95,9 @@ public class MobConfigData extends SavedData {
         tag.put("Toggles", t);
         tag.put("Values", v);
         tag.put("Drops", dt);
+        CompoundTag ct = new CompoundTag();
+        categories.forEach(ct::putString);
+        tag.put("Categories", ct);
         return tag;
     }
 
@@ -144,7 +157,26 @@ public class MobConfigData extends SavedData {
         }
     }
 
-    /** Number of overrides (toggles + values, plus a custom drop list for a mob type) set at this scope. */
+    /** The category set for a mob type ("hostile", "neutral" or "passive"), or null for its default. */
+    public String category(String mobId) {
+        return categories.get(mobId);
+    }
+
+    public void setCategory(String mobId, String category) {
+        categories.put(mobId, category);
+        version++;
+        setDirty();
+    }
+
+    /** Back to the default category. */
+    public void clearCategory(String mobId) {
+        if (categories.remove(mobId) != null) {
+            version++;
+            setDirty();
+        }
+    }
+
+    /** Number of overrides (toggles + values, plus a custom drop list / category for a mob type) set at this scope. */
     public int count(Scope s) {
         String p = s.key() + "|";
         int n = 0;
@@ -161,6 +193,9 @@ public class MobConfigData extends SavedData {
         if (s.type() == ScopeType.MOB_TYPE && drops.containsKey(s.id())) {
             n++;
         }
+        if (s.type() == ScopeType.MOB_TYPE && categories.containsKey(s.id())) {
+            n++;
+        }
         return n;
     }
 
@@ -170,6 +205,7 @@ public class MobConfigData extends SavedData {
         values.keySet().removeIf(k -> k.startsWith(p));
         if (s.type() == ScopeType.MOB_TYPE) {
             drops.remove(s.id());
+            categories.remove(s.id());
         }
         version++;
         setDirty();
