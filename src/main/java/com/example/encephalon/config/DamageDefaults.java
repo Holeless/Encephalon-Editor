@@ -94,7 +94,8 @@ public final class DamageDefaults {
             Map.entry("minecraft:elder_guardian", List.of(new Attack("beam", 8.0, DamageTypes.INDIRECT_MAGIC))),
             Map.entry("minecraft:llama", List.of(new Attack("spit", 1.0, DamageTypes.SPIT))),
             Map.entry("minecraft:trader_llama", List.of(new Attack("spit", 1.0, DamageTypes.SPIT))),
-            Map.entry("minecraft:wither", List.of(new Attack("skull", 8.0, DamageTypes.WITHER_SKULL))));
+            Map.entry("minecraft:wither", List.of(new Attack("skull", 8.0, DamageTypes.WITHER_SKULL))),
+            Map.entry("minecraft:ender_dragon", List.of(new Attack("breath", -1, DamageTypes.INDIRECT_MAGIC))));
 
     /** Vanilla special attacks that do no damage of their own (ids have a name and a .desc in the lang file). */
     private static final Map<String, List<String>> SPECIAL = Map.ofEntries(
@@ -109,7 +110,18 @@ public final class DamageDefaults {
             Map.entry("minecraft:bee", List.of("bee_poison")),
             Map.entry("minecraft:snow_golem", List.of("snowball")),
             Map.entry("minecraft:ravager", List.of("roar")),
-            Map.entry("minecraft:warden", List.of("darkness")));
+            Map.entry("minecraft:warden", List.of("darkness")),
+            Map.entry("minecraft:ghast", List.of("ghast_explosion")),
+            Map.entry("minecraft:wither", List.of("spawn_blast")),
+            Map.entry("minecraft:ender_dragon", List.of("dragon_fireball", "dragon_charge", "dragon_crystals")));
+
+    /** Mobs that have an attack damage attribute but never melee (they shoot, cast, explode or breathe instead). */
+    private static final Set<String> NO_MELEE = Set.of("minecraft:creeper", "minecraft:wither", "minecraft:guardian",
+            "minecraft:elder_guardian", "minecraft:evoker", "minecraft:shulker", "minecraft:witch", "minecraft:pillager",
+            "minecraft:breeze", "minecraft:ghast");
+
+    /** Melee damage of vanilla mobs whose hits are not a plain attack damage attribute. */
+    private static final Map<String, Double> MELEE_DEFAULTS = Map.of("minecraft:ender_dragon", 10.0);
 
     /** Words in the name of a modded goal class that mark it as an attack, and words that rule it out. */
     private static final String[] ATTACK_WORDS = {"attack", "shoot", "spit", "breath", "sting", "blast", "explo", "fireball", "beam",
@@ -321,9 +333,13 @@ public final class DamageDefaults {
                     others.add(new Attack(RANGED, -1, null, Kind.DAMAGE, null));
                 }
                 others.addAll(found);
-                // A brain-driven mob (hoglin, warden) has no goals but a real attack damage; a phantom has a melee-like swoop.
-                boolean ownAttack = meleeGoal || (others.isEmpty() && hasOwnAttackDamage(t));
-                Attack melee = ownAttack ? new Attack(MELEE, defaultMelee(t), null, Kind.MELEE, null) : null;
+                // Melee: a melee goal, or a real attack damage on a mob that does not explode (a blaze, warden, phantom or vex
+                // fight up close with their own code, not with a melee goal). A few vanilla mobs have the attribute but never melee.
+                Double fixed = MELEE_DEFAULTS.get(id);
+                boolean ownAttack = fixed != null || meleeGoal
+                        || (!swell && !NO_MELEE.contains(id) && hasOwnAttackDamage(t));
+                Attack melee = ownAttack
+                        ? new Attack(MELEE, fixed != null ? fixed : defaultMelee(t), null, Kind.MELEE, null) : null;
                 return new Profile(melee, List.copyOf(others));
             }
         } catch (RuntimeException | LinkageError ex) {
