@@ -210,7 +210,12 @@ public class MobEditorScreen extends Screen {
     // into idle, then blend again into the walk once the walk state kicks in. A modded mob is therefore drawn off-screen
     // (empty scissor) for this long first, so those blends finish before anyone sees it.
     private static final int WARMUP_TICKS = 10;      // simulated ticks of animation before a modded mob may be shown
-    private static final int FAST_STEPS = 6;         // warm-up ticks simulated (and rendered off-screen) per frame
+    private static final int FAST_STEPS = 6;         // warm-up ticks simulated (and rendered off-screen) per frame, at most
+    // Warming up a many-part mob (a worm with dozens of animated segments) costs a lot per hidden draw. All the warm-up work of
+    // one frame shares this time budget; once it is spent each mob still gets one step (so it keeps progressing) but no more,
+    // which keeps the editor from stuttering while a worm is being prepared.
+    private static final long WARM_BUDGET_NANOS = 10_000_000L;
+    private long warmDeadline;
     // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
     // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
     // entities it makes show up in the client level near the anchor and are drawn together with the preview mob.
@@ -1656,8 +1661,13 @@ public class MobEditorScreen extends Screen {
         boolean ok = true;
         for (int i = 0; i < FAST_STEPS && ok && !warmedUp(p); i++) {
             stepPreview(p);
-            ok = hiddenRender(g, p, true, 0F, raw, realPartial);
+            // The companions (body segments) only need drawing once per frame, not once per simulated tick.
+            boolean last = i == FAST_STEPS - 1 || System.nanoTime() > warmDeadline;
+            ok = hiddenRender(g, p, true, 0F, last ? raw : List.of(), realPartial);
             p.trackStable();
+            if (last) {
+                break;
+            }
         }
         p.sim = System.nanoTime();
         return ok;
@@ -2130,6 +2140,7 @@ public class MobEditorScreen extends Screen {
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
         super.render(g, mouseX, mouseY, partialTick);
+        warmDeadline = System.nanoTime() + WARM_BUDGET_NANOS;
         g.drawCenteredString(this.font, this.title, width / 2, 5, 0xFFFFFF);
         if (data == null) {
             g.drawCenteredString(this.font, Component.translatable("encephalon.screen.nodata"), width / 2, height / 2, 0xFF5555);
