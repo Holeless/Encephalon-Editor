@@ -10,7 +10,7 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 
 /** Client, mod bus: the key that opens the editor. */
-@EventBusSubscriber(value = Dist.CLIENT, modid = EncephalonMod.MOD_ID, bus = EventBusSubscriber.Bus.MOD)
+@EventBusSubscriber(value = Dist.CLIENT, modid = EncephalonMod.MOD_ID)
 public final class EncephalonClientMod {
     public static final KeyMapping OPEN = new KeyMapping("key.encephalon.open", InputConstants.KEY_K, "key.categories.encephalon");
 
