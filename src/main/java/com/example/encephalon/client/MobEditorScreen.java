@@ -7,7 +7,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -201,9 +200,6 @@ public class MobEditorScreen extends Screen {
     private final Map<String, List<EntityType<?>>> vanillaByCategory = new HashMap<>();
     /** Modded mobs by mod id (sorted by mod name), then by category. */
     private final Map<String, Map<String, List<EntityType<?>>>> moddedByMod = new LinkedHashMap<>();
-    private final List<EntityType<?>> vanillaTypes = new ArrayList<>();
-    private final List<EntityType<?>> moddedTypes = new ArrayList<>();
-    private final List<EntityType<?>> allTypes = new ArrayList<>();
     private final Set<String> expanded = new HashSet<>(Set.of(Scope.VANILLA.key()));
 
     // ------------------------------------------------------------------ 3D preview state
@@ -215,19 +211,14 @@ public class MobEditorScreen extends Screen {
     // whole batch: the draw is by far the expensive part (a big GeckoLib model costs far more than its tick), and animation
     // libraries read the mob's tick count when they draw, so a draw per batch blends exactly as well as a draw per tick.
     private static final int FAST_STEPS = 5;
-    // Warming up a many-part mob (a worm with dozens of animated segments) costs a lot per hidden draw. All the warm-up work of
-    // one frame shares this time budget; once it is spent the shown mob still gets a single step (so it keeps progressing),
-    // and background warm-ups wait for a later frame (see pumpWarm), which keeps the editor from stuttering.
-    private static final long WARM_BUDGET_NANOS = 4_000_000L;
-    private long warmDeadline;
     /** Counts rendered editor frames; lets per-frame work (the companion scan) be done once and shared. */
     private long frame;
     // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
     // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
     // entities it makes show up in the client level near the anchor and are drawn together with the preview mob.
-    // Each twin lives in its own "slot", stacked vertically, so the parts of different mobs never mix and several mobs
-    // can be warmed up at once.
-    private static final int SLOTS = 6;
+    // Each twin lives in its own "slot", stacked vertically, so the parts of the old and the new mob never mix while the old
+    // one is being removed.
+    private static final int SLOTS = 2;
     private static final double SLOT_SPACING = 96.0;
     private static final String PREVIEW_TAG = "encephalon_preview";
     // Companions are spawned all at once at their starting spots and then drift into place (the Void Worm even staggers
@@ -251,9 +242,6 @@ public class MobEditorScreen extends Screen {
     // A preview mob whose own tick takes longer than this several times is drawn without being ticked from then on.
     private static final long SLOW_TICK_NANOS = 8_000_000L;
     private static final int SLOW_TICK_LIMIT = 4;
-    private static final int MAX_IN_FLIGHT = 2;          // mobs being warmed up at the same time
-    private static final boolean PREWARM_VISIBLE = false; // true = also warm every visible row (smoother picking, more spikes)
-    private static final int MAX_CACHED = 12;            // warmed mobs kept around for instant picking
 
     /** Modded types known to have no companions (no twin needed) / to have companions (hold the reveal until settled). */
     private static final Set<EntityType<?>> SOLO = ConcurrentHashMap.newKeySet();
@@ -464,14 +452,10 @@ public class MobEditorScreen extends Screen {
     }
 
     private Preview active;
-    /** Mobs warmed (or warming) off-screen, oldest first. */
-    private final Map<EntityType<?>, Preview> warm = new LinkedHashMap<>();
-    private final Set<EntityType<?>> wantedNow = new LinkedHashSet<>();
     private final boolean[] slotUsed = new boolean[SLOTS];
     private final Set<EntityType<?>> badTypes = new HashSet<>();
     /** quiet() answers, per type (the config lookup and tag check are too slow to repeat on every tick). */
     private final Map<EntityType<?>, Boolean> quietCache = new HashMap<>();
-    private EntityType<?> rotationNext;
     // Where the previews are parked (x/z fixed when the editor opens, y is slot 0), so they never count as having moved.
     private boolean anchorReady;
     private double anchorX;
@@ -582,9 +566,6 @@ public class MobEditorScreen extends Screen {
     private void buildTypes() {
         vanillaByCategory.clear();
         moddedByMod.clear();
-        vanillaTypes.clear();
-        moddedTypes.clear();
-        allTypes.clear();
         for (String c : MobGroups.CATEGORIES) {
             vanillaByCategory.put(c, new ArrayList<>());
         }
@@ -609,7 +590,6 @@ public class MobEditorScreen extends Screen {
         for (String c : MobGroups.CATEGORIES) {
             List<EntityType<?>> list = vanillaByCategory.get(c);
             list.sort(byName);
-            vanillaTypes.addAll(list);
         }
         List<String> mods = new ArrayList<>(byMod.keySet());
         mods.sort(Comparator.comparing(MobEditorScreen::modName, String.CASE_INSENSITIVE_ORDER));
@@ -619,13 +599,10 @@ public class MobEditorScreen extends Screen {
                 List<EntityType<?>> list = cats.get(c);
                 if (list != null) {
                     list.sort(byName);
-                    moddedTypes.addAll(list);
                 }
             }
             moddedByMod.put(mod, cats);
         }
-        allTypes.addAll(vanillaTypes);
-        allTypes.addAll(moddedTypes);
     }
 
     private void edit(Runnable r) {
@@ -1336,43 +1313,6 @@ public class MobEditorScreen extends Screen {
         return -1;
     }
 
-    /** A slot for a new twin. With evict, a cached mob gives its slot up (one nobody is looking at first). */
-    private int takeSlot(boolean evict) {
-        int s = freeSlot();
-        if (s >= 0 || !evict) {
-            return s;
-        }
-        Preview victim = null;
-        for (Preview p : warm.values()) {
-            if (p.slot < 0) {
-                continue;
-            }
-            if (!wantedNow.contains(p.type)) {
-                victim = p;
-                break;
-            }
-            if (victim == null) {
-                victim = p;
-            }
-        }
-        if (victim == null) {
-            return -1;
-        }
-        dispose(victim);
-        return freeSlot();
-    }
-
-    /** Frees the slot of a cached mob nobody needs any more. */
-    private boolean evictUnwanted() {
-        for (Preview p : warm.values()) {
-            if (p.slot >= 0 && !wantedNow.contains(p.type)) {
-                dispose(p);
-                return true;
-            }
-        }
-        return false;
-    }
-
     /**
      * Queues the hidden twin of a modded mob so the entities its server logic creates exist for the preview. Nothing here waits
      * for the server: the result is picked up by twinReady() on a later frame.
@@ -1542,7 +1482,6 @@ public class MobEditorScreen extends Screen {
 
     private void dispose(Preview p) {
         stopTwin(p);
-        warm.remove(p.type, p);
     }
 
     private void clearAllTwins() {
@@ -1570,7 +1509,6 @@ public class MobEditorScreen extends Screen {
     @Override
     public void removed() {
         clearAllTwins();
-        warm.clear();
         active = null;
         // Anything a preview mob's client code added to the client level up there (the server twins are removed above).
         AABB zone = PreviewZone.zone;
@@ -1633,11 +1571,6 @@ public class MobEditorScreen extends Screen {
         return p.warmTicks >= WARMUP_TICKS && p.stable;
     }
 
-    /** Finished warming: animation blends done and, for mobs with parts, the group has settled. Nothing more to do off-screen. */
-    private boolean isDone(Preview p) {
-        return warmedUp(p) && (p.slot < 0 || p.settled);
-    }
-
     /**
      * Whether the mob may be shown. A mob known to have parts waits until they have settled so it never appears piecemeal;
      * one not known to have any shows after the warm-up (parts that turn up later still wait to appear together).
@@ -1652,100 +1585,49 @@ public class MobEditorScreen extends Screen {
         return p.lastCount <= 0 && !MULTI.contains(p.type);
     }
 
-    /** The mob to show: the selected mob type, or a rotating pick from the selected category / all mobs. */
+    /** The preview of the selected mob type: made on first use (and any previous one released), then reused every frame. */
     private Preview current() {
-        rotationNext = null;
-        if (this.minecraft.level == null) {
+        if (this.minecraft.level == null || scope.type() != ScopeType.MOB_TYPE) {
             return null;
         }
-        List<EntityType<?>> list;
-        int start = 0;
-        switch (scope.type()) {
-            case MOB_TYPE -> {
-                list = new ArrayList<>(1);
-                list.add(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())));
-            }
-            case CATEGORY -> list = vanillaByCategory.getOrDefault(scope.id(), List.of());
-            case ORIGIN -> list = scope.id().equals("vanilla") ? vanillaTypes : moddedTypes;
-            case MOD -> {
-                list = new ArrayList<>();
-                for (List<EntityType<?>> types : moddedByMod.getOrDefault(scope.id(), Map.of()).values()) {
-                    list.addAll(types);
-                }
-            }
-            case MOD_CATEGORY -> {
-                int slash = scope.id().indexOf('/');
-                list = moddedByMod.getOrDefault(scope.id().substring(0, slash), Map.of())
-                        .getOrDefault(scope.id().substring(slash + 1), List.of());
-            }
-            case ALL -> list = allTypes;
-            default -> list = List.of();
+        EntityType<?> t = BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id()));
+        if (active != null && active.type == t) {
+            return active;
         }
-        if (list.isEmpty()) {
+        if (badTypes.contains(t)) {
             return null;
         }
-        if (scope.type() != ScopeType.MOB_TYPE) {
-            start = (int) ((Util.getMillis() / 4000L) % list.size());
-            if (list.size() > 1) {
-                // Warm the next mob of the rotation for the whole turn of this one, so the swap is seamless.
-                rotationNext = list.get((start + 1) % list.size());
-            }
+        Preview p = create(t);
+        if (p == null) {
+            return null;
         }
-        for (int i = 0; i < list.size(); i++) {
-            EntityType<?> t = list.get((start + i) % list.size());
-            if (active != null && active.type == t) {
-                return active;
-            }
-            if (badTypes.contains(t)) {
-                continue;
-            }
-            Preview p = warm.remove(t);
-            if (p == null) {
-                p = create(t, true);
-            }
-            if (p == null) {
-                continue;
-            }
-            demote(active);
-            active = p;
-            return p;
-        }
-        return null;
+        release(active);
+        active = p;
+        return p;
     }
 
-    /** A mob that is no longer shown goes back into the cache if it is fully warmed, so picking it again is instant. */
-    private void demote(Preview old) {
-        if (old == null) {
-            return;
-        }
-        stopTwin(old);
-    }
-
-    private void trimCache() {
-        while (warm.size() > MAX_CACHED) {
-            Preview oldest = warm.values().iterator().next();
-            dispose(oldest);
+    /** The preview of a mob that is no longer shown is dropped, together with its server twin. */
+    private void release(Preview old) {
+        if (old != null) {
+            stopTwin(old);
         }
     }
 
     /** Creates and sets up a preview mob (and its twin when it may need one), or returns null if it can't be made. */
-    private Preview create(EntityType<?> t, boolean evict) {
+    private Preview create(EntityType<?> t) {
         long t0 = System.nanoTime();
-        Preview made = createImpl(t, evict);
+        Preview made = createImpl(t);
         slow("creating preview (constructor + server twin)", t, t0);
         return made;
     }
 
-    private Preview createImpl(EntityType<?> t, boolean evict) {
+    private Preview createImpl(EntityType<?> t) {
         if (this.minecraft.level == null || badTypes.contains(t)) {
             return null;
         }
         int slot = -1;
         if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && !noTwin(t)) {
-            slot = takeSlot(evict);
-            if (slot < 0 && !evict) {
-                return null; // no room to warm it yet
-            }
+            slot = freeSlot();
         }
         double ay = anchorY + Math.max(slot, 0) * SLOT_SPACING;
         LivingEntity e = makeEntity(t, anchorX, ay, anchorZ);
@@ -1789,81 +1671,7 @@ public class MobEditorScreen extends Screen {
         return null;
     }
 
-    // ------------------------------------------------------------------ background warm-up
-
-    /** Mobs worth having warm, most important first: the hovered row, the next in a rotation, then everything in view. */
-    private void computeWanted() {
-        wantedNow.clear();
-        if (rotationNext != null) {
-            wantedNow.add(rotationNext);
-        }
-        if (scopeList != null && PREWARM_VISIBLE) {
-            scopeList.forEachVisible(4, it -> {
-                if (it instanceof ScopeItem si && si.s.type() == ScopeType.MOB_TYPE) {
-                    wantedNow.add(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(si.s.id())));
-                }
-            });
-        }
-        wantedNow.removeIf(MobEditorScreen::isVanilla);
-    }
-
-    /** Starts at most one new warm-up per frame (a few run at once) and steps / draws the running ones off-screen. */
-    private void pumpWarm(GuiGraphics g, float realPartial) {
-        if (this.minecraft.level == null) {
-            return;
-        }
-        int inFlight = 0;
-        for (Preview p : warm.values()) {
-            if (!isDone(p)) {
-                inFlight++;
-            }
-        }
-        if (inFlight < MAX_IN_FLIGHT) {
-            for (EntityType<?> t : wantedNow) {
-                if ((active != null && active.type == t) || warm.containsKey(t) || badTypes.contains(t)) {
-                    continue;
-                }
-                Preview p = create(t, false);
-                if (p == null && !badTypes.contains(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && evictUnwanted()) {
-                    p = create(t, false);
-                }
-                if (p != null) {
-                    warm.put(t, p);
-                    trimCache();
-                }
-                break;
-            }
-        }
-        for (Preview p : new ArrayList<>(warm.values())) {
-            if (isDone(p)) {
-                continue;
-            }
-            // The shown mob has first call on the frame's time budget. If it (or an earlier mob) used it up, a background
-            // warm-up only gets every fourth frame, so several big mobs never stack their hidden draws into one slow frame.
-            if (System.nanoTime() > warmDeadline && (frame & 3L) != 0L) {
-                continue;
-            }
-            long now = System.nanoTime();
-            if (p.firstRender == 0L) {
-                p.firstRender = now;
-            }
-            List<Entity> raw = rawCompanions(p);
-            p.growEnv(raw);
-            if (!warmedUp(p)) {
-                if (!fastForward(g, p, raw, realPartial)) {
-                    badTypes.add(p.type);
-                    dispose(p);
-                }
-                continue;
-            }
-            stepFrames(p, now);
-            float partial = (now - p.sim) / (float) TICK_NANOS;
-            if (!hiddenRender(g, p, true, partial, raw, realPartial)) {
-                badTypes.add(p.type);
-                dispose(p);
-            }
-        }
-    }
+    // ------------------------------------------------------------------ hidden draws
 
     /** Draws with an empty clip area: the animation library runs, nothing is shown. Returns false if drawing failed. */
     private boolean hiddenRender(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras, float realPartial) {
@@ -1936,12 +1744,11 @@ public class MobEditorScreen extends Screen {
      * Animation libraries (GeckoLib and the like) blend from the bind pose into idle over a number of ticks of the mob's age.
      * Instead of waiting for that in real time, a batch of ticks is simulated in one frame, each one advancing tickCount, and the
      * mob is then rendered off-screen once, so the blend is over before the mob is ever shown. The draw is the expensive part,
-     * so there is one per frame whatever the batch size; when the frame's time budget is already spent the batch is cut to one
-     * tick. Rendered at partial 0 so the animation clock never runs backwards when the real-time stepping takes over.
+     * so there is one per frame whatever the batch size. Rendered at partial 0 so the animation clock never runs backwards when the real-time stepping takes over.
      * Returns false if drawing failed.
      */
     private boolean fastForward(GuiGraphics g, Preview p, List<Entity> raw, float realPartial) {
-        int steps = System.nanoTime() > warmDeadline ? 1 : FAST_STEPS;
+        int steps = FAST_STEPS;
         for (int i = 0; i < steps; i++) {
             stepPreview(p);
         }
@@ -2170,7 +1977,6 @@ public class MobEditorScreen extends Screen {
     // ------------------------------------------------------------------ preview drawing
 
     private void renderPreview(GuiGraphics g, float realPartial) {
-        computeWanted();
         if (scope.type() == ScopeType.MOB_TYPE) {
             Preview p = current();
             if (p != null) {
@@ -2180,14 +1986,10 @@ public class MobEditorScreen extends Screen {
             }
         } else {
             // Vanilla Mobs / a category / a mod: no mob, just the Minecraft logo or the mod's name.
-            rotationNext = null;
-            if (active != null) {
-                demote(active);
-                active = null;
-            }
+            release(active);
+            active = null;
             drawScopeIcon(g);
         }
-        pumpWarm(g, realPartial);
     }
 
     private static LogoRenderer mcLogo;
@@ -2522,7 +2324,6 @@ public class MobEditorScreen extends Screen {
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
         super.render(g, mouseX, mouseY, partialTick);
         frame++;
-        warmDeadline = System.nanoTime() + WARM_BUDGET_NANOS;
         g.drawCenteredString(this.font, this.title, width / 2, 5, 0xFFFFFF);
         if (data == null) {
             g.drawCenteredString(this.font, Component.translatable("encephalon.screen.nodata"), width / 2, height / 2, 0xFF5555);
@@ -2563,11 +2364,11 @@ public class MobEditorScreen extends Screen {
             g.disableScissor();
             return;
         }
-        // No preview while a behavior is open, but mobs in view keep warming up in the background.
-        PreviewSandbox.run(() -> {
-            computeWanted();
-            pumpWarm(g, partialTick);
-        });
+        // No preview while a behavior is open: the mob and its server twin are released until the preview is needed again.
+        if (active != null) {
+            release(active);
+            active = null;
+        }
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         drawWarning(g, scroll);
