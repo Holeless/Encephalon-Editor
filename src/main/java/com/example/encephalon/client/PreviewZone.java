@@ -6,6 +6,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import com.example.encephalon.EncephalonMod;
 
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
@@ -29,7 +30,8 @@ import net.neoforged.neoforge.event.tick.EntityTickEvent;
  * Containment: a twin runs its mod's real server code, and that code can reach outside the column (the Void Worm opens a portal
  * in the sky and a sister portal at its destination, next to the player, which then teleports the player). So while a preview
  * entity is spawning or ticking on the server, every entity it tries to add to a world is vetoed unless it is a living
- * companion inside the column (a body segment or a head, which the preview draws). That is not specific to any one mod.
+ * companion inside the column that belongs to the twin's own mod (a body segment or a head, which the preview draws).
+ * Minions of another mod or of vanilla (a ghoul that comes with a crowd of zombies) are vetoed too.
  *
  * Stability: twins are pinned to their spot after every tick (the preview draws their parts relative to that spot, and a mob
  * that drifts, like the Void Worm, would carry its parts out of view), and mobs inside the column never despawn (a head or
@@ -47,6 +49,8 @@ public final class PreviewZone {
     private static final Set<Entity> TICKING = ConcurrentHashMap.newKeySet();
     /** Entity id of each server twin -> the spot it is pinned to. */
     private static final Map<Integer, Vec3> TWIN_HOME = new ConcurrentHashMap<>();
+    /** Mod ids of the twins that were made: only entities from these mods may exist next to a twin. */
+    private static final Set<String> PART_NAMESPACES = ConcurrentHashMap.newKeySet();
 
     private PreviewZone() {
     }
@@ -56,8 +60,9 @@ public final class PreviewZone {
         return z != null && z.contains(pos);
     }
 
-    /** Call on the server thread around code that creates a twin. */
-    static void beginSpawn() {
+    /** Call on the server thread around code that creates a twin of a mob from the given mod. */
+    static void beginSpawn(String namespace) {
+        PART_NAMESPACES.add(namespace);
         spawning++;
     }
 
@@ -78,11 +83,18 @@ public final class PreviewZone {
         spawning = 0;
         TICKING.clear();
         TWIN_HOME.clear();
+        PART_NAMESPACES.clear();
     }
 
     /** True while preview code (a twin being created, or one ticking) is running on the server. */
     private static boolean previewCodeRunning() {
         return zone != null && (spawning > 0 || !TICKING.isEmpty());
+    }
+
+    /** True for a living entity that belongs to the mod of one of the twins (a body segment, a head). */
+    static boolean isPart(Entity e) {
+        return e instanceof LivingEntity
+                && PART_NAMESPACES.contains(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getNamespace());
     }
 
     @SubscribeEvent
@@ -119,9 +131,10 @@ public final class PreviewZone {
             return;
         }
         boolean inside = contains(e.position());
-        // Whatever a preview entity creates is vetoed, except living companions inside the column. This is what stops portals,
-        // their sister portals next to the player, projectiles, area clouds, items and minions from ever existing.
-        if (!event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !(e instanceof LivingEntity))) {
+        // Whatever a preview entity creates is vetoed, except living companions of the same mod inside the column. This is what
+        // stops portals, their sister portals next to the player, projectiles, area clouds, items, minions and crowds of
+        // zombies from ever existing.
+        if (!event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !isPart(e))) {
             event.setCanceled(true);
             return;
         }

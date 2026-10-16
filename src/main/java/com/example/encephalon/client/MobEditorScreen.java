@@ -130,7 +130,10 @@ public class MobEditorScreen extends Screen {
     private static final float GROUP_VIEW_ANGLE = 0.55F;
     private static final double GROUP_SWAY_DEG = 15.0;
     private static final float SMOOTH = 0.15F;          // how fast the shown size / angle follows the fitted one (per frame)
-    private static final int MEASURE_TICKS = 80;        // preview ticks (after warm-up) during which the model is measured
+    // A modded mob is kept hidden (and measured) until its size has stopped changing for this many ticks (about one walk cycle),
+    // or this many ticks after the warm-up at the latest. So it appears at its final size instead of zooming in and out.
+    private static final int STABLE_TICKS = 20;
+    private static final int MAX_STABLE_WAIT = 60;
     private static final int MB_BINS = 2048;            // measuring histogram: bins per axis...
     private static final float MB_BIN = 0.25F;          // ...of this many blocks...
     private static final float MB_OFF = 256F;           // ...starting this far below zero
@@ -253,6 +256,11 @@ public class MobEditorScreen extends Screen {
         float sPivX;
         float sPivZ;
         float sYaw;
+        // Size tracking for the reveal: the model's extent is snapshotted whenever it changes, and the mob counts as steady
+        // once it has stayed within a few percent of the snapshot for STABLE_TICKS ticks.
+        float[] snap;
+        int stableTicks;
+        boolean stable;
 
         Preview(EntityType<?> type, LivingEntity entity, double ay, int slot) {
             this.type = type;
@@ -269,7 +277,48 @@ public class MobEditorScreen extends Screen {
         }
 
         boolean canMeasure() {
-            return !isVanilla(type) && warmTicks < WARMUP_TICKS + MEASURE_TICKS;
+            return !isVanilla(type) && !stable;
+        }
+
+        /** Called after each simulated, rendered warm-up tick: decides when the model's size has settled. */
+        void trackStable() {
+            if (stable) {
+                return;
+            }
+            if (warmTicks >= WARMUP_TICKS + MAX_STABLE_WAIT) {
+                stable = true;
+                return;
+            }
+            if (warmTicks < WARMUP_TICKS || !hasMeasure()) {
+                return;
+            }
+            float[] cur = new float[6];
+            float[] r = new float[2];
+            float size = 0F;
+            for (int a = 0; a < 3; a++) {
+                range(a, r);
+                cur[2 * a] = r[0];
+                cur[2 * a + 1] = r[1];
+                size = Math.max(size, r[1] - r[0]);
+            }
+            float tol = Math.max(0.05F * size, 0.05F);
+            boolean same = snap != null;
+            if (same) {
+                for (int i = 0; i < 6; i++) {
+                    if (Math.abs(cur[i] - snap[i]) > tol) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if (same) {
+                if (++stableTicks >= STABLE_TICKS) {
+                    stable = true;
+                }
+            } else {
+                snap = cur;
+                stableTicks = 0;
+            }
         }
 
         /** Records a vertex of the model, in blocks from the anchor (x, z horizontal, y up). */
@@ -1091,7 +1140,7 @@ public class MobEditorScreen extends Screen {
         final int[] id = {-1};
         try {
             server.executeBlocking(() -> {
-                PreviewZone.beginSpawn(); // anything this mob creates outside the preview column is vetoed
+                PreviewZone.beginSpawn(BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace()); // anything this mob creates outside the column, or that is not from its own mod, is vetoed
                 try {
                 ServerLevel sl = server.getLevel(dim);
                 if (sl == null) {
@@ -1217,7 +1266,7 @@ public class MobEditorScreen extends Screen {
         // Living entities only: those are the segments and heads. Other things the mob makes (the Void Worm's portal) are
         // effects of the twin standing still up there, not part of the mob.
         List<Entity> found = this.minecraft.level.getEntities((Entity) null, p.box(),
-                en -> en instanceof LivingEntity && en.getId() != p.twinId && en != p.entity && en != this.minecraft.player);
+                en -> PreviewZone.isPart(en) && en.getId() != p.twinId && en != p.entity && en != this.minecraft.player);
         long now = this.minecraft.level.getGameTime();
         if (found.size() != p.lastCount) {
             p.lastCount = found.size();
@@ -1243,7 +1292,7 @@ public class MobEditorScreen extends Screen {
         if (isVanilla(p.type)) {
             return true;
         }
-        return p.warmTicks >= WARMUP_TICKS;
+        return p.warmTicks >= WARMUP_TICKS && p.stable;
     }
 
     /** Finished warming: animation blends done and, for mobs with parts, the group has settled. Nothing more to do off-screen. */
@@ -1548,6 +1597,7 @@ public class MobEditorScreen extends Screen {
         for (int i = 0; i < FAST_STEPS && ok && !warmedUp(p); i++) {
             stepPreview(p);
             ok = hiddenRender(g, p, true, 0F, raw, realPartial);
+            p.trackStable();
         }
         p.sim = System.nanoTime();
         return ok;
@@ -1979,7 +2029,7 @@ public class MobEditorScreen extends Screen {
             tScale = Math.min(55F, Math.min(panelH * fillH / extentH, rw * fillW / extentW));
         }
 
-        if (p.sScale < 0F) {
+        if (p.sScale < 0F || !visible) { // while it is not shown yet there is nothing to ease
             p.sScale = tScale;
             p.sCenterY = tCenterY;
             p.sPivX = tPivX;
