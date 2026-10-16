@@ -13,6 +13,8 @@ public final class EncephalonConfig {
     public static final ModConfigSpec SPEC;
     public static final ModConfigSpec.BooleanValue SHOW_MOBS_WITHOUT_EGG;
     public static final ModConfigSpec.BooleanValue BOSS_TWINS;
+    public static final ModConfigSpec.BooleanValue HOVER_PREWARM;
+    public static final ModConfigSpec.IntValue BREAKER_MS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> QUIET_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> PART_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> NOT_PART_MOBS;
@@ -37,6 +39,8 @@ public final class EncephalonConfig {
      */
     private static final Set<String> BUILT_IN_NO_TWIN_MODS = Set.of("naturalist");
 
+    private static final int DEFAULT_BREAKER_MS = 120;
+
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
         SHOW_MOBS_WITHOUT_EGG = b
@@ -50,6 +54,17 @@ public final class EncephalonConfig {
                         "body parts exist and are drawn (the Void Worm needs this). They still are never ticked on the client.",
                         "Turn off if a boss changes the sky or starts music in the editor. Mobs in quietMobs never get a twin.")
                 .define("bossTwins", true);
+        HOVER_PREWARM = b
+                .comment("Warm up a modded mob in the background while the mouse is over its row, so that clicking it is instant.",
+                        "Every hovered row builds the mob, a hidden server twin and about 70 simulated ticks with hidden draws, so",
+                        "sweeping the mouse down a long list of big mobs (whales, mammoths, giraffes) is very expensive.",
+                        "Off by default: the mob is prepared when you click it instead.")
+                .define("hoverPrewarm", false);
+        BREAKER_MS = b
+                .comment("Preview circuit breaker, in milliseconds. If drawing one preview mob takes longer than this on two",
+                        "frames, that mob's preview is switched off for the rest of the editor session (its behaviors can still be",
+                        "edited) instead of freezing the game. 0 turns the breaker off.")
+                .defineInRange("previewBreakerMs", DEFAULT_BREAKER_MS, 0, 5000);
         QUIET_MOBS = b
                 .comment("Modded mobs (entity ids) that the Mob Editor preview must treat as inert: no hidden server twin and no",
                         "entity ticking, only the model is drawn. Use this for bosses whose own code starts music, sky effects",
@@ -76,6 +91,17 @@ public final class EncephalonConfig {
 
     public static boolean showMobsWithoutEgg() {
         return SPEC.isLoaded() && SHOW_MOBS_WITHOUT_EGG.get();
+    }
+
+    /** Whether hovering a mob row warms that mob up in the background (off by default, it is expensive). */
+    public static boolean hoverPrewarm() {
+        return SPEC.isLoaded() && HOVER_PREWARM.get();
+    }
+
+    /** Circuit breaker limit for one preview draw, in nanoseconds; 0 or less means the breaker is off. */
+    public static long breakerNanos() {
+        int ms = SPEC.isLoaded() ? BREAKER_MS.get() : DEFAULT_BREAKER_MS;
+        return ms * 1_000_000L;
     }
 
     /** True if this type is named in the built-in or config quiet lists: no client ticking and no server twin at all. */

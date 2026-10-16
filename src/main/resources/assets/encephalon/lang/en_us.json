@@ -18,6 +18,7 @@
   "encephalon.screen.from_here": "Set here",
   "encephalon.screen.from_other": "Inherited from: %s",
   "encephalon.screen.from_none": "Not set anywhere (off by default)",
+  "encephalon.screen.preview_off": "No preview: this mob failed to load or was too heavy to preview. Its behaviors can still be edited.",
   "encephalon.state.inherit": "Inherit",
   "encephalon.state.on": "On",
   "encephalon.state.off": "Off",
