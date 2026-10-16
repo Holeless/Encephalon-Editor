@@ -13,6 +13,7 @@ import java.util.Set;
 
 import org.joml.Quaternionf;
 
+import com.example.encephalon.EncephalonMod;
 import com.example.encephalon.behavior.Behavior;
 import com.example.encephalon.behavior.Behaviors;
 import com.example.encephalon.behavior.Setting;
@@ -51,10 +52,13 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.WalkAnimationState;
 import net.minecraft.world.entity.ambient.Bat;
+import net.minecraft.world.entity.animal.Dolphin;
 import net.minecraft.world.entity.animal.FlyingAnimal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.monster.Guardian;
 import net.minecraft.world.entity.monster.Slime;
+import net.minecraft.world.entity.monster.hoglin.Hoglin;
+import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.SpawnEggItem;
 
@@ -88,7 +92,22 @@ public class MobEditorScreen extends Screen {
     private static final float GUARDIAN_TAIL_SPEED = 0.15F;
     private static final Field GUARDIAN_TAIL = field(Guardian.class, "clientSideTailAnimation");
     private static final Field GUARDIAN_TAIL_O = field(Guardian.class, "clientSideTailAnimationO");
+    // Out of water the spikes also snap to a new random value every tick; hold them still.
+    private static final float GUARDIAN_SPIKES = 0.45F;
+    private static final Field GUARDIAN_SPIKES_F = field(Guardian.class, "clientSideSpikesAnimation");
+    private static final Field GUARDIAN_SPIKES_O = field(Guardian.class, "clientSideSpikesAnimationO");
+    private static final boolean CAN_PIN_GUARDIAN = GUARDIAN_TAIL != null && GUARDIAN_TAIL_O != null
+            && GUARDIAN_SPIKES_F != null && GUARDIAN_SPIKES_O != null;
     private static final boolean CAN_PIN_WALK = WALK_SPEED_OLD != null && WALK_SPEED_NOW != null && WALK_POS != null;
+
+    static {
+        if (!CAN_PIN_WALK) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: WalkAnimationState fields not found; non-dragon mobs are animated by hand");
+        }
+        if (!CAN_PIN_GUARDIAN) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: Guardian animation fields not found; guardians are not animated");
+        }
+    }
 
     private MinecraftServer server;
     private MobConfigData data;
@@ -593,6 +612,17 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ 3D preview
 
+    private static void faceViewer(LivingEntity e) {
+        e.yBodyRot = 180F;
+        e.yBodyRotO = 180F;
+        e.setYRot(180F);
+        e.yRotO = 180F;
+        e.yHeadRot = 180F;
+        e.yHeadRotO = 180F;
+        e.setXRot(0F);
+        e.xRotO = 0F;
+    }
+
     private static boolean isFlyer(LivingEntity e) {
         return e instanceof FlyingAnimal || e instanceof FlyingMob || e instanceof Bat || e instanceof EnderDragon;
     }
@@ -631,9 +661,12 @@ public class MobEditorScreen extends Screen {
                 Entity e = t.create(this.minecraft.level);
                 if (e instanceof LivingEntity living) {
                     living.setSilent(true);
-                    if (living instanceof Mob mob) {
-                        mob.setNoAi(true); // stops hoglins/piglins shaking as if converting to zombified in the overworld
+                    if (living instanceof Hoglin || living instanceof AbstractPiglin) {
+                        // Stops them shaking as if converting to zombified in the overworld. Not for other mobs: the dragon,
+                        // for one, freezes its wings when it has no AI.
+                        ((Mob) living).setNoAi(true);
                     }
+                    faceViewer(living);
                     tickFailed = false;
                     previewType = t;
                     previewEntity = living;
@@ -671,7 +704,8 @@ public class MobEditorScreen extends Screen {
         }
         boolean dragon = e instanceof EnderDragon;
         e.tickCount++;
-        if (!tickFailed && (CAN_PIN_WALK || dragon)) {
+        boolean skipTick = e instanceof Guardian && !CAN_PIN_GUARDIAN;
+        if (!tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
                 double hx = this.minecraft.player.getX();
                 double hy = this.minecraft.level.getMaxBuildHeight() + 64;
@@ -681,23 +715,32 @@ public class MobEditorScreen extends Screen {
                     walk = new float[] {WALK_SPEED_OLD.getFloat(e.walkAnimation), WALK_SPEED_NOW.getFloat(e.walkAnimation),
                             WALK_POS.getFloat(e.walkAnimation)};
                 }
+                faceViewer(e); // the dragon records its yaw every tick and renders from that history
                 e.setPos(hx, hy, hz);
                 e.setOldPosAndRot();
-                // The dragon's wing flap rate depends on its speed; a stationary dragon flaps far too fast, so give it a cruise.
-                e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : 0.0);
+                // The dragon's wing flap rate depends on its speed (a stationary one flaps far too fast), and the dolphin
+                // only animates while it is moving.
+                e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : e instanceof Dolphin ? -0.05 : 0.0);
                 // Slimes only squish on ground transitions, so make them hop in place.
                 boolean grounded = e instanceof Slime ? e.tickCount % 24 < 16 : !isFlyer(e);
                 e.setOnGround(grounded);
                 float tail = 0F;
-                boolean pinTail = e instanceof Guardian && GUARDIAN_TAIL != null && GUARDIAN_TAIL_O != null;
-                if (pinTail) {
+                boolean pinGuardian = e instanceof Guardian && CAN_PIN_GUARDIAN;
+                if (pinGuardian) {
                     tail = GUARDIAN_TAIL.getFloat(e);
                 }
+                // Slimes set oSquish = squish every tick, which makes the squish step at 20 Hz; keep the previous value to lerp.
+                float squish = e instanceof Slime sl ? sl.squish : 0F;
                 e.tick();
                 e.setPos(hx, hy, hz);
-                if (pinTail) {
+                if (e instanceof Slime sl) {
+                    sl.oSquish = squish;
+                }
+                if (pinGuardian) {
                     GUARDIAN_TAIL_O.setFloat(e, tail);
                     GUARDIAN_TAIL.setFloat(e, tail + GUARDIAN_TAIL_SPEED);
+                    GUARDIAN_SPIKES_O.setFloat(e, GUARDIAN_SPIKES);
+                    GUARDIAN_SPIKES_F.setFloat(e, GUARDIAN_SPIKES);
                 }
                 if (walk != null) {
                     WALK_SPEED_OLD.setFloat(e.walkAnimation, walk[0]);
@@ -757,14 +800,7 @@ public class MobEditorScreen extends Screen {
         float feetY = (top + bottom) / 2F + centerY * scale;
 
         // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
-        e.yBodyRot = 180F;
-        e.yBodyRotO = 180F;
-        e.setYRot(180F);
-        e.yRotO = 180F;
-        e.yHeadRot = 180F;
-        e.yHeadRotO = 180F;
-        e.setXRot(0F);
-        e.xRotO = 0F;
+        faceViewer(e);
         float sway = (float) Math.toRadians((dragon ? 12.0 : 40.0) * Math.sin(Util.getMillis() / 1500.0));
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
