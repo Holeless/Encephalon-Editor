@@ -125,16 +125,6 @@ public class MobEditorScreen extends Screen {
     // How much of the panel a measured modded mob may fill (the measurement is accurate, so little padding is needed). The
     // panel it is fitted to stops above the name label, so nothing overlaps the text.
     private static final float FILL_H = 0.90F;
-    // Mobs are never drawn bigger than this many pixels per block (a zombie-sized mob is already drawn about this big)...
-    private static final float MAX_FIT_SCALE = 55F;
-    // ...unless they are microscopic: a mob whose core size would come out smaller than this many pixels is enlarged until
-    // it is that big (so a 0.3 block mob is visible, but a normal small mob is left at its natural size).
-    private static final float MIN_SHOWN_PX = 30F;
-    // So that mobs keep their size relative to each other, nothing is drawn bigger than the size at which a zombie (1.95 blocks)
-    // fills REF_FILL of the panel height; only mobs too big for the panel are shrunk below that. (On a small panel, i.e. a big
-    // GUI scale, this is below MAX_FIT_SCALE, which is what leaves room for a giant to look bigger than a zombie.)
-    private static final float REF_HEIGHT = 1.95F;
-    private static final float REF_FILL = 0.5F;
     private static final int LABEL_STRIP = 18;          // pixels kept free above the bottom of the panel for the name label
     private static final float FILL_W = 0.95F;
     private static final float GROUP_VIEW_ANGLE = 0.55F;
@@ -220,11 +210,11 @@ public class MobEditorScreen extends Screen {
     // into idle, then blend again into the walk once the walk state kicks in. A modded mob is therefore drawn off-screen
     // (empty scissor) for this long first, so those blends finish before anyone sees it.
     private static final int WARMUP_TICKS = 10;      // simulated ticks of animation before a modded mob may be shown
-    private static final int FAST_STEPS = 6;         // warm-up ticks simulated (and rendered off-screen) per frame, at most
+    private static final int FAST_STEPS = 3;         // warm-up ticks simulated (and rendered off-screen) per frame, at most
     // Warming up a many-part mob (a worm with dozens of animated segments) costs a lot per hidden draw. All the warm-up work of
     // one frame shares this time budget; once it is spent each mob still gets one step (so it keeps progressing) but no more,
     // which keeps the editor from stuttering while a worm is being prepared.
-    private static final long WARM_BUDGET_NANOS = 10_000_000L;
+    private static final long WARM_BUDGET_NANOS = 4_000_000L;
     private long warmDeadline;
     // Mods often build a mob out of other entities that only the server creates (body segments, a detached head, ...).
     // For modded mobs a hidden, AI-less twin is spawned on the integrated server at the same spot; whatever extra
@@ -239,7 +229,8 @@ public class MobEditorScreen extends Screen {
     private static final int SETTLE_STABLE_TICKS = 10;  // the number of companions must not change for this long
     private static final int SETTLE_MIN_TICKS = 20;      // and at least this long must have passed since the twin spawned
     private static final int SOLO_TICKS = 70;           // a twin that made no companions by now never will: drop it
-    private static final int MAX_IN_FLIGHT = 4;          // mobs being warmed up at the same time
+    private static final int MAX_IN_FLIGHT = 2;          // mobs being warmed up at the same time
+    private static final boolean PREWARM_VISIBLE = false; // true = also warm every visible row (smoother picking, more spikes)
     private static final int MAX_CACHED = 12;            // warmed mobs kept around for instant picking
 
     /** Modded types known to have no companions (no twin needed) / to have companions (hold the reveal until settled). */
@@ -1201,10 +1192,42 @@ public class MobEditorScreen extends Screen {
         return c != null && HAS_BOSS_BAR.computeIfAbsent(c, MobEditorScreen::hasBossBar);
     }
 
-    /** The biggest scale a mob of this size (blocks) is drawn at; see REF_FILL. Microscopic mobs may go past it. */
+    /**
+     * Mobs that get no server twin (so none of their body parts exist). Only the ones named in the built-in / config lists.
+     * Bosses that are merely detected as bosses (tag or boss bar) are not in that group: a multi-part boss such as the Void
+     * Worm needs its twin to have a body. Its boss bar is hidden and disarmed by PreviewBossBars, and its sounds and music are
+     * dropped; set bossTwins=false in the config to give detected bosses no twin again.
+     */
+    private boolean noTwin(EntityType<?> t) {
+        if (isVanilla(t)) {
+            return false;
+        }
+        if (EncephalonConfig.isQuietListed(t)) {
+            return true;
+        }
+        return !EncephalonConfig.bossTwins() && quiet(t);
+    }
+
+    // Size to screen curve: the fraction of the panel height a mob of `size` blocks gets. It is smooth (no hard minimum), so
+    // relative sizes hold: a chicken is clearly smaller than a zombie, which is clearly smaller than a giant.
+    // Raise SIZE_K to make everything bigger. Lower SIZE_EXP to make small mobs bigger relative to big ones.
+    private static final float SIZE_K = 0.38F;
+    private static final float SIZE_EXP = 0.65F;
+    private static final float MIN_FRAC = 0.14F;
+
+    /** The scale (pixels per block) a mob of this size (blocks) is drawn at, before the fit rules shrink it further. */
     private static float baseScale(float panelH, float size) {
-        float cap = Math.min(MAX_FIT_SCALE, panelH * REF_FILL / REF_HEIGHT);
-        return Math.max(cap, MIN_SHOWN_PX / Math.max(size, 0.05F));
+        size = Math.max(size, 0.05F);
+        float frac = Mth.clamp(SIZE_K * (float) Math.pow(size, SIZE_EXP), MIN_FRAC, 1F);
+        return panelH * frac / size;
+    }
+
+    /** Logs a preview step that took long, with the mob id, so lag spikes can be traced to a mob and a phase. */
+    private static void slow(String what, EntityType<?> t, long startNanos) {
+        long ms = (System.nanoTime() - startNanos) / 1_000_000L;
+        if (ms >= 25) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: {} took {} ms for {}", what, ms, BuiltInRegistries.ENTITY_TYPE.getKey(t));
+        }
     }
 
     private static Field field(Class<?> owner, String name) {
@@ -1585,11 +1608,18 @@ public class MobEditorScreen extends Screen {
 
     /** Creates and sets up a preview mob (and its twin when it may need one), or returns null if it can't be made. */
     private Preview create(EntityType<?> t, boolean evict) {
+        long t0 = System.nanoTime();
+        Preview made = createImpl(t, evict);
+        slow("creating preview (constructor + server twin)", t, t0);
+        return made;
+    }
+
+    private Preview createImpl(EntityType<?> t, boolean evict) {
         if (this.minecraft.level == null || badTypes.contains(t)) {
             return null;
         }
         int slot = -1;
-        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && !quiet(t)) {
+        if (server != null && !isVanilla(t) && !SOLO.contains(t) && !NO_TWIN.contains(t) && !noTwin(t)) {
             slot = takeSlot(evict);
             if (slot < 0 && !evict) {
                 return null; // no room to warm it yet
@@ -1654,7 +1684,7 @@ public class MobEditorScreen extends Screen {
         if (rotationNext != null) {
             wantedNow.add(rotationNext);
         }
-        if (scopeList != null) {
+        if (scopeList != null && PREWARM_VISIBLE) {
             scopeList.forEachVisible(4, it -> {
                 if (it instanceof ScopeItem si && si.s.type() == ScopeType.MOB_TYPE) {
                     wantedNow.add(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(si.s.id())));
@@ -1719,6 +1749,13 @@ public class MobEditorScreen extends Screen {
 
     /** Draws with an empty clip area: the animation library runs, nothing is shown. Returns false if drawing failed. */
     private boolean hiddenRender(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras, float realPartial) {
+        long t0 = System.nanoTime();
+        boolean done = hiddenRenderImpl(g, p, withMain, partial, extras, realPartial);
+        slow("hidden warm-up render", p.type, t0);
+        return done;
+    }
+
+    private boolean hiddenRenderImpl(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras, float realPartial) {
         LivingEntity e = p.entity;
         faceViewer(e);
         forceWet(e);
@@ -2069,6 +2106,12 @@ public class MobEditorScreen extends Screen {
     }
 
     private void drawActive(GuiGraphics g, Preview p, float realPartial) {
+        long t0 = System.nanoTime();
+        drawActiveImpl(g, p, realPartial);
+        slow("drawing shown mob", p.type, t0);
+    }
+
+    private void drawActiveImpl(GuiGraphics g, Preview p, float realPartial) {
         LivingEntity e = p.entity;
         long now = System.nanoTime();
         if (p.firstRender == 0L) {
@@ -2204,7 +2247,7 @@ public class MobEditorScreen extends Screen {
                 // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
                 extentH = Math.max(bbH, bbW * 1.2F);
                 extentW = bbW * 2.2F;
-                fillH = 0.8F;
+                fillH = 0.9F;
                 fillW = 0.8F;
                 if (!modded && p.vanillaMeasured && p.hasMeasure()) {
                     float[] mr = new float[2];

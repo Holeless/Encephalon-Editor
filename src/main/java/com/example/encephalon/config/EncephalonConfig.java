@@ -12,6 +12,7 @@ import net.neoforged.neoforge.common.Tags;
 public final class EncephalonConfig {
     public static final ModConfigSpec SPEC;
     public static final ModConfigSpec.BooleanValue SHOW_MOBS_WITHOUT_EGG;
+    public static final ModConfigSpec.BooleanValue BOSS_TWINS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> QUIET_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> PART_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> NOT_PART_MOBS;
@@ -36,6 +37,11 @@ public final class EncephalonConfig {
                         "creative tab or have to spawn naturally (biome or structure spawn lists).")
                 .translation("encephalon.configuration.showMobsWithoutEgg")
                 .define("showMobsWithoutEgg", false);
+        BOSS_TWINS = b
+                .comment("Give modded bosses (tagged c:bosses, or holding a boss bar) a hidden server twin in the preview, so their",
+                        "body parts exist and are drawn (the Void Worm needs this). They still are never ticked on the client.",
+                        "Turn off if a boss changes the sky or starts music in the editor. Mobs in quietMobs never get a twin.")
+                .define("bossTwins", true);
         QUIET_MOBS = b
                 .comment("Modded mobs (entity ids) that the Mob Editor preview must treat as inert: no hidden server twin and no",
                         "entity ticking, only the model is drawn. Use this for bosses whose own code starts music, sky effects",
@@ -58,7 +64,17 @@ public final class EncephalonConfig {
         return SPEC.isLoaded() && SHOW_MOBS_WITHOUT_EGG.get();
     }
 
-    /** True if the preview should draw this type without ticking it or spawning a server twin for it. */
+    /** True if this type is named in the built-in or config quiet lists: no client ticking and no server twin at all. */
+    public static boolean isQuietListed(EntityType<?> type) {
+        String id = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
+        return BUILT_IN_QUIET.contains(id) || (SPEC.isLoaded() && QUIET_MOBS.get().contains(id));
+    }
+
+    public static boolean bossTwins() {
+        return !SPEC.isLoaded() || BOSS_TWINS.get();
+    }
+
+    /** True if the preview should draw this type without ticking it (listed ones also get no server twin). */
     public static boolean isQuiet(EntityType<?> type) {
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
         if (BUILT_IN_QUIET.contains(id)) {

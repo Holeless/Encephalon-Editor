@@ -1,7 +1,13 @@
 package com.example.encephalon.client;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
@@ -9,6 +15,7 @@ import com.example.encephalon.EncephalonMod;
 import com.example.encephalon.config.EncephalonConfig;
 
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
@@ -64,6 +71,14 @@ public final class PreviewZone {
 
     /** Twins that are about to be added to the level (they must not be mistaken for something they spawned). */
     private static final Set<Entity> EXPECTED = ConcurrentHashMap.newKeySet();
+    /**
+     * UUIDs of the twins and of every part let in next to them. An entity that refers to one of these (a Murmur head knows its
+     * body, a worm segment its parent) is a part even when it has AI and target goals, which is what the minion test would
+     * otherwise reject.
+     */
+    private static final Set<UUID> FAMILY = ConcurrentHashMap.newKeySet();
+    /** Reference-holding fields per entity class (UUID, Optional or entity typed, below Entity). */
+    private static final Map<Class<?>, Field[]> LINK_FIELDS = new ConcurrentHashMap<>();
     /** Entity types already reported as blocked, so the log says it once. */
     private static final Set<String> LOGGED = ConcurrentHashMap.newKeySet();
 
@@ -98,6 +113,7 @@ public final class PreviewZone {
     /** Server thread: this entity is the twin the editor is creating, let it into the level. */
     static void expectTwin(Entity twin) {
         EXPECTED.add(twin);
+        FAMILY.add(twin.getUUID());
     }
 
     static boolean contains(Vec3 pos) {
@@ -130,6 +146,7 @@ public final class PreviewZone {
         TWIN_HOME.clear();
         PART_NAMESPACES.clear();
         EXPECTED.clear();
+        FAMILY.clear();
     }
 
     /** True while preview code (a twin being created, or one ticking) is running on the server. */
@@ -162,7 +179,73 @@ public final class PreviewZone {
             return false;
         }
         // Goals only exist on the server; the client only ever sees entities the server let through.
-        return !(e instanceof Mob mob && !mob.targetSelector.getAvailableGoals().isEmpty());
+        if (!(e instanceof Mob mob) || mob.targetSelector.getAvailableGoals().isEmpty()) {
+            return true;
+        }
+        // It hunts, but it may still be a head or limb that belongs to the twin: it points back at it (or at another part).
+        return linkedToFamily(e);
+    }
+
+    private static Field[] linkFields(Class<?> c) {
+        return LINK_FIELDS.computeIfAbsent(c, k -> {
+            List<Field> out = new ArrayList<>();
+            for (Class<?> x = k; x != null && x != Entity.class && x != Object.class; x = x.getSuperclass()) {
+                try {
+                    for (Field f : x.getDeclaredFields()) {
+                        Class<?> t = f.getType();
+                        if (Modifier.isStatic(f.getModifiers())) {
+                            continue;
+                        }
+                        if (t == UUID.class || t == Optional.class || Entity.class.isAssignableFrom(t) || t == Object.class) {
+                            f.setAccessible(true);
+                            out.add(f);
+                        }
+                    }
+                } catch (LinkageError | RuntimeException ex) {
+                    // a field type from a mod that is not installed, or a field that cannot be opened: skip the class level
+                }
+            }
+            return out.toArray(new Field[0]);
+        });
+    }
+
+    private static boolean refersToFamily(Object o) {
+        if (o instanceof Optional<?> opt) {
+            o = opt.orElse(null);
+        }
+        if (o instanceof UUID id) {
+            return FAMILY.contains(id);
+        }
+        return o instanceof Entity other && FAMILY.contains(other.getUUID());
+    }
+
+    /** True if the entity's synched data or one of its fields holds the UUID of the twin or of a part already let in. */
+    private static boolean linkedToFamily(Entity e) {
+        if (FAMILY.isEmpty()) {
+            return false;
+        }
+        try {
+            List<SynchedEntityData.DataValue<?>> values = e.getEntityData().getNonDefaultValues();
+            if (values != null) {
+                for (SynchedEntityData.DataValue<?> v : values) {
+                    if (refersToFamily(v.value())) {
+                        return true;
+                    }
+                }
+            }
+        } catch (RuntimeException ex) {
+            // best effort
+        }
+        for (Field f : linkFields(e.getClass())) {
+            try {
+                if (refersToFamily(f.get(e))) {
+                    return true;
+                }
+            } catch (ReflectiveOperationException | RuntimeException ex) {
+                // best effort
+            }
+        }
+        return false;
     }
 
     private static void logBlocked(Entity e) {
@@ -218,10 +301,13 @@ public final class PreviewZone {
         // stops portals, their sister portals next to the player, projectiles, area clouds, items, minions and crowds of
         // zombies from ever existing.
         boolean twin = !event.getLevel().isClientSide() && EXPECTED.remove(e);
-        if (!twin && !event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !isPart(e))) {
-            logBlocked(e);
-            event.setCanceled(true);
-            return;
+        if (!twin && !event.getLevel().isClientSide() && previewCodeRunning()) {
+            if (!inside || !isPart(e)) {
+                logBlocked(e);
+                event.setCanceled(true);
+                return;
+            }
+            FAMILY.add(e.getUUID()); // a part: anything that points at it is a part too (a segment's own child, say)
         }
         if (!inside) {
             return;
