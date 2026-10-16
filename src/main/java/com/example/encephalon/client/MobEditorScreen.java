@@ -240,7 +240,14 @@ public class MobEditorScreen extends Screen {
     // Server-side fast-forward of a fresh twin: up to this many ticks of the twin and everything it made, within this time.
     // It runs on the server thread without blocking the render thread.
     private static final int TWIN_PRETICKS = 48;
-    private static final long TWIN_PRETICK_BUDGET_NANOS = 60_000_000L;
+    private static final long TWIN_PRETICK_BUDGET_NANOS = 30_000_000L;
+    // Result of the asynchronous twin spawn: pending, failed, or the entity id (>= 0).
+    private static final int TWIN_PENDING = -2;
+    private static final int TWIN_FAILED = -1;
+    // Frame-time governor for the shown mob (see govern()): above FREEZE its own tick is switched off, above OFF its preview is.
+    private static final long FREEZE_NANOS = 10_000_000L;
+    private static final long OFF_NANOS = 35_000_000L;
+    private static final int GOVERN_SETTLE_FRAMES = 20;
     // A preview mob whose own tick takes longer than this several times is drawn without being ticked from then on.
     private static final long SLOW_TICK_NANOS = 8_000_000L;
     private static final int SLOW_TICK_LIMIT = 4;
@@ -263,6 +270,11 @@ public class MobEditorScreen extends Screen {
         final double az;
         int slot;
         int twinId = -1;
+        final java.util.concurrent.atomic.AtomicInteger twinResult = new java.util.concurrent.atomic.AtomicInteger(TWIN_PENDING);
+        /** Frame-time governor state (see govern()). */
+        double avgNanos;
+        int govFrames;
+        int hugeFrames;
         long sim = System.nanoTime();
         long firstRender;
         long twinStartTick;
@@ -459,8 +471,6 @@ public class MobEditorScreen extends Screen {
     private final Set<EntityType<?>> badTypes = new HashSet<>();
     /** quiet() answers, per type (the config lookup and tag check are too slow to repeat on every tick). */
     private final Map<EntityType<?>, Boolean> quietCache = new HashMap<>();
-    private EntityType<?> hoverType;
-    private long hoverStamp;
     private EntityType<?> rotationNext;
     // Where the previews are parked (x/z fixed when the editor opens, y is slot 0), so they never count as having moved.
     private boolean anchorReady;
@@ -795,13 +805,6 @@ public class MobEditorScreen extends Screen {
             g.drawString(f, fit(label.getString(), w - (tx - x) - 2 - badgeW), tx, ty, internal ? 0xFFB060 : n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
             if (n > 0) {
                 g.drawString(f, badge, x + w - f.width(badge) - 2, ty, 0xFFAA00, true);
-            }
-        }
-
-        @Override
-        public void hovered() {
-            if (s.type() == ScopeType.MOB_TYPE) {
-                hoverPrewarm(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id())));
             }
         }
 
@@ -1242,7 +1245,7 @@ public class MobEditorScreen extends Screen {
         if (isVanilla(t)) {
             return false;
         }
-        if (EncephalonConfig.isQuietListed(t)) {
+        if (EncephalonConfig.isQuietListed(t) || EncephalonConfig.isNoTwinMod(t)) {
             return true;
         }
         return !EncephalonConfig.bossTwins() && quiet(t);
@@ -1312,7 +1315,7 @@ public class MobEditorScreen extends Screen {
         double low = this.minecraft.level.getMaxBuildHeight() + 16;
         double high = low + 48 + SLOT_SPACING * SLOTS + 80;
         try {
-            server.executeBlocking(() -> {
+            server.execute(() -> {
                 ServerLevel sl = server.getLevel(dim);
                 if (sl != null) {
                     discardAll(sl, new AABB(px - 160, low, pz - 160, px + 160, high, pz + 160));
@@ -1370,7 +1373,10 @@ public class MobEditorScreen extends Screen {
         return false;
     }
 
-    /** Spawns the hidden twin of a modded mob so the entities its server logic creates exist for the preview. */
+    /**
+     * Queues the hidden twin of a modded mob so the entities its server logic creates exist for the preview. Nothing here waits
+     * for the server: the result is picked up by twinReady() on a later frame.
+     */
     private void startTwin(Preview p) {
         EntityType<?> type = p.type;
         var dim = this.minecraft.level.dimension();
@@ -1379,69 +1385,91 @@ public class MobEditorScreen extends Screen {
         final double z = p.az;
         final AABB box = p.box();
         final String namespace = BuiltInRegistries.ENTITY_TYPE.getKey(type).getNamespace();
-        final int[] id = {-1};
+        final java.util.concurrent.atomic.AtomicInteger result = p.twinResult;
         try {
-            server.executeBlocking(() -> {
-                PreviewZone.beginSpawn(namespace); // anything this mob creates outside the column, or that is not from its own mod, is vetoed
-                try {
-                ServerLevel sl = server.getLevel(dim);
-                if (sl == null) {
-                    return;
-                }
-                discardAll(sl, box);
-                Entity made = type.create(sl);
-                if (!(made instanceof Mob mob)) {
-                    if (made != null) {
-                        made.discard();
-                    }
-                    return;
-                }
-                try {
-                    PreviewZone.expectTwin(mob);
-                    mob.moveTo(x, y, z, 180F, 0F);
-                    mob.setNoAi(true);
-                    mob.setNoGravity(true);
-                    mob.setInvulnerable(true);
-                    mob.setSilent(true);
-                    mob.setPersistenceRequired();
-                    mob.addTag(PREVIEW_TAG);
-                    // Same as /summon: lets mods set up what they normally set up on spawn (emerge state, riders, ...).
-                    mob.finalizeSpawn(sl, sl.getCurrentDifficultyAt(mob.blockPosition()), MobSpawnType.COMMAND, null);
-                    if (sl.addFreshEntity(mob)) {
-                        id[0] = mob.getId();
-                        PreviewZone.pinTwin(mob, new Vec3(x, y, z)); // it must not drift: its parts are drawn relative to this spot
-                    }
-                } catch (RuntimeException | LinkageError ex) {
-                    EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
-                    mob.discard();
-                    discardAll(sl, box);
-                }
-                } finally {
-                    PreviewZone.endSpawn();
-                }
-            });
+            server.execute(() -> result.set(spawnTwin(dim, type, box, x, y, z, namespace)));
         } catch (RuntimeException | LinkageError ex) {
             EncephalonMod.LOGGER.warn("Mob Editor preview: server twin failed for {}", type, ex);
+            result.set(TWIN_FAILED);
         }
-        if (id[0] == -1) {
-            NO_TWIN.add(type);
-            slotUsed[p.slot] = false;
-            p.slot = -1;
+    }
+
+    /** Server thread. Spawns and fast-forwards the twin; returns its entity id, or TWIN_FAILED. */
+    private int spawnTwin(ResourceKey<Level> dim, EntityType<?> type, AABB box, double x, double y, double z, String namespace) {
+        if (PreviewZone.zone == null || server == null) {
+            return TWIN_FAILED; // the editor was closed before this ran
+        }
+        int id = TWIN_FAILED;
+        PreviewZone.beginSpawn(namespace); // anything this mob creates outside the column, or that is not from its own mod, is vetoed
+        try {
+            ServerLevel sl = server.getLevel(dim);
+            if (sl == null) {
+                return TWIN_FAILED;
+            }
+            discardAll(sl, box);
+            Entity made = type.create(sl);
+            if (!(made instanceof Mob mob)) {
+                if (made != null) {
+                    made.discard();
+                }
+                return TWIN_FAILED;
+            }
+            try {
+                PreviewZone.expectTwin(mob);
+                mob.moveTo(x, y, z, 180F, 0F);
+                mob.setNoAi(true);
+                mob.setNoGravity(true);
+                mob.setInvulnerable(true);
+                mob.setSilent(true);
+                mob.setPersistenceRequired();
+                mob.addTag(PREVIEW_TAG);
+                // Same as /summon: lets mods set up what they normally set up on spawn (emerge state, riders, ...).
+                mob.finalizeSpawn(sl, sl.getCurrentDifficultyAt(mob.blockPosition()), MobSpawnType.COMMAND, null);
+                if (sl.addFreshEntity(mob)) {
+                    id = mob.getId();
+                    PreviewZone.pinTwin(mob, new Vec3(x, y, z)); // it must not drift: its parts are drawn relative to this spot
+                }
+            } catch (RuntimeException | LinkageError ex) {
+                EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
+                mob.discard();
+                discardAll(sl, box);
+            }
+        } catch (RuntimeException | LinkageError ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor preview: server twin failed for {}", type, ex);
+        } finally {
+            PreviewZone.endSpawn();
+        }
+        if (id >= 0) {
+            // Do not wait for the real-time server ticks that build the body (segments, heads, ...): run them now.
+            preTickTwin(dim, box, x, y, z, id, namespace);
+        }
+        return id;
+    }
+
+    /** Render thread. True once the twin exists; a failed twin is dropped here (and the mob is shown without one). */
+    private boolean twinReady(Preview p) {
+        if (p.twinId >= 0) {
+            return true;
+        }
+        int r = p.twinResult.get();
+        if (r == TWIN_PENDING) {
+            return false;
+        }
+        if (r == TWIN_FAILED) {
+            NO_TWIN.add(p.type);
+            if (p.slot >= 0) {
+                slotUsed[p.slot] = false;
+                p.slot = -1;
+            }
             p.settled = true;
-            return;
+            return false;
         }
-        p.twinId = id[0];
+        p.twinId = r;
         p.twinStartTick = this.minecraft.level.getGameTime();
         p.lastCount = -1;
         p.countChangedTick = p.twinStartTick;
         p.settled = false;
-        // Do not wait for the real-time server ticks that build the body (segments, heads, ...): run them now, off the render thread.
-        final int twinId = id[0];
-        try {
-            server.execute(() -> preTickTwin(dim, box, x, y, z, twinId, namespace));
-        } catch (RuntimeException ex) {
-            // the twin is simply built at normal speed
-        }
+        return true;
     }
 
     /**
@@ -1501,7 +1529,7 @@ public class MobEditorScreen extends Screen {
         var dim = this.minecraft.level.dimension();
         final AABB box = p.box();
         try {
-            server.executeBlocking(() -> {
+            server.execute(() -> {
                 ServerLevel sl = server.getLevel(dim);
                 if (sl != null) {
                     discardAll(sl, box);
@@ -1527,7 +1555,7 @@ public class MobEditorScreen extends Screen {
         if (any && z != null && server != null && this.minecraft.level != null) {
             var dim = this.minecraft.level.dimension();
             try {
-                server.executeBlocking(() -> {
+                server.execute(() -> {
                     ServerLevel sl = server.getLevel(dim);
                     if (sl != null) {
                         discardAll(sl, z);
@@ -1567,6 +1595,9 @@ public class MobEditorScreen extends Screen {
         }
         if (p.compFrame == frame) {
             return p.compCache;
+        }
+        if (p.twinId < 0 && !twinReady(p)) {
+            return List.of();
         }
         // Companions of the twin's own mod (see PreviewZone.isPart). Things the twin made that are not part of the mob (the
         // Void Worm's portal) are effects of the twin standing still up there, and are left out.
@@ -1687,13 +1718,7 @@ public class MobEditorScreen extends Screen {
         if (old == null) {
             return;
         }
-        if (isVanilla(old.type) || !isDone(old) || badTypes.contains(old.type)) {
-            stopTwin(old);
-            return;
-        }
-        warm.remove(old.type);
-        warm.put(old.type, old);
-        trimCache();
+        stopTwin(old);
     }
 
     private void trimCache() {
@@ -1766,18 +1791,9 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ background warm-up
 
-    /** Called every frame a mob row is hovered: that mob goes to the front of the warm-up queue straight away. */
-    void hoverPrewarm(EntityType<?> t) {
-        hoverType = t;
-        hoverStamp = Util.getMillis();
-    }
-
     /** Mobs worth having warm, most important first: the hovered row, the next in a rotation, then everything in view. */
     private void computeWanted() {
         wantedNow.clear();
-        if (hoverType != null && Util.getMillis() - hoverStamp < 250L) {
-            wantedNow.add(hoverType);
-        }
         if (rotationNext != null) {
             wantedNow.add(rotationNext);
         }
@@ -2014,7 +2030,7 @@ public class MobEditorScreen extends Screen {
         int steps = 0;
         while (now - p.sim >= TICK_NANOS) {
             p.sim += TICK_NANOS;
-            if (steps++ < 4) {
+            if (steps++ < 2) {
                 stepPreview(p);
             }
         }
@@ -2159,6 +2175,8 @@ public class MobEditorScreen extends Screen {
             Preview p = current();
             if (p != null) {
                 drawActive(g, p, realPartial);
+            } else if (badTypes.contains(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id())))) {
+                drawPreviewOff(g);
             }
         } else {
             // Vanilla Mobs / a category / a mod: no mob, just the Minecraft logo or the mod's name.
@@ -2219,7 +2237,64 @@ public class MobEditorScreen extends Screen {
     private void drawActive(GuiGraphics g, Preview p, float realPartial) {
         long t0 = System.nanoTime();
         drawActiveImpl(g, p, realPartial);
+        long took = System.nanoTime() - t0;
         slow("drawing shown mob", p.type, t0);
+        govern(p, took);
+    }
+
+    /**
+     * Frame-time governor for the shown mob, whatever its size or mod. The cost of one frame of it (tick + draw) is tracked as a
+     * moving average. Above FREEZE_NANOS its own tick is switched off (the model is still drawn and animated from its age); if it
+     * is still above OFF_NANOS, or a couple of frames are enormous, the preview of this mob is switched off for the session
+     * instead of freezing the game. The reason is written to the log with the mob id.
+     */
+    private void govern(Preview p, long took) {
+        if (active != p) {
+            return;
+        }
+        if (took > OFF_NANOS * 3) {
+            if (++p.hugeFrames >= (warmedUp(p) ? 2 : 4)) {
+                trip(p, took);
+                return;
+            }
+        } else if (p.hugeFrames > 0 && (frame & 63L) == 0L) {
+            p.hugeFrames--;
+        }
+        if (!warmedUp(p)) {
+            return;
+        }
+        p.avgNanos += (took - p.avgNanos) * 0.1;
+        if (++p.govFrames < GOVERN_SETTLE_FRAMES) {
+            return;
+        }
+        if (!p.tickFailed && p.avgNanos > FREEZE_NANOS) {
+            p.tickFailed = true;
+            p.govFrames = 0;
+            p.avgNanos = 0;
+            EncephalonMod.LOGGER.warn("Mob Editor preview: {} costs over {} ms per frame; it is drawn without being ticked",
+                    BuiltInRegistries.ENTITY_TYPE.getKey(p.type), FREEZE_NANOS / 1_000_000L);
+        } else if (p.avgNanos > OFF_NANOS) {
+            trip(p, took);
+        }
+    }
+
+    private void trip(Preview p, long took) {
+        EncephalonMod.LOGGER.warn("Mob Editor preview: {} is too slow ({} ms last frame, {} ms average); preview switched off for this mob",
+                BuiltInRegistries.ENTITY_TYPE.getKey(p.type), took / 1_000_000L, (long) (p.avgNanos / 1_000_000.0));
+        badTypes.add(p.type);
+        dispose(p);
+        if (active == p) {
+            active = null;
+        }
+    }
+
+    /** Panel text for a mob whose preview could not be made or was switched off (badTypes). */
+    private void drawPreviewOff(GuiGraphics g) {
+        List<FormattedCharSequence> lines = this.font.split(Component.translatable("encephalon.screen.preview_off"), Math.max(40, rw - 16));
+        int y0 = (TOP + viewBottom()) / 2 - lines.size() * 5;
+        for (int i = 0; i < lines.size(); i++) {
+            g.drawCenteredString(this.font, lines.get(i), rx + rw / 2, y0 + i * 10, 0xFFAA00);
+        }
     }
 
     private void drawActiveImpl(GuiGraphics g, Preview p, float realPartial) {
