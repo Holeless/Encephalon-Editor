@@ -71,7 +71,7 @@ public class MobEditorScreen extends Screen {
 
     // 3D preview tuning
     private static final long TICK_NANOS = 50_000_000L;
-    private static final float WALK_SPEED = 0.25F;      // limb swing amount; the walk cycle advances about this much per tick
+    private static final float WALK_SPEED = 0.5F;       // limb swing amount; the walk cycle advances about this much per tick
     private static final float DRAGON_W = 19F;          // blocks: wingspan plus a little sway room
     private static final float DRAGON_H = 13F;          // blocks: wing flap range
     private static final float DRAGON_CENTER_Y = 1F;    // blocks above the dragon's feet where the model's visual middle sits
@@ -650,15 +650,17 @@ public class MobEditorScreen extends Screen {
 
     /**
      * One 20 Hz step of the preview mob. The entity is ticked so its own animations run (dragon wings, bat, guardian, ...),
-     * but the walk cycle is driven here at a fixed gentle speed. If the walk state can't be pinned, only the dragon is
+     * but the walk cycle is driven here at a fixed speed. If the walk state can't be pinned, only the dragon is
      * ticked and everything else is animated by hand.
+     * The level normally does the per-tick bookkeeping (old position and tickCount) before entity.tick(); tickCount is the
+     * "age" that rods, tentacles, wings and segments animate from, so it must advance here or those mobs vibrate.
      */
     private void stepPreview(LivingEntity e) {
         if (this.minecraft.level == null || this.minecraft.player == null) {
             return;
         }
         boolean dragon = e instanceof EnderDragon;
-        boolean ticked = false;
+        e.tickCount++;
         if (!tickFailed && (CAN_PIN_WALK || dragon)) {
             try {
                 double hx = this.minecraft.player.getX();
@@ -670,6 +672,7 @@ public class MobEditorScreen extends Screen {
                             WALK_POS.getFloat(e.walkAnimation)};
                 }
                 e.setPos(hx, hy, hz);
+                e.setOldPosAndRot();
                 // The dragon's wing flap rate depends on its speed; a stationary dragon flaps far too fast, so give it a cruise.
                 e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : 0.0);
                 e.setOnGround(!isFlyer(e));
@@ -680,13 +683,9 @@ public class MobEditorScreen extends Screen {
                     WALK_SPEED_NOW.setFloat(e.walkAnimation, walk[1]);
                     WALK_POS.setFloat(e.walkAnimation, walk[2]);
                 }
-                ticked = true;
             } catch (Exception ex) {
                 tickFailed = true;
             }
-        }
-        if (!ticked) {
-            e.tickCount++;
         }
         e.walkAnimation.update(WALK_SPEED, 0.4F);
     }
@@ -754,7 +753,7 @@ public class MobEditorScreen extends Screen {
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
-            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway));
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
             RenderSystem.runAsFancy(() -> dispatcher.render(e, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880));
