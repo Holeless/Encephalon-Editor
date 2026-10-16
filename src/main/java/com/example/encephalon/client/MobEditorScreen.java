@@ -16,6 +16,7 @@ import com.example.encephalon.behavior.Behavior;
 import com.example.encephalon.behavior.Behaviors;
 import com.example.encephalon.behavior.Setting;
 import com.example.encephalon.config.ConfigResolver;
+import com.example.encephalon.config.EncephalonConfig;
 import com.example.encephalon.config.MobConfigData;
 import com.example.encephalon.config.Tri;
 import com.example.encephalon.scope.MobGroups;
@@ -63,6 +64,15 @@ public class MobEditorScreen extends Screen {
     private static final int BOTTOM_RESERVE = 34;
     private static final int GREY = 0xAAAAAA; // vanilla ChatFormatting.GRAY
 
+    /** Mobs without a spawn egg that are still always listed (vanilla has no egg for these). */
+    private static final Set<String> ALWAYS_LISTED = Set.of("ender_dragon", "wither", "iron_golem", "snow_golem");
+
+    // 3D preview tuning
+    private static final long TICK_NANOS = 50_000_000L;
+    private static final double WALK_STEP = 0.05; // blocks per tick the preview mob walks (walk speed = WALK_STEP * 4)
+    private static final float DRAGON_W = 24F;    // lower these two if the dragon crops on your layout
+    private static final float DRAGON_H = 13F;
+
     private MinecraftServer server;
     private MobConfigData data;
     private boolean editable;
@@ -83,7 +93,7 @@ public class MobEditorScreen extends Screen {
     private EntityType<?> previewType;
     private LivingEntity previewEntity;
     private final Set<EntityType<?>> badTypes = new HashSet<>();
-    private long lastTickNanos = System.nanoTime();
+    private long simTime = System.nanoTime();
     private boolean tickFailed;
 
     private Scope scope = Scope.ALL;
@@ -178,6 +188,15 @@ public class MobEditorScreen extends Screen {
         rebuildDetail();
     }
 
+    /** Mobs with a spawn egg are always listed; others only when enabled in the mod config (plus a small vanilla whitelist). */
+    private static boolean isListed(EntityType<?> t) {
+        if (EncephalonConfig.showMobsWithoutEgg() || SpawnEggItem.byId(t) != null) {
+            return true;
+        }
+        ResourceLocation key = BuiltInRegistries.ENTITY_TYPE.getKey(t);
+        return key.getNamespace().equals("minecraft") && ALWAYS_LISTED.contains(key.getPath());
+    }
+
     private void buildTypes() {
         typesByCategory.clear();
         allTypes.clear();
@@ -186,7 +205,7 @@ public class MobEditorScreen extends Screen {
         }
         for (EntityType<?> t : BuiltInRegistries.ENTITY_TYPE) {
             String c = MobGroups.categoryOf(t);
-            if (c != null) {
+            if (c != null && isListed(t)) {
                 typesByCategory.get(c).add(t);
             }
         }
@@ -561,40 +580,6 @@ public class MobEditorScreen extends Screen {
         return e instanceof FlyingAnimal || e instanceof FlyingMob || e instanceof Bat || e instanceof EnderDragon;
     }
 
-    /**
-     * Ticks the preview mob so its own animations run (bat wings, dragon, camel, ...). It lives far above the world and is
-     * nudged forward by the lerp each tick, so the game's own walk-animation code sees it moving and animates it naturally.
-     */
-    @Override
-    public void tick() {
-        super.tick();
-        lastTickNanos = System.nanoTime();
-        LivingEntity e = previewEntity;
-        if (e == null || behavior != null || this.minecraft.level == null || this.minecraft.player == null) {
-            return;
-        }
-        if (!tickFailed) {
-            try {
-                double hx = this.minecraft.player.getX();
-                double hy = this.minecraft.level.getMaxBuildHeight() + 64;
-                double hz = this.minecraft.player.getZ();
-                e.setPos(hx, hy, hz);
-                e.setOnGround(!isFlyer(e));
-                e.lerpTo(hx, hy, hz - 0.125, 180F, 0F, 1);
-                e.tick();
-                e.setPos(hx, hy, hz);
-            } catch (Exception ex) {
-                tickFailed = true;
-            }
-        }
-        if (tickFailed) {
-            e.tickCount++;
-            e.walkAnimation.update(0.5F, 1.0F);
-        } else if (e.walkAnimation.speed(1.0F) < 0.15F) {
-            e.walkAnimation.update(0.5F, 0.4F);
-        }
-    }
-
     /** The mob to show: the selected mob type, or a rotating pick from the selected category / all mobs. */
     private LivingEntity previewEntity() {
         if (this.minecraft.level == null) {
@@ -632,6 +617,7 @@ public class MobEditorScreen extends Screen {
                     tickFailed = false;
                     previewType = t;
                     previewEntity = living;
+                    simTime = System.nanoTime();
                     return living;
                 }
             } catch (Exception ex) {
@@ -642,22 +628,73 @@ public class MobEditorScreen extends Screen {
         return null;
     }
 
+    /**
+     * One 20 Hz step of the preview mob so its own animations run (bat wings, dragon, camel, ...). It lives far above the
+     * world and is nudged forward by the lerp, so the game's own walk-animation code sees it moving and animates naturally.
+     */
+    private void stepPreview(LivingEntity e) {
+        if (this.minecraft.level == null || this.minecraft.player == null) {
+            return;
+        }
+        double hx = this.minecraft.player.getX();
+        double hy = this.minecraft.level.getMaxBuildHeight() + 64;
+        double hz = this.minecraft.player.getZ();
+        if (!tickFailed) {
+            try {
+                e.setPos(hx, hy, hz);
+                e.setOnGround(!isFlyer(e));
+                e.lerpTo(hx, hy, hz - WALK_STEP, 180F, 0F, 1);
+                e.tick();
+                e.setPos(hx, hy, hz);
+                return;
+            } catch (Exception ex) {
+                tickFailed = true;
+            }
+        }
+        e.tickCount++;
+        e.walkAnimation.update((float) (WALK_STEP * 4.0), 0.4F);
+    }
+
     private void renderPreview(GuiGraphics g) {
         LivingEntity e = previewEntity();
         if (e == null) {
             return;
         }
-        // The screen's partialTick is a frame delta in 1.21, not a 0..1 fraction, so time it ourselves.
-        float partial = Mth.clamp((System.nanoTime() - lastTickNanos) / 50_000_000F, 0F, 1F);
+        // Fixed-timestep simulation driven by the real clock, so age = tickCount + partial never goes backwards.
+        long now = System.nanoTime();
+        if (now - simTime > 1_000_000_000L) {
+            simTime = now; // was not rendering for a while (e.g. a behavior was open); don't fast-forward
+        }
+        int steps = 0;
+        while (now - simTime >= TICK_NANOS) {
+            simTime += TICK_NANOS;
+            if (steps++ < 4) {
+                stepPreview(e);
+            }
+        }
+        float partial = (now - simTime) / (float) TICK_NANOS;
 
         int top = TOP + 6;
         int bottom = viewBottom() - 16;
         float bbH = Math.max(e.getBbHeight(), 0.4F);
         float bbW = Math.max(e.getBbWidth(), 0.4F);
-        // Models are often longer/wider than their hitbox (camel, dragon), so fit against a padded extent.
-        float extentH = Math.max(bbH, bbW * 1.2F);
-        float extentW = e instanceof EnderDragon ? 40F : bbW * 2.2F;
-        float scale = Math.min(55F, Math.min((bottom - top) * 0.7F / extentH, rw * 0.8F / extentW));
+        float extentH;
+        float extentW;
+        float fillH;
+        float fillW;
+        if (e instanceof EnderDragon) {
+            extentH = DRAGON_H;
+            extentW = DRAGON_W;
+            fillH = 0.9F;
+            fillW = 0.9F;
+        } else {
+            // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
+            extentH = Math.max(bbH, bbW * 1.2F);
+            extentW = bbW * 2.2F;
+            fillH = 0.7F;
+            fillW = 0.8F;
+        }
+        float scale = Math.min(55F, Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW));
         float cx = rx + rw / 2F;
         float feetY = (top + bottom) / 2F + bbH * scale / 2F;
 
