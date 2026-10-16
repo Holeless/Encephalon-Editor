@@ -1,8 +1,12 @@
 package com.example.encephalon.config;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -33,6 +37,7 @@ import net.minecraft.world.entity.ai.goal.SwellGoal;
 import net.minecraft.world.entity.ai.goal.WrappedGoal;
 import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.level.Level;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.entity.EntityAttributeModificationEvent;
@@ -68,9 +73,13 @@ public final class DamageDefaults {
      * One attack of a mob. def is the default damage (negative: varies). type is the damage type it hurts with, null when it is
      * not one fixed type. label is a literal name for attacks found in a mod (null: the name comes from the lang file).
      */
-    public record Attack(String id, double def, ResourceKey<DamageType> type, Kind kind, String label) {
+    public record Attack(String id, double def, ResourceKey<DamageType> type, Kind kind, String label, String desc) {
+        public Attack(String id, double def, ResourceKey<DamageType> type, Kind kind, String label) {
+            this(id, def, type, kind, label, null);
+        }
+
         public Attack(String id, double def, ResourceKey<DamageType> type) {
-            this(id, def, type, Kind.DAMAGE, null);
+            this(id, def, type, Kind.DAMAGE, null, null);
         }
 
         /** True if the attack has a damage value that can be set. */
@@ -126,10 +135,15 @@ public final class DamageDefaults {
     /** Words in the name of a modded goal class that mark it as an attack, and words that rule it out. */
     private static final String[] ATTACK_WORDS = {"attack", "shoot", "spit", "breath", "sting", "blast", "explo", "fireball", "beam",
             "laser", "summon", "cast", "spell", "bite", "slam", "stomp", "roar", "charge", "pounce", "leap", "swoop", "smash",
-            "strike", "throw", "lunge", "ram", "teleport", "poison"};
+            "strike", "throw", "lunge", "ram", "teleport", "poison", "action", "ability", "skill", "special"};
     private static final String[] NOT_ATTACK_WORDS = {"target", "avoid", "flee", "retreat", "panic", "look", "follow", "wander",
             "stroll", "float", "swim", "breed", "sleep", "tempt", "eat", "attackable"};
-    private static final int MAX_SPECIAL = 6;
+    private static final int MAX_SPECIAL = 8;
+    /** Goal names that only wrap the real attacks (an "ActionGoal" holding a list of actions): the actions are looked for inside. */
+    private static final String[] WRAPPER_WORDS = {"action", "ability", "skill", "special", "spell"};
+    /** Names too generic to show as an attack. */
+    private static final Set<String> GENERIC = Set.of("action", "ability", "skill", "special", "attack", "spell", "boss", "custom",
+            "cooldown", "mob", "entity", "default", "phase", "move", "ai", "task");
 
     /** Types that had no attack damage and were given the size fallback. */
     private static final Map<EntityType<?>, Double> FALLBACK = new ConcurrentHashMap<>();
@@ -299,7 +313,13 @@ public final class DamageDefaults {
                 others.add(new Attack(s, -1, null, Kind.EFFECT, null));
             }
         }
+        List<String[]> configured = EncephalonConfig.extraAttacks(t);
+        for (String[] c : configured) {
+            others.add(new Attack("custom_" + c[0].toLowerCase().replaceAll("[^a-z0-9]+", "_"), -1, null, Kind.EFFECT, c[0],
+                    c[1].isEmpty() ? null : c[1]));
+        }
         boolean meleeGoal = false;
+        List<String> goalClasses = new ArrayList<>();
         Entity e = null;
         try {
             e = t.create(server.overworld());
@@ -317,13 +337,19 @@ public final class DamageDefaults {
                         ranged = true;
                     } else if (g instanceof SwellGoal) {
                         swell = true;
-                    } else if (!vanilla && found.size() < MAX_SPECIAL) {
-                        String name = specialName(g);
-                        if (name != null && seen.add(name)) {
-                            found.add(new Attack("special_" + name.toLowerCase().replaceAll("[^a-z0-9]+", "_"), -1, null,
-                                    Kind.EFFECT, name));
+                    } else if (!vanilla) {
+                        goalClasses.add(g.getClass().getName());
+                        for (String name : specialNames(g)) {
+                            if (found.size() < MAX_SPECIAL && seen.add(name)) {
+                                found.add(new Attack("special_" + name.toLowerCase().replaceAll("[^a-z0-9]+", "_"), -1, null,
+                                        Kind.EFFECT, name));
+                            }
                         }
                     }
+                }
+                if (!vanilla) {
+                    EncephalonMod.LOGGER.info("Mob Editor attacks: {} has goals {} -> found {}", id, goalClasses,
+                            found.stream().map(Attack::label).toList());
                 }
                 if (swell) {
                     others.add(0, new Attack(EXPLOSION, Math.round(explosionMax(mob)), DamageTypes.EXPLOSION, Kind.EXPLOSION, null));
@@ -333,11 +359,16 @@ public final class DamageDefaults {
                     others.add(new Attack(RANGED, -1, null, Kind.DAMAGE, null));
                 }
                 others.addAll(found);
+                if (!vanilla && others.isEmpty() && EncephalonConfig.isQuiet(t)) {
+                    // A modded boss whose attacks live in the mod's own code: say so instead of showing only a made-up default.
+                    others.add(new Attack("custom_code", -1, null, Kind.EFFECT, null));
+                }
                 // Melee: a melee goal, or a real attack damage on a mob that does not explode (a blaze, warden, phantom or vex
                 // fight up close with their own code, not with a melee goal). A few vanilla mobs have the attribute but never melee.
                 Double fixed = MELEE_DEFAULTS.get(id);
-                boolean ownAttack = fixed != null || meleeGoal
-                        || (!swell && !NO_MELEE.contains(id) && hasOwnAttackDamage(t));
+                // A mob that explodes (a creeper has a melee goal too) never lists melee.
+                boolean ownAttack = fixed != null
+                        || (!swell && (meleeGoal || (!NO_MELEE.contains(id) && hasOwnAttackDamage(t))));
                 Attack melee = ownAttack
                         ? new Attack(MELEE, fixed != null ? fixed : defaultMelee(t), null, Kind.MELEE, null) : null;
                 return new Profile(melee, List.copyOf(others));
@@ -352,36 +383,130 @@ public final class DamageDefaults {
         return new Profile(null, List.copyOf(others));
     }
 
-    /** A readable name for a modded goal that looks like an attack ("FireBreathGoal" -> "Fire Breath"), else null. */
-    private static String specialName(Goal g) {
-        String raw = g.getClass().getName();
-        if (raw.startsWith("net.minecraft.")) {
-            return null;
-        }
+    private static boolean isEngine(String cn) {
+        return cn.startsWith("java.") || cn.startsWith("javax.") || cn.startsWith("jdk.") || cn.startsWith("sun.")
+                || cn.startsWith("net.minecraft.") || cn.startsWith("net.neoforged.") || cn.startsWith("com.mojang.")
+                || cn.startsWith("kotlin.") || cn.startsWith("org.slf4j.") || cn.startsWith("it.unimi.") || cn.startsWith("com.google.");
+    }
+
+    /** The plain class name ("MissileAction"), or null for anonymous classes and lambdas. */
+    private static String simpleName(String raw) {
         String n = raw.substring(Math.max(raw.lastIndexOf('.'), raw.lastIndexOf('$')) + 1);
-        if (n.isEmpty() || Character.isDigit(n.charAt(0))) {
-            return null; // anonymous class: nothing readable
-        }
-        String lower = n.toLowerCase();
-        for (String bad : NOT_ATTACK_WORDS) {
-            if (lower.contains(bad)) {
-                return null;
-            }
-        }
-        boolean match = false;
-        for (String word : ATTACK_WORDS) {
-            if (lower.contains(word)) {
-                match = true;
-                break;
-            }
-        }
-        if (!match) {
+        if (n.isEmpty() || Character.isDigit(n.charAt(0)) || raw.contains("Lambda")) {
             return null;
         }
+        return n;
+    }
+
+    private static boolean hasWord(String lower, String[] words) {
+        for (String w : words) {
+            if (lower.contains(w)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** "FireBreathGoal" -> "Fire Breath", "MissileAction" -> "Missile". */
+    private static String readable(String n) {
         if (n.endsWith("Goal") && n.length() > 4) {
             n = n.substring(0, n.length() - 4);
         }
+        if (n.endsWith("Action") && n.length() > 6) {
+            n = n.substring(0, n.length() - 6);
+        }
         return n.replaceAll("(?<=[a-z0-9])(?=[A-Z])", " ");
+    }
+
+    private static boolean genericName(String readable) {
+        return GENERIC.contains(readable.toLowerCase().replace(" ", ""));
+    }
+
+    /**
+     * Readable names for a modded goal that looks like an attack. A goal named after an attack gives its own name. A goal that
+     * only wraps actions (an ActionGoal) is searched: the classes of the objects it holds, two levels down, are the attacks.
+     */
+    private static List<String> specialNames(Goal g) {
+        String raw = g.getClass().getName();
+        if (isEngine(raw)) {
+            return List.of();
+        }
+        String n = simpleName(raw);
+        if (n == null) {
+            return List.of();
+        }
+        String lower = n.toLowerCase();
+        if (hasWord(lower, NOT_ATTACK_WORDS) || !hasWord(lower, ATTACK_WORDS)) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        String base = readable(n);
+        if (!genericName(base)) {
+            out.add(base);
+        }
+        if (hasWord(lower, WRAPPER_WORDS)) {
+            Set<String> dug = new LinkedHashSet<>();
+            dive(g, 2, dug, Collections.newSetFromMap(new IdentityHashMap<>()));
+            for (String d : dug) {
+                if (!out.contains(d)) {
+                    out.add(d);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Collects readable class names of the mod's objects held (in fields, lists) by o, down to the given depth. */
+    private static void dive(Object o, int depth, Set<String> out, Set<Object> seen) {
+        if (o == null || depth < 0 || out.size() >= MAX_SPECIAL || !seen.add(o) || o instanceof Entity || o instanceof Level) {
+            return;
+        }
+        String cn = o.getClass().getName();
+        if (isEngine(cn)) {
+            return;
+        }
+        if (depth < 2) { // depth 2 is the goal itself
+            String n = simpleName(cn);
+            if (n != null && !hasWord(n.toLowerCase(), NOT_ATTACK_WORDS)) {
+                String r = readable(n);
+                if (r.length() >= 3 && !genericName(r)) {
+                    out.add(r);
+                }
+            }
+        }
+        if (depth == 0) {
+            return;
+        }
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            Field[] fields;
+            try {
+                fields = k.getDeclaredFields();
+            } catch (LinkageError | RuntimeException ex) {
+                continue;
+            }
+            for (Field f : fields) {
+                if (Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) {
+                    continue;
+                }
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v instanceof Iterable<?> it) {
+                        int count = 0;
+                        for (Object x : it) {
+                            if (count++ >= 20) {
+                                break;
+                            }
+                            dive(x, depth - 1, out, seen);
+                        }
+                    } else {
+                        dive(v, depth - 1, out, seen);
+                    }
+                } catch (ReflectiveOperationException | RuntimeException | LinkageError ex) {
+                    // a field that cannot be read: skip it
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ names
@@ -393,6 +518,9 @@ public final class DamageDefaults {
 
     /** The short description of a special attack (the ones that do no damage). */
     public static Component describe(Attack a) {
+        if (a.desc() != null) {
+            return Component.literal(a.desc());
+        }
         return a.label() != null
                 ? Component.translatable("encephalon.attack.generic_special", a.label())
                 : Component.translatable("encephalon.attack." + a.id() + ".desc");

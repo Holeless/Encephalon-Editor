@@ -59,6 +59,8 @@
   "encephalon.attack.ranged": "Ranged attack (arrows, projectiles)",
   "encephalon.attack.sonic_boom": "Sonic boom",
   "encephalon.attack.breath": "Dragon's breath",
+  "encephalon.attack.custom_code": "Custom boss attacks",
+  "encephalon.attack.custom_code.desc": "This boss attacks with its mod's own code, which the editor cannot list or edit. To name its attacks here, add them to extraAttacks in encephalon-client.toml.",
   "encephalon.attack.ghast_explosion": "Fireball explosion",
   "encephalon.attack.ghast_explosion.desc": "Its fireballs explode on impact, breaking blocks and setting fires.",
   "encephalon.attack.spawn_blast": "Spawn explosion",

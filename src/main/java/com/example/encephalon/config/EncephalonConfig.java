@@ -1,5 +1,6 @@
 package com.example.encephalon.config;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -17,6 +18,7 @@ public final class EncephalonConfig {
     public static final ModConfigSpec.ConfigValue<List<? extends String>> PART_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> NOT_PART_MOBS;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> NO_TWIN_MODS;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> EXTRA_ATTACKS;
 
     /**
      * Always treated as quiet, whatever the config file says (a config file made by an older version keeps its old list, so
@@ -66,11 +68,34 @@ public final class EncephalonConfig {
                         "the client). A twin is only needed by mods that build one mob out of several entities (the Void Worm's",
                         "segments). \"naturalist\" is always on this list. Example: [\"somemod\"]")
                 .defineListAllowEmpty("noTwinMods", List.of(), () -> "modid", o -> o instanceof String);
+        EXTRA_ATTACKS = b
+                .comment("Attacks to list under Attacks in the Mob Editor for modded mobs whose attacks cannot be found by the editor",
+                        "(bosses that run their attacks from their own code). One entry per attack, written as",
+                        "\"modid:entity|Attack name|What it does\" (the last part is optional). They are only listed, not editable.",
+                        "Restart the game after changing this. Example:",
+                        "[\"bosses_of_mass_destruction:lich|Missiles|Fires magic missiles at its target\"]")
+                .defineListAllowEmpty("extraAttacks", List.of(), () -> "modid:entity|Name|Description", o -> o instanceof String);
         SPEC = b.build();
     }
 
     public static boolean showMobsWithoutEgg() {
         return SPEC.isLoaded() && SHOW_MOBS_WITHOUT_EGG.get();
+    }
+
+    /** The extra attacks configured for this type, as {name, description} (description may be empty). */
+    public static List<String[]> extraAttacks(EntityType<?> type) {
+        List<String[]> out = new ArrayList<>();
+        if (!SPEC.isLoaded()) {
+            return out;
+        }
+        String id = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
+        for (String line : EXTRA_ATTACKS.get()) {
+            String[] p = line.split("\\|", 3);
+            if (p.length >= 2 && p[0].trim().equals(id) && !p[1].trim().isEmpty()) {
+                out.add(new String[] {p[1].trim(), p.length > 2 ? p[2].trim() : ""});
+            }
+        }
+        return out;
     }
 
     /** True if this type is named in the built-in or config quiet lists: no client ticking and no server twin at all. */
