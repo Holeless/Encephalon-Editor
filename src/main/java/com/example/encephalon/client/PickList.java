@@ -22,6 +22,10 @@ public class PickList extends ObjectSelectionList<PickList.Row> {
         void draw(GuiGraphics g, Font font, int x, int y, int w, int h);
 
         void picked();
+
+        /** Called every frame the pointer is over this row. */
+        default void hovered() {
+        }
     }
 
     public PickList(Minecraft mc, int x, int y, int w, int h, int itemHeight) {
@@ -102,6 +106,9 @@ public class PickList extends ObjectSelectionList<PickList.Row> {
         @Override
         public void render(GuiGraphics g, int index, int top, int left, int width, int height, int mouseX, int mouseY, boolean hovering, float partialTick) {
             // The selection box starts 2px left of "left" and is "width" wide, so keep everything inside that.
+            if (hovering) {
+                item.hovered();
+            }
             if (hovering && getSelected() != this) {
                 g.fill(left - 2, top - 2, left - 2 + width, top + height + 2, 0x20FFFFFF);
             }

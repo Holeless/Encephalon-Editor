@@ -169,6 +169,19 @@ public class MobEditorScreen extends Screen {
     private final Set<EntityType<?>> badTypes = new HashSet<>();
     private long simTime = System.nanoTime();
     private boolean tickFailed;
+    // Animation libraries (GeckoLib and the like) drive a mob from its first render: they start from the bind pose and blend
+    // into idle, then blend again into the walk once the walk state kicks in. A modded mob is therefore drawn off-screen
+    // (empty scissor) for this long first, so those blends finish before anyone sees it.
+    private static final long WARMUP_NANOS = 500_000_000L;
+    private static final long HOVER_DELAY_MS = 120L;    // how long the pointer rests on a mob row before it is warmed up
+    private long warmUntil;
+    // A second mob being warmed up off-screen (hovered in the list, or next in a rotation) so picking it shows no delay.
+    private EntityType<?> prewarmType;
+    private LivingEntity prewarmEntity;
+    private long prewarmSim;
+    private long prewarmFirstRender;
+    private EntityType<?> hoverType;
+    private long hoverSince;
     // Where the preview mob is parked, fixed when it is created so it never counts as having moved.
     private double anchorX;
     private double anchorY;
@@ -515,6 +528,13 @@ public class MobEditorScreen extends Screen {
             g.drawString(f, fit(label.getString(), w - (tx - x) - 2 - badgeW), tx, ty, n > 0 ? 0xFFFFFF : 0xC8C8C8, true);
             if (n > 0) {
                 g.drawString(f, badge, x + w - f.width(badge) - 2, ty, 0xFFAA00, true);
+            }
+        }
+
+        @Override
+        public void hovered() {
+            if (s.type() == ScopeType.MOB_TYPE) {
+                hoverPrewarm(BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(s.id())));
             }
         }
 
@@ -979,6 +999,10 @@ public class MobEditorScreen extends Screen {
         }
         if (scope.type() != ScopeType.MOB_TYPE) {
             start = (int) ((Util.getMillis() / 4000L) % list.size());
+            // Warm the next mob up during the last moments of this one's turn, so the swap is seamless.
+            if (list.size() > 1 && Util.getMillis() % 4000L > 3300L) {
+                prewarm(list.get((start + 1) % list.size()));
+            }
         }
         for (int i = 0; i < list.size(); i++) {
             EntityType<?> t = list.get((start + i) % list.size());
@@ -988,39 +1012,161 @@ public class MobEditorScreen extends Screen {
             if (badTypes.contains(t)) {
                 continue;
             }
-            try {
-                Entity e = t.create(this.minecraft.level);
-                if (e instanceof LivingEntity living) {
-                    living.setSilent(true);
-                    if (living instanceof Hoglin || living instanceof AbstractPiglin) {
-                        // Stops them shaking as if converting to zombified in the overworld. Not for other mobs: the dragon,
-                        // for one, freezes its wings when it has no AI.
-                        ((Mob) living).setNoAi(true);
-                    }
-                    faceViewer(living);
-                    // Park it at its spot now, while tickCount is still 0: entities treat a move after that as a teleport
-                    // (a shulker, for one, slides in from its old position).
-                    if (this.minecraft.player != null) {
-                        anchorX = this.minecraft.player.getX();
-                        anchorY = this.minecraft.level.getMaxBuildHeight() + 64;
-                        anchorZ = this.minecraft.player.getZ();
-                        living.setPos(anchorX, anchorY, anchorZ);
-                        living.setOldPosAndRot();
-                    }
-                    living.setDeltaMovement(previewMotion(living));
-                    tickFailed = false;
-                    previewType = t;
-                    previewEntity = living;
-                    simTime = System.nanoTime();
-                    startTwin(t);
-                    return living;
+            long ready;
+            LivingEntity living;
+            if (prewarmEntity != null && prewarmType == t) {
+                // Already warmed up off-screen (hovered, or the next one in a rotation): show it straight away.
+                living = prewarmEntity;
+                ready = prewarmFirstRender == 0L ? System.nanoTime() + WARMUP_NANOS : prewarmFirstRender + WARMUP_NANOS;
+                simTime = prewarmSim;
+                clearPrewarm();
+                updateAnchor();
+                living.setPos(anchorX, anchorY, anchorZ);
+                living.setOldPosAndRot();
+            } else {
+                updateAnchor();
+                living = createPreview(t);
+                if (living == null) {
+                    continue;
                 }
-            } catch (Exception ex) {
-                // fall through and blacklist
+                ready = isVanilla(t) ? 0L : System.nanoTime() + WARMUP_NANOS;
+                simTime = System.nanoTime();
             }
-            badTypes.add(t);
+            warmUntil = ready;
+            tickFailed = false;
+            previewType = t;
+            previewEntity = living;
+            startTwin(t);
+            return living;
         }
         return null;
+    }
+
+    private static boolean isVanilla(EntityType<?> t) {
+        return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
+    }
+
+    private void updateAnchor() {
+        if (this.minecraft.player != null && this.minecraft.level != null) {
+            anchorX = this.minecraft.player.getX();
+            anchorY = this.minecraft.level.getMaxBuildHeight() + 64;
+            anchorZ = this.minecraft.player.getZ();
+        }
+    }
+
+    /** Creates and sets up a preview mob at the anchor, or returns null (and blacklists the type) if it can't be made. */
+    private LivingEntity createPreview(EntityType<?> t) {
+        if (this.minecraft.level == null || badTypes.contains(t)) {
+            return null;
+        }
+        try {
+            Entity e = t.create(this.minecraft.level);
+            if (e instanceof LivingEntity living) {
+                living.setSilent(true);
+                if (living instanceof Hoglin || living instanceof AbstractPiglin) {
+                    // Stops them shaking as if converting to zombified in the overworld. Not for other mobs: the dragon,
+                    // for one, freezes its wings when it has no AI.
+                    ((Mob) living).setNoAi(true);
+                }
+                faceViewer(living);
+                // Park it at its spot now, while tickCount is still 0: entities treat a move after that as a teleport
+                // (a shulker, for one, slides in from its old position).
+                living.setPos(anchorX, anchorY, anchorZ);
+                living.setOldPosAndRot();
+                living.setDeltaMovement(previewMotion(living));
+                // Start in the steady walking state instead of ramping up to it after the first frame.
+                living.walkAnimation.update(WALK_SPEED, 1.0F);
+                return living;
+            }
+        } catch (Exception ex) {
+            // fall through and blacklist
+        }
+        badTypes.add(t);
+        return null;
+    }
+
+    // ------------------------------------------------------------------ off-screen warm-up
+
+    private void clearPrewarm() {
+        prewarmEntity = null;
+        prewarmType = null;
+        prewarmFirstRender = 0L;
+    }
+
+    /** Starts warming a modded mob up off-screen so it is already settled when it is picked. */
+    private void prewarm(EntityType<?> t) {
+        if (t == previewType || t == prewarmType || isVanilla(t) || badTypes.contains(t) || this.minecraft.level == null) {
+            return;
+        }
+        if (previewEntity == null) {
+            updateAnchor();
+        }
+        LivingEntity e = createPreview(t);
+        if (e == null) {
+            return;
+        }
+        prewarmType = t;
+        prewarmEntity = e;
+        prewarmSim = System.nanoTime();
+        prewarmFirstRender = 0L;
+    }
+
+    /** Called every frame a mob row is hovered; warming starts once the pointer has rested on it for a moment. */
+    void hoverPrewarm(EntityType<?> t) {
+        long now = Util.getMillis();
+        if (t != hoverType) {
+            hoverType = t;
+            hoverSince = now;
+        } else if (now - hoverSince >= HOVER_DELAY_MS) {
+            prewarm(t);
+        }
+    }
+
+    /** Steps and draws the warming mob with an empty clip area: the animation library runs, nothing is shown. */
+    private void warmRender(GuiGraphics g) {
+        LivingEntity p = prewarmEntity;
+        if (p == null) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (prewarmFirstRender == 0L) {
+            prewarmFirstRender = now;
+        }
+        if (now - prewarmSim > 1_000_000_000L) {
+            prewarmSim = now;
+        }
+        int steps = 0;
+        while (now - prewarmSim >= TICK_NANOS) {
+            prewarmSim += TICK_NANOS;
+            if (steps++ < 4) {
+                stepPreview(p);
+            }
+        }
+        float partial = (now - prewarmSim) / (float) TICK_NANOS;
+        faceViewer(p);
+        forceWet(p);
+        p.setInvisible(false);
+        g.enableScissor(rx, TOP, rx, viewBottom());
+        PoseStack pose = g.pose();
+        pose.pushPose();
+        EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
+        try {
+            pose.translate(rx, TOP, 50.0);
+            pose.scale(1F, 1F, -1F);
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI));
+            Lighting.setupForEntityInInventory();
+            dispatcher.setRenderShadow(false);
+            RenderSystem.runAsFancy(() -> dispatcher.render(p, 0.0, 0.0, 0.0, 0.0F, partial, pose, g.bufferSource(), 15728880));
+            g.flush();
+        } catch (Exception ex) {
+            badTypes.add(prewarmType);
+            clearPrewarm();
+        } finally {
+            dispatcher.setRenderShadow(true);
+            pose.popPose();
+            Lighting.setupFor3DItems();
+        }
+        g.disableScissor();
     }
 
     private static Field field(Class<?> owner, String name) {
@@ -1141,6 +1287,7 @@ public class MobEditorScreen extends Screen {
     private void renderPreview(GuiGraphics g, float realPartial) {
         LivingEntity e = previewEntity();
         if (e == null) {
+            warmRender(g);
             return;
         }
         // Fixed-timestep simulation driven by the real clock, so age = tickCount + partial never goes backwards.
@@ -1230,7 +1377,8 @@ public class MobEditorScreen extends Screen {
         final float pz = pivotZ;
         final List<Entity> drawExtras = extras;
 
-        g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
+        boolean warming = now < warmUntil;
+        g.enableScissor(rx, TOP, warming ? rx : rx + rw + 6, viewBottom()); // zero width while warming up: rendered, not shown
         PoseStack pose = g.pose();
         pose.pushPose();
         EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
@@ -1268,6 +1416,7 @@ public class MobEditorScreen extends Screen {
             Lighting.setupFor3DItems();
         }
         g.disableScissor();
+        warmRender(g);
 
         if (previewType != null) {
             g.drawCenteredString(this.font, previewType.getDescription(), (int) cx, viewBottom() - 12, 0xC8C8C8);
