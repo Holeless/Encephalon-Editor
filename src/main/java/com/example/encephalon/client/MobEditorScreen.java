@@ -21,7 +21,9 @@ import com.example.encephalon.EncephalonMod;
 import com.example.encephalon.behavior.Behavior;
 import com.example.encephalon.behavior.Behaviors;
 import com.example.encephalon.behavior.Setting;
+import com.example.encephalon.config.CategoryBehavior;
 import com.example.encephalon.config.ConfigResolver;
+import com.example.encephalon.config.DamageDefaults;
 import com.example.encephalon.config.EncephalonConfig;
 import com.example.encephalon.config.MobConfigData;
 import com.example.encephalon.config.Tri;
@@ -91,8 +93,9 @@ import net.neoforged.fml.ModList;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
- * Middle: behaviors for the selected scope, with a behavior search (a mob type also gets a "Drops" entry there).
- * Right: scrollable details and settings (or the drops editor), or an animated 3D mob preview while nothing is selected.
+ * Middle: behaviors for the selected scope, with a behavior search (a mob type also gets "Drops", "Category" and "Damage" entries there).
+ * Right: scrollable details and settings (or the drops / category / damage editor), or an animated 3D mob preview while nothing is selected.
+ * The tree always files a mob under its default category; the Category entry changes how the mob acts in the game, not where it is listed.
  * Singleplayer only for now: it edits the integrated server's MobConfigData directly (networking is a TODO).
  * Preview mobs live in dummy worlds (PreviewLevel) and every piece of their code runs inside PreviewSandbox.
  */
@@ -212,8 +215,13 @@ public class MobEditorScreen extends Screen {
     private static final int DROP_MAX_AMOUNT = 64;
     /** Key of the "Category" row in the behavior list. */
     private static final Object CATEGORY_KEY = new Object();
+    /** Key of the "Damage" row in the behavior list. */
+    private static final Object DAMAGE_KEY = new Object();
+    private static final double DAMAGE_MAX = 1000.0;
     /** True while the "Category" row is the open entry (only for a mob type; behavior is null then). */
     private boolean categoryOpen;
+    /** True while the "Damage" row is the open entry (only for a mob type; behavior is null then). */
+    private boolean damageOpen;
     /** When the default drops of the shown mob were first asked for (0 = not waiting); the loading text only shows after a pause. */
     private long loadingSince;
 
@@ -250,6 +258,17 @@ public class MobEditorScreen extends Screen {
     private ItemStack hovered = ItemStack.EMPTY;
 
     private record PickEntry(Item item, String name, String id) {
+    }
+
+    // ------------------------------------------------------------------ damage editor state
+    private List<FormattedCharSequence> damageDesc = List.of();
+    private int damageStateY;
+    /** True when the shown mob has no attack of its own, so its default melee damage comes from its size. */
+    private boolean damageFallback;
+    private final List<DamageRow> damageRows = new ArrayList<>();
+    private Button damageReset;
+
+    private record DamageRow(DamageDefaults.Attack attack, int y) {
     }
 
     // ------------------------------------------------------------------ 3D preview state
@@ -555,7 +574,9 @@ public class MobEditorScreen extends Screen {
         placed.clear();
         rows.clear();
         dropBoxes.clear();
+        damageRows.clear();
         dropsReset = null;
+        damageReset = null;
         pickSearch = null;
         stateButton = null;
         scroll = 0;
@@ -863,7 +884,7 @@ public class MobEditorScreen extends Screen {
 
     private void rebuildBehaviors() {
         List<PickList.Item> items = new ArrayList<>();
-        // A mob type gets a "Drops" entry at the top of its behaviors.
+        // A mob type gets "Drops", "Category" and "Damage" entries at the top of its behaviors.
         if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
                 || Component.translatable("encephalon.screen.drops_title").getString().toLowerCase().contains(behaviorFilter))) {
             items.add(new DropsItem());
@@ -871,6 +892,10 @@ public class MobEditorScreen extends Screen {
         if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
                 || Component.translatable("encephalon.screen.category_title").getString().toLowerCase().contains(behaviorFilter))) {
             items.add(new CategoryItem());
+        }
+        if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
+                || Component.translatable("encephalon.screen.damage_title").getString().toLowerCase().contains(behaviorFilter))) {
+            items.add(new DamageItem());
         }
         for (Behavior b : Behaviors.all()) {
             if (b.scopes().contains(scope.type())
@@ -892,11 +917,17 @@ public class MobEditorScreen extends Screen {
             categoryOpen = false;
             changed = true;
         }
+        if (damageOpen && scope.type() != ScopeType.MOB_TYPE) {
+            damageOpen = false;
+            changed = true;
+        }
         behaviorList.setItems(items);
         if (dropsOpen) {
             behaviorList.select(DROPS_KEY);
         } else if (categoryOpen) {
             behaviorList.select(CATEGORY_KEY);
+        } else if (damageOpen) {
+            behaviorList.select(DAMAGE_KEY);
         } else if (behavior != null) {
             behaviorList.select(behavior);
         }
@@ -942,6 +973,7 @@ public class MobEditorScreen extends Screen {
             behavior = b;
             dropsOpen = false;
             categoryOpen = false;
+            damageOpen = false;
             addMode = false;
             rebuildDetail();
         }
@@ -972,6 +1004,7 @@ public class MobEditorScreen extends Screen {
             behavior = null;
             dropsOpen = true;
             categoryOpen = false;
+            damageOpen = false;
             addMode = false;
             gridScroll = 0;
             pickFilter = "";
@@ -1005,6 +1038,38 @@ public class MobEditorScreen extends Screen {
             behavior = null;
             dropsOpen = false;
             categoryOpen = true;
+            damageOpen = false;
+            addMode = false;
+            rebuildDetail();
+        }
+    }
+
+    /** The "Damage" entry of a mob type's behavior list: opens the damage editor in the right panel. */
+    private final class DamageItem implements PickList.Item {
+        @Override
+        public Object key() {
+            return DAMAGE_KEY;
+        }
+
+        @Override
+        public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
+            g.renderFakeItem(new ItemStack(Items.IRON_SWORD), x + 1, y + (h - 16) / 2);
+            boolean custom = scope.type() == ScopeType.MOB_TYPE && data.hasDamages(scope.id());
+            Component state = Component.translatable(custom ? "encephalon.state.custom" : "encephalon.screen.default");
+            int color = custom ? 0xFFAA00 : 0xA0A0A0;
+            int stateW = f.width(state);
+            int ty = y + (h - 8) / 2 + 1;
+            g.drawString(f, fit(Component.translatable("encephalon.screen.damage_title").getString(), w - 20 - stateW - 6),
+                    x + 20, ty, 0xFFFFFF, true);
+            g.drawString(f, state, x + w - stateW - 2, ty, color, true);
+        }
+
+        @Override
+        public void picked() {
+            behavior = null;
+            dropsOpen = false;
+            categoryOpen = false;
+            damageOpen = true;
             addMode = false;
             rebuildDetail();
         }
@@ -1020,7 +1085,9 @@ public class MobEditorScreen extends Screen {
         placed.clear();
         rows.clear();
         dropBoxes.clear();
+        damageRows.clear();
         dropsReset = null;
+        damageReset = null;
         pickSearch = null;
         stateButton = null;
         descLines = List.of();
@@ -1034,6 +1101,10 @@ public class MobEditorScreen extends Screen {
         }
         if (categoryOpen && scope.type() == ScopeType.MOB_TYPE && data != null) {
             buildCategoryPanel();
+            return;
+        }
+        if (damageOpen && scope.type() == ScopeType.MOB_TYPE && data != null) {
+            buildDamagePanel();
             return;
         }
         if (behavior == null) {
@@ -1147,10 +1218,13 @@ public class MobEditorScreen extends Screen {
     private void resetScope() {
         setFocused(null);
         Scope sc = scope;
-        edit(() -> data.clearScope(sc));
-        if (sc.type() == ScopeType.MOB_TYPE) {
-            refreshTree(); // its category may have changed back
-        }
+        String mobId = sc.type() == ScopeType.MOB_TYPE ? sc.id() : null;
+        edit(() -> {
+            data.clearScope(sc);
+            if (mobId != null) {
+                CategoryBehavior.refresh(server, mobId);
+            }
+        });
         rebuildDetail();
     }
 
@@ -1626,8 +1700,13 @@ public class MobEditorScreen extends Screen {
         return BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation.parse(scope.id()));
     }
 
-    /** The category a mob type is filed under: the one set in the editor, else its default (null if it has none). */
+    /** The category a mob type is listed under in the tree: always its default one (null if it is not a mob). */
     private String categoryOf(EntityType<?> t) {
+        return MobGroups.categoryOf(t);
+    }
+
+    /** How a mob type acts in the game: the category set in the editor, else its default one (null if it has none). */
+    private String actingCategory(EntityType<?> t) {
         String own = data == null ? null : data.category(BuiltInRegistries.ENTITY_TYPE.getKey(t).toString());
         return own != null ? own : MobGroups.categoryOf(t);
     }
@@ -1641,8 +1720,30 @@ public class MobEditorScreen extends Screen {
         if (scope.type() != ScopeType.MOB_TYPE) {
             return "neutral";
         }
-        String c = categoryOf(selectedType());
+        String c = actingCategory(selectedType());
         return c == null ? "neutral" : c;
+    }
+
+    /** A button that can be shown as the chosen one: it keeps the highlighted look vanilla gives a hovered or focused button. */
+    private static final class ChoiceButton extends Button {
+        private final boolean selected;
+
+        ChoiceButton(int x, int y, int w, int h, Component message, Button.OnPress onPress, boolean selected) {
+            super(x, y, w, h, message, onPress, DEFAULT_NARRATION);
+            this.selected = selected;
+        }
+
+        @Override
+        public boolean isHoveredOrFocused() {
+            return selected || super.isHoveredOrFocused();
+        }
+
+        @Override
+        public void onPress() {
+            if (!selected) {
+                super.onPress();
+            }
+        }
     }
 
     private void buildCategoryPanel() {
@@ -1665,11 +1766,11 @@ public class MobEditorScreen extends Screen {
         Component name = cat == null
                 ? Component.translatable("encephalon.screen.category_default", Component.translatable("encephalon.category." + defaultCategory()))
                 : Component.translatable("encephalon.category." + cat);
-        Component label = current ? Component.literal("> ").append(name).append(Component.literal(" <")).withStyle(ChatFormatting.YELLOW) : name;
-        Button b = track(Button.builder(label, btn -> pickCategory(cat)).bounds(rx, y, rw, 20).build());
-        b.active = editable && !current;
+        ChoiceButton b = track(new ChoiceButton(rx, y, rw, 20, name, btn -> pickCategory(cat), current));
+        b.active = editable;
     }
 
+    /** Sets how the mob acts. The tree is not touched: the mob stays listed under its default category. */
     private void pickCategory(String cat) {
         if (!editable) {
             return;
@@ -1681,35 +1782,9 @@ public class MobEditorScreen extends Screen {
             } else {
                 data.setCategory(id, cat);
             }
+            CategoryBehavior.refresh(server, id); // mobs of this type that are already in the world pick the change up at once
         });
-        refreshTree();
         rebuildDetail();
-    }
-
-    /** Re-sorts the tree after a category changed, and opens the folder the selected mob moved into so it stays in view. */
-    private void refreshTree() {
-        PreviewSandbox.run(this::buildTypes);
-        if (scope.type() == ScopeType.MOB_TYPE) {
-            expandToMob(selectedType());
-        }
-        rebuildScopes();
-        rebuildBehaviors();
-    }
-
-    private void expandToMob(EntityType<?> t) {
-        String cat = categoryOf(t);
-        if (cat == null) {
-            return;
-        }
-        String ns = BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace();
-        if (ns.equals("minecraft")) {
-            expanded.add(Scope.VANILLA.key());
-            expanded.add(new Scope(ScopeType.CATEGORY, cat).key());
-        } else {
-            expanded.add(Scope.MODDED.key());
-            expanded.add(new Scope(ScopeType.MOD, ns).key());
-            expanded.add(new Scope(ScopeType.MOD_CATEGORY, ns + "/" + cat).key());
-        }
     }
 
     private void drawCategoryEditor(GuiGraphics g) {
@@ -1720,6 +1795,137 @@ public class MobEditorScreen extends Screen {
         Component state = Component.translatable(own != null ? "encephalon.screen.category_state_custom" : "encephalon.screen.category_state_default",
                 Component.translatable("encephalon.category." + effectiveCategory()));
         g.drawString(this.font, fit(state.getString(), rw), rx, categoryStateY - scroll, own != null ? 0xFFAA00 : 0xA0A0A0, true);
+    }
+
+    // ------------------------------------------------------------------ damage editor
+
+    /** Builds the damage editor: description, a reset button, then one row (name, default, box, R) per attack of the mob. */
+    private void buildDamagePanel() {
+        EntityType<?> type = selectedType();
+        damageFallback = DamageDefaults.isFallback(type);
+        damageDesc = this.font.split(Component.translatable("encephalon.screen.damage_desc"), rw);
+        int y = TOP + 2 + warnH + damageDesc.size() * 10 + 4;
+        damageStateY = y;
+        y += damageFallback ? 24 : 14;
+        damageReset = track(Button.builder(Component.translatable("encephalon.screen.damage_reset"), b -> resetDamage())
+                .bounds(rx, y, rw, 20).build());
+        damageReset.active = editable && data.hasDamages(scope.id());
+        y += 28;
+        String mobId = scope.id();
+        for (DamageDefaults.Attack a : DamageDefaults.attacksOf(type)) {
+            damageRows.add(new DamageRow(a, y));
+            DamageBox box = track(new DamageBox(this.font, rx, y + 20, rw - 24, mobId, a, data.damage(mobId, a.id())));
+            box.setEditable(editable);
+            Button reset = track(Button.builder(Component.literal("R"), b -> box.reset())
+                    .bounds(rx + rw - 20, y + 20, 20, 20)
+                    .tooltip(Tooltip.create(Component.translatable("encephalon.screen.reset_tip"))).build());
+            reset.active = editable;
+            y += 48;
+        }
+        contentHeight = y + 4 - TOP;
+        layoutDetail();
+    }
+
+    private void resetDamage() {
+        setFocused(null);
+        String id = scope.id();
+        edit(() -> data.clearDamages(id));
+        rebuildDetail();
+    }
+
+    /** Damage field of one attack: the greyed hint is the default; Enter or clicking away applies it (0 - 1000), empty resets it. */
+    private final class DamageBox extends EditBox {
+        private final String mobId;
+        private final DamageDefaults.Attack attack;
+
+        DamageBox(Font font, int x, int y, int w, String mobId, DamageDefaults.Attack attack, Double current) {
+            super(font, x, y, w, 20, Component.literal(attack.id()));
+            this.mobId = mobId;
+            this.attack = attack;
+            setMaxLength(8);
+            if (current != null) {
+                setValue(fmt(current));
+            }
+            setFilter(s -> s.matches("\\d*\\.?\\d*"));
+            setHint(Component.literal(fmt(attack.def())));
+        }
+
+        void commit() {
+            if (!editable) {
+                return;
+            }
+            Double old = data.damage(mobId, attack.id());
+            String txt = getValue().trim();
+            Double nv = null;
+            if (!txt.isEmpty()) {
+                try {
+                    nv = Mth.clamp(Double.parseDouble(txt), 0.0, DAMAGE_MAX);
+                } catch (NumberFormatException e) {
+                    setValue(old == null ? "" : fmt(old));
+                    return;
+                }
+            }
+            if (!Objects.equals(old, nv)) {
+                Double v = nv;
+                String id = attack.id();
+                edit(() -> {
+                    if (v == null) {
+                        data.clearDamage(mobId, id);
+                    } else {
+                        data.setDamage(mobId, id, v);
+                    }
+                });
+                if (damageReset != null) {
+                    damageReset.active = data.hasDamages(mobId);
+                }
+            }
+            setValue(nv == null ? "" : fmt(nv));
+        }
+
+        void reset() {
+            setValue("");
+            commit();
+        }
+
+        @Override
+        public void setFocused(boolean focused) {
+            boolean was = isFocused();
+            super.setFocused(focused);
+            if (was && !focused) {
+                commit();
+            }
+        }
+
+        @Override
+        public boolean keyPressed(int key, int scan, int mods) {
+            if (isFocused() && (key == 257 || key == 335)) { // Enter / keypad Enter
+                commit();
+                return true;
+            }
+            return super.keyPressed(key, scan, mods);
+        }
+    }
+
+    private void drawDamageEditor(GuiGraphics g) {
+        for (int i = 0; i < damageDesc.size(); i++) {
+            g.drawString(this.font, damageDesc.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
+        }
+        boolean custom = data.hasDamages(scope.id());
+        Component state = Component.translatable(custom ? "encephalon.screen.damage_state_custom" : "encephalon.screen.damage_state_default");
+        g.drawString(this.font, fit(state.getString(), rw), rx, damageStateY - scroll, custom ? 0xFFAA00 : 0xA0A0A0, true);
+        if (damageFallback) {
+            Component note = Component.translatable("encephalon.screen.damage_fallback",
+                    Component.translatable("encephalon.size." + DamageDefaults.sizeClass(selectedType())));
+            g.drawString(this.font, fit(note.getString(), rw), rx, damageStateY + 10 - scroll, 0x808080, true);
+        }
+        for (DamageRow row : damageRows) {
+            int y = row.y() - scroll;
+            boolean set = data.damage(scope.id(), row.attack().id()) != null;
+            g.drawString(this.font, Component.translatable("encephalon.attack." + row.attack().id()), rx, y, set ? 0xFFFFFF : 0xA0A0A0, true);
+            g.drawString(this.font, fit(Component.translatable("encephalon.screen.damage_info",
+                            fmt(row.attack().def()), fmt(row.attack().def() / 2.0)).getString(), rw),
+                    rx, y + 10, 0x808080, true);
+        }
     }
 
     // ------------------------------------------------------------------ 3D preview helpers
@@ -3052,13 +3258,15 @@ public class MobEditorScreen extends Screen {
             g.drawString(this.font, Component.translatable("encephalon.screen.drops_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         } else if (categoryOpen) {
             g.drawString(this.font, Component.translatable("encephalon.screen.category_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
+        } else if (damageOpen) {
+            g.drawString(this.font, Component.translatable("encephalon.screen.damage_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         } else if (behavior == null) {
             g.drawString(this.font, Component.translatable("encephalon.screen.select"), rx, 39, 0xA0A0A0, true);
         } else {
             g.drawString(this.font, behavior.name().copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         }
         g.disableScissor();
-        if (behavior == null && !dropsOpen && !categoryOpen) {
+        if (behavior == null && !dropsOpen && !categoryOpen && !damageOpen) {
             PreviewSandbox.run(() -> renderPreview(g, partialTick));
             g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
             drawWarning(g, 0);
@@ -3086,6 +3294,12 @@ public class MobEditorScreen extends Screen {
         }
         if (categoryOpen) {
             drawCategoryEditor(g);
+            g.disableScissor();
+            drawPanelScrollbar(g);
+            return;
+        }
+        if (damageOpen) {
+            drawDamageEditor(g);
             g.disableScissor();
             drawPanelScrollbar(g);
             return;

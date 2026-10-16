@@ -19,7 +19,8 @@ import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.level.saveddata.SavedData;
 
 /**
- * Per-world overrides: toggles and setting values, keyed by scope + behavior (+ setting), and custom drop lists per mob type.
+ * Per-world overrides: toggles and setting values, keyed by scope + behavior (+ setting), custom drop lists per mob type,
+ * the category (how a mob acts) per mob type, and attack damage per mob type + attack.
  * Saved as data/encephalon_config.dat.
  */
 public class MobConfigData extends SavedData {
@@ -33,8 +34,10 @@ public class MobConfigData extends SavedData {
     private final Map<String, Double> values = new ConcurrentHashMap<>();
     /** Mob type id -> its custom drop list. No entry means "use the default loot table"; an empty list means "drops nothing". */
     private final Map<String, List<DropEntry>> drops = new ConcurrentHashMap<>();
-    /** Mob type id -> the category (hostile / neutral / passive) the editor files it under. No entry means its default one. */
+    /** Mob type id -> how the mob acts (hostile / neutral / passive). No entry means its default one. */
     private final Map<String, String> categories = new ConcurrentHashMap<>();
+    /** "mobId|attackId" -> damage points on Normal difficulty. No entry means the default damage. */
+    private final Map<String, Double> damages = new ConcurrentHashMap<>();
     /** Bumped on every edit so resolved-config caches know when to rebuild. */
     private volatile int version;
 
@@ -70,6 +73,10 @@ public class MobConfigData extends SavedData {
                 d.categories.put(k, c);
             }
         }
+        CompoundTag dm = tag.getCompound("Damage");
+        for (String k : dm.getAllKeys()) {
+            d.damages.put(k, dm.getDouble(k));
+        }
         return d;
     }
 
@@ -98,6 +105,9 @@ public class MobConfigData extends SavedData {
         CompoundTag ct = new CompoundTag();
         categories.forEach(ct::putString);
         tag.put("Categories", ct);
+        CompoundTag dm = new CompoundTag();
+        damages.forEach(dm::putDouble);
+        tag.put("Damage", dm);
         return tag;
     }
 
@@ -162,6 +172,11 @@ public class MobConfigData extends SavedData {
         return categories.get(mobId);
     }
 
+    /** True if any mob type has a category set (lets the game skip the lookup in the common case). */
+    public boolean anyCategory() {
+        return !categories.isEmpty();
+    }
+
     public void setCategory(String mobId, String category) {
         categories.put(mobId, category);
         version++;
@@ -176,7 +191,46 @@ public class MobConfigData extends SavedData {
         }
     }
 
-    /** Number of overrides (toggles + values, plus a custom drop list / category for a mob type) set at this scope. */
+    /** The damage set for one attack of a mob type, or null for its default. */
+    public Double damage(String mobId, String attack) {
+        return damages.get(mobId + "|" + attack);
+    }
+
+    public void setDamage(String mobId, String attack, double value) {
+        damages.put(mobId + "|" + attack, value);
+        version++;
+        setDirty();
+    }
+
+    /** Back to the default damage of one attack. */
+    public void clearDamage(String mobId, String attack) {
+        if (damages.remove(mobId + "|" + attack) != null) {
+            version++;
+            setDirty();
+        }
+    }
+
+    /** True if any attack of the mob type has a custom damage. */
+    public boolean hasDamages(String mobId) {
+        String p = mobId + "|";
+        for (String k : damages.keySet()) {
+            if (k.startsWith(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Back to the default damage of every attack of the mob type. */
+    public void clearDamages(String mobId) {
+        String p = mobId + "|";
+        if (damages.keySet().removeIf(k -> k.startsWith(p))) {
+            version++;
+            setDirty();
+        }
+    }
+
+    /** Number of overrides (toggles + values, plus a custom drop list / category / damages for a mob type) set at this scope. */
     public int count(Scope s) {
         String p = s.key() + "|";
         int n = 0;
@@ -196,6 +250,14 @@ public class MobConfigData extends SavedData {
         if (s.type() == ScopeType.MOB_TYPE && categories.containsKey(s.id())) {
             n++;
         }
+        if (s.type() == ScopeType.MOB_TYPE) {
+            String dp = s.id() + "|";
+            for (String k : damages.keySet()) {
+                if (k.startsWith(dp)) {
+                    n++;
+                }
+            }
+        }
         return n;
     }
 
@@ -206,6 +268,8 @@ public class MobConfigData extends SavedData {
         if (s.type() == ScopeType.MOB_TYPE) {
             drops.remove(s.id());
             categories.remove(s.id());
+            String dp = s.id() + "|";
+            damages.keySet().removeIf(k -> k.startsWith(dp));
         }
         version++;
         setDirty();
