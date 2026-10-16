@@ -1155,6 +1155,7 @@ public class MobEditorScreen extends Screen {
                     return;
                 }
                 try {
+                    PreviewZone.expectTwin(mob);
                     mob.moveTo(x, y, z, 180F, 0F);
                     mob.setNoAi(true);
                     mob.setNoGravity(true);

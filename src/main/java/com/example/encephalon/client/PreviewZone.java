@@ -5,12 +5,15 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.example.encephalon.EncephalonMod;
+import com.example.encephalon.config.EncephalonConfig;
 
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.SpawnEggItem;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -52,7 +55,17 @@ public final class PreviewZone {
     /** Mod ids of the twins that were made: only entities from these mods may exist next to a twin. */
     private static final Set<String> PART_NAMESPACES = ConcurrentHashMap.newKeySet();
 
+    /** Twins that are about to be added to the level (they must not be mistaken for something they spawned). */
+    private static final Set<Entity> EXPECTED = ConcurrentHashMap.newKeySet();
+    /** Entity types already reported as blocked, so the log says it once. */
+    private static final Set<String> LOGGED = ConcurrentHashMap.newKeySet();
+
     private PreviewZone() {
+    }
+
+    /** Server thread: this entity is the twin the editor is creating, let it into the level. */
+    static void expectTwin(Entity twin) {
+        EXPECTED.add(twin);
     }
 
     static boolean contains(Vec3 pos) {
@@ -84,6 +97,7 @@ public final class PreviewZone {
         TICKING.clear();
         TWIN_HOME.clear();
         PART_NAMESPACES.clear();
+        EXPECTED.clear();
     }
 
     /** True while preview code (a twin being created, or one ticking) is running on the server. */
@@ -91,10 +105,39 @@ public final class PreviewZone {
         return zone != null && (spawning > 0 || !TICKING.isEmpty());
     }
 
-    /** True for a living entity that belongs to the mod of one of the twins (a body segment, a head). */
+    /**
+     * Whether a living entity next to a preview twin is a body part (a worm segment, a detached head) rather than a minion.
+     * It has to be from the twin's own mod, and then it counts as a minion if it is a mob in its own right (it has a spawn egg,
+     * so it is also listed in the editor) or if it hunts (it has target goals). Parts have neither. The config lists
+     * partMobs / notPartMobs override this for any type it gets wrong.
+     */
     static boolean isPart(Entity e) {
-        return e instanceof LivingEntity
-                && PART_NAMESPACES.contains(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getNamespace());
+        if (!(e instanceof LivingEntity)) {
+            return false;
+        }
+        EntityType<?> t = e.getType();
+        if (EncephalonConfig.isForcedNotPart(t)) {
+            return false;
+        }
+        if (!PART_NAMESPACES.contains(BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace())) {
+            return false;
+        }
+        if (EncephalonConfig.isForcedPart(t)) {
+            return true;
+        }
+        if (SpawnEggItem.byId(t) != null) {
+            return false;
+        }
+        // Goals only exist on the server; the client only ever sees entities the server let through.
+        return !(e instanceof Mob mob && !mob.targetSelector.getAvailableGoals().isEmpty());
+    }
+
+    private static void logBlocked(Entity e) {
+        String id = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString();
+        if (LOGGED.add(id)) {
+            EncephalonMod.LOGGER.info("Mob Editor preview: removed {} made by a preview mob (not a body part). "
+                    + "If it is one, add it to partMobs in encephalon-client.toml.", id);
+        }
     }
 
     @SubscribeEvent
@@ -134,7 +177,11 @@ public final class PreviewZone {
         // Whatever a preview entity creates is vetoed, except living companions of the same mod inside the column. This is what
         // stops portals, their sister portals next to the player, projectiles, area clouds, items, minions and crowds of
         // zombies from ever existing.
-        if (!event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !isPart(e))) {
+        boolean twin = !event.getLevel().isClientSide() && EXPECTED.remove(e);
+        if (!twin && !event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !isPart(e))) {
+            if (e instanceof LivingEntity) {
+                logBlocked(e);
+            }
             event.setCanceled(true);
             return;
         }

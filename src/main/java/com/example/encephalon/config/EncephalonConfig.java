@@ -11,6 +11,8 @@ public final class EncephalonConfig {
     public static final ModConfigSpec SPEC;
     public static final ModConfigSpec.BooleanValue SHOW_MOBS_WITHOUT_EGG;
     public static final ModConfigSpec.ConfigValue<List<? extends String>> QUIET_MOBS;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> PART_MOBS;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> NOT_PART_MOBS;
 
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
@@ -25,6 +27,14 @@ public final class EncephalonConfig {
                 .defineListAllowEmpty("quietMobs",
                         List.of("alexscaves:luxtructosaurus", "alexscaves:tremorzilla", "alexscaves:hullbreaker"),
                         () -> "modid:entity", o -> o instanceof String);
+        PART_MOBS = b
+                .comment("Entity ids that the preview must always treat as a body part of the mob that made them (drawn together",
+                        "with it). Only needed if a segment of a multi-part mob is wrongly hidden. Example: [\"somemod:worm_segment\"]")
+                .defineListAllowEmpty("partMobs", List.of(), () -> "modid:entity", o -> o instanceof String);
+        NOT_PART_MOBS = b
+                .comment("Entity ids that the preview must never treat as a body part: minions or helpers that a mob spawns with.",
+                        "Anything listed here is removed when a preview mob creates it. Example: [\"somemod:minion\"]")
+                .defineListAllowEmpty("notPartMobs", List.of(), () -> "modid:entity", o -> o instanceof String);
         SPEC = b.build();
     }
 
@@ -38,6 +48,14 @@ public final class EncephalonConfig {
             return false;
         }
         return QUIET_MOBS.get().contains(BuiltInRegistries.ENTITY_TYPE.getKey(type).toString());
+    }
+
+    public static boolean isForcedPart(EntityType<?> type) {
+        return SPEC.isLoaded() && PART_MOBS.get().contains(BuiltInRegistries.ENTITY_TYPE.getKey(type).toString());
+    }
+
+    public static boolean isForcedNotPart(EntityType<?> type) {
+        return SPEC.isLoaded() && NOT_PART_MOBS.get().contains(BuiltInRegistries.ENTITY_TYPE.getKey(type).toString());
     }
 
     private EncephalonConfig() {
