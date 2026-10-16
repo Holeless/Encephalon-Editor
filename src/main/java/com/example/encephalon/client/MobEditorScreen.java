@@ -18,6 +18,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import org.joml.Matrix4f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
@@ -88,7 +89,6 @@ import net.minecraft.world.item.SpawnEggItem;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.fml.ModList;
-import net.neoforged.neoforge.common.Tags;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
@@ -120,14 +120,20 @@ public class MobEditorScreen extends Screen {
     private static final float GHAST_EXTENT_H = 6.5F;   // blocks: body plus tentacles
     private static final float GHAST_CENTER_Y = 1F;     // blocks above the ghast's feet where its visual middle sits
 
-    // Huge mobs are never shrunk below the size at which the panel shows this many blocks of height (and about 1.5x as many
-    // of width). A mob bigger than that is clipped by the panel instead of being drawn as a speck. Raise it for bigger
-    // minimum sizes (more clipping), lower it to let huge mobs shrink further.
-    private static final float MIN_BLOCKS_VISIBLE = 16F;
-    // Mobs made of several parts (worms, snakes, leviathans) are shown from a three-quarter angle: this many radians away from
-    // looking straight along their length. Their length mostly runs into the screen, so it costs little width.
-    private static final float GROUP_VIEW_ANGLE = 0.9F;
+    // Modded mobs are fitted from the extent of the vertices that are really drawn (not from the hitbox). A mob that is much
+    // longer than it is tall / thick (a worm, snake or leviathan) is "elongated": only the first LENGTH_CAP times its core
+    // size of length is fitted, the rest runs off the edge of the panel, and it is turned so that length mostly runs into the
+    // screen (GROUP_VIEW_ANGLE radians away from looking straight along it). So a huge snake is shown big and clipped instead
+    // of tiny and complete, and no mob is ever scaled up past what fits.
+    private static final float ELONGATED_RATIO = 1.6F;
+    private static final float LENGTH_CAP = 2.5F;
+    private static final float GROUP_VIEW_ANGLE = 0.55F;
     private static final double GROUP_SWAY_DEG = 15.0;
+    private static final float SMOOTH = 0.15F;          // how fast the shown size / angle follows the fitted one (per frame)
+    private static final int MEASURE_TICKS = 80;        // preview ticks (after warm-up) during which the model is measured
+    private static final int MB_BINS = 2048;            // measuring histogram: bins per axis...
+    private static final float MB_BIN = 0.25F;          // ...of this many blocks...
+    private static final float MB_OFF = 256F;           // ...starting this far below zero
 
     // Shulkers only open when the server tells them to, so the lid is driven by hand. A shulker that sees its position
     // change also plays a 6-tick "slide in from the old spot" animation, which is pinned off.
@@ -235,10 +241,18 @@ public class MobEditorScreen extends Screen {
         boolean settled;
         boolean tickFailed;
         int warmTicks;
-        // How far the model really reaches, in blocks (recorded while it is drawn off-screen during warm-up).
-        float mMinY = Float.MAX_VALUE;
-        float mMaxY = -Float.MAX_VALUE;
-        float mMaxR2;
+        // How far the model really reaches along each axis (x, y, z), in blocks from the mob's anchor, recorded from the
+        // vertices that are actually drawn. The histograms let a few stray vertices be ignored.
+        final int[][] hist = new int[3][MB_BINS];
+        final float[] lo = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE};
+        final float[] hi = {-Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
+        int samples;
+        // What is shown eases toward the fitted values, so a measurement that is still growing does not make the mob jump.
+        float sScale = -1F;
+        float sCenterY;
+        float sPivX;
+        float sPivZ;
+        float sYaw;
 
         Preview(EntityType<?> type, LivingEntity entity, double ay, int slot) {
             this.type = type;
@@ -254,19 +268,56 @@ public class MobEditorScreen extends Screen {
             return new AABB(ax - 64, ay - 48, az - 64, ax + 64, ay + 48, az + 64);
         }
 
-        /** Records a vertex of the model: height above the feet, and distance from the mob's vertical axis. */
+        boolean canMeasure() {
+            return !isVanilla(type) && warmTicks < WARMUP_TICKS + MEASURE_TICKS;
+        }
+
+        /** Records a vertex of the model, in blocks from the anchor (x, z horizontal, y up). */
         void measure(float wx, float wy, float wz) {
             // The first warm-up ticks are the bind pose (limbs wherever the model file left them); only the settled ones count.
-            if (warmTicks < WARMUP_TICKS - 4 || Float.isNaN(wx + wy + wz) || Math.abs(wy) > 300F || wx * wx + wz * wz > 90000F) {
+            if (warmTicks < WARMUP_TICKS - 4 || Float.isNaN(wx + wy + wz)
+                    || Math.abs(wx) > 250F || Math.abs(wy) > 250F || Math.abs(wz) > 250F) {
                 return;
             }
-            mMinY = Math.min(mMinY, wy);
-            mMaxY = Math.max(mMaxY, wy);
-            mMaxR2 = Math.max(mMaxR2, wx * wx + wz * wz);
+            add(0, wx);
+            add(1, wy);
+            add(2, wz);
+            samples++;
+        }
+
+        private void add(int axis, float v) {
+            int bin = Math.max(0, Math.min(MB_BINS - 1, (int) ((v + MB_OFF) / MB_BIN)));
+            hist[axis][bin]++;
+            lo[axis] = Math.min(lo[axis], v);
+            hi[axis] = Math.max(hi[axis], v);
         }
 
         boolean hasMeasure() {
-            return mMaxY > mMinY;
+            return samples >= 200;
+        }
+
+        /** The extent along an axis, ignoring the outermost 0.2% of vertices at each end (stray bits of a model). */
+        void range(int axis, float[] out) {
+            int[] h = hist[axis];
+            int cut = Math.max(1, samples / 500);
+            int c = 0;
+            int i = 0;
+            while (i < MB_BINS - 1 && (c += h[i]) < cut) {
+                i++;
+            }
+            c = 0;
+            int j = MB_BINS - 1;
+            while (j > 0 && (c += h[j]) < cut) {
+                j--;
+            }
+            float qLo = i * MB_BIN - MB_OFF;
+            float qHi = (j + 1) * MB_BIN - MB_OFF;
+            out[0] = Math.max(lo[axis], qLo);
+            out[1] = Math.min(hi[axis], qHi);
+            if (out[1] <= out[0]) {
+                out[0] = lo[axis];
+                out[1] = hi[axis];
+            }
         }
     }
 
@@ -924,13 +975,9 @@ public class MobEditorScreen extends Screen {
         return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
     }
 
-    /**
-     * Modded mobs whose own client code must not run for a preview: the ones listed in the mod config (quietMobs) and any
-     * modded boss tagged c:bosses. Boss code tends to start music, sky effects and warnings just because the boss exists.
-     * They are drawn but never ticked (their model animation does not need it) and get no server twin from the config list.
-     */
+    /** Modded mobs listed in the mod config (quietMobs): drawn but never ticked, and given no server twin. */
     private static boolean isQuiet(EntityType<?> t) {
-        return !isVanilla(t) && (EncephalonConfig.isQuiet(t) || t.is(Tags.EntityTypes.BOSSES));
+        return !isVanilla(t) && EncephalonConfig.isQuiet(t);
     }
 
     private static Field field(Class<?> owner, String name) {
@@ -1450,7 +1497,7 @@ public class MobEditorScreen extends Screen {
             pose.mulPose(new Quaternionf().rotateZ((float) Math.PI));
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
-            measuring = withMain && !isVanilla(p.type);
+            measuring = withMain && p.canMeasure();
             RenderSystem.runAsFancy(() -> drawModels(g, p, withMain, partial, extras, realPartial, pose, dispatcher));
             g.flush();
         } catch (Exception ex) {
@@ -1471,8 +1518,7 @@ public class MobEditorScreen extends Screen {
         if (withMain) {
             MultiBufferSource source = g.bufferSource();
             if (measuring) {
-                Vector3f o = pose.last().pose().transformPosition(new Vector3f());
-                source = new ExtentProbe(source, p, o.x(), o.y(), o.z());
+                source = new ExtentProbe(source, p, new Matrix4f(pose.last().pose()).invert());
             }
             dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, source, 15728880);
         }
@@ -1508,22 +1554,19 @@ public class MobEditorScreen extends Screen {
     }
 
     /**
-     * Passes everything through to the real buffer and records where the vertices land. The off-screen warm-up pose is a plain
-     * 1 pixel = 1 block flip around the mob's origin, so (origin - vertex) is the model's own position in blocks.
+     * Passes everything through to the real buffer and records where the vertices land. Each vertex is put back through the
+     * inverse of the pose the mob is drawn with, which gives its position in blocks around the mob's anchor whatever the
+     * scale, sway or turn of the pose is.
      */
     private static final class ExtentProbe implements MultiBufferSource {
         private final MultiBufferSource delegate;
         private final Preview p;
-        private final float ox;
-        private final float oy;
-        private final float oz;
+        private final Matrix4f inv;
 
-        ExtentProbe(MultiBufferSource delegate, Preview p, float ox, float oy, float oz) {
+        ExtentProbe(MultiBufferSource delegate, Preview p, Matrix4f inv) {
             this.delegate = delegate;
             this.p = p;
-            this.ox = ox;
-            this.oy = oy;
-            this.oz = oz;
+            this.inv = inv;
         }
 
         @Override
@@ -1533,6 +1576,7 @@ public class MobEditorScreen extends Screen {
 
         private final class Tap implements VertexConsumer {
             private final VertexConsumer out;
+            private final Vector3f tmp = new Vector3f();
 
             Tap(VertexConsumer out) {
                 this.out = out;
@@ -1540,7 +1584,8 @@ public class MobEditorScreen extends Screen {
 
             @Override
             public VertexConsumer addVertex(float x, float y, float z) {
-                p.measure(ox - x, oy - y, oz - z);
+                inv.transformPosition(x, y, z, tmp);
+                p.measure(tmp.x, tmp.y, tmp.z);
                 out.addVertex(x, y, z);
                 return this;
             }
@@ -1610,7 +1655,7 @@ public class MobEditorScreen extends Screen {
         p.warmTicks++;
         // A modded fish is not ticked at all: the game resets the water flag to dry at the start of every tick, before the
         // mod's own tick code runs, and code like "if (!isInWaterOrBubble()) onLandProgress++" then lays the model on its side.
-        // Quiet mobs (configured, or modded bosses) are not ticked either: their client tick code can start boss music or
+        // Quiet mobs (listed in the config) are not ticked either: their client tick code can start boss music or
         // change the sky, which a preview must never do.
         boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN) || (!isVanilla(e.getType()) && isFish(e))
                 || isQuiet(e.getType());
@@ -1831,107 +1876,134 @@ public class MobEditorScreen extends Screen {
 
         int top = TOP + 6;
         int bottom = viewBottom() - 16;
+        float panelH = bottom - top;
         float bbH = Math.max(e.getBbHeight(), 0.4F);
         float bbW = Math.max(e.getBbWidth(), 0.4F);
-        float extentH;
-        float extentW;
-        float fillH;
-        float fillW;
         boolean dragon = e instanceof EnderDragon;
-        if (dragon) {
-            extentH = DRAGON_H;
-            extentW = DRAGON_W;
-            fillH = 0.95F;
-            fillW = 0.95F;
-        } else if (e instanceof Squid || e instanceof Ghast) {
-            extentH = e instanceof Ghast ? GHAST_EXTENT_H : SQUID_EXTENT_H;
-            extentW = bbW * 2.2F;
-            fillH = 0.7F;
-            fillW = 0.8F;
-        } else {
-            // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
-            extentH = Math.max(bbH, bbW * 1.2F);
-            extentW = bbW * 2.2F;
-            fillH = 0.7F;
-            fillW = 0.8F;
-        }
-        float centerY = dragon ? DRAGON_CENTER_Y
-                : e instanceof Squid ? SQUID_CENTER_Y
-                : e instanceof Ghast ? GHAST_CENTER_Y
-                : bbH / 2F;
-        // The hitbox is only a guess at the size of the model. A mob whose model reaches well past it (a kraken's tentacles) is
-        // fitted by the extent that was measured while it was drawn off-screen; mobs that fit their hitbox keep the usual fit.
-        // (Mobs with parts are fitted from the union of their parts' hitboxes below.)
-        if (!dragon && !(e instanceof Squid) && !(e instanceof Ghast) && p.hasMeasure()) {
-            float measuredH = p.mMaxY - p.mMinY;
-            float measuredW = 2F * (float) Math.sqrt(p.mMaxR2);
-            if (measuredH > extentH || measuredW > extentW) {
-                extentH = Math.max(extentH, measuredH);
-                extentW = Math.max(extentW, measuredW);
-                centerY = (p.mMinY + p.mMaxY) / 2F;
-            }
-        }
+        boolean modded = !isVanilla(p.type);
+        boolean measured = modded && p.hasMeasure();
+        double swayDeg = dragon ? 12.0 : 40.0;
 
-        // When the mob has companions (body segments, a detached head) the whole group is fitted and centred. It is turned
-        // three-quarters on: a long body mostly runs into the screen, so it takes far less width than seen from the side.
-        boolean group = !extras.isEmpty();
-        float pivotX = 0F;
-        float pivotZ = 0F;
-        float viewYaw = 0F;
-        if (group) {
-            double minX = -bbW / 2.0;
-            double maxX = bbW / 2.0;
-            double minZ = -bbW / 2.0;
-            double maxZ = bbW / 2.0;
-            double minY = 0.0;
-            double maxY = bbH;
+        float tScale;
+        float tCenterY;
+        float tPivX = 0F;
+        float tPivZ = 0F;
+        float tYaw = 0F;
+        if (modded && (measured || !extras.isEmpty())) {
+            // Bounds of what is really drawn (blocks around the anchor); the hitbox only stands in until it has been measured.
+            float minX = -bbW / 2F;
+            float maxX = bbW / 2F;
+            float minY = 0F;
+            float maxY = bbH;
+            float minZ = -bbW / 2F;
+            float maxZ = bbW / 2F;
+            if (measured) {
+                float[] r = new float[2];
+                p.range(0, r);
+                minX = r[0];
+                maxX = r[1];
+                p.range(1, r);
+                minY = r[0];
+                maxY = r[1];
+                p.range(2, r);
+                minZ = r[0];
+                maxZ = r[1];
+            }
             for (Entity c : extras) {
                 AABB b = c.getBoundingBox();
-                minX = Math.min(minX, b.minX - p.ax);
-                maxX = Math.max(maxX, b.maxX - p.ax);
-                minZ = Math.min(minZ, b.minZ - p.az);
-                maxZ = Math.max(maxZ, b.maxZ - p.az);
-                minY = Math.min(minY, b.minY - p.ay);
-                maxY = Math.max(maxY, b.maxY - p.ay);
+                minX = (float) Math.min(minX, b.minX - p.ax);
+                maxX = (float) Math.max(maxX, b.maxX - p.ax);
+                minY = (float) Math.min(minY, b.minY - p.ay);
+                maxY = (float) Math.max(maxY, b.maxY - p.ay);
+                minZ = (float) Math.min(minZ, b.minZ - p.az);
+                maxZ = (float) Math.max(maxZ, b.maxZ - p.az);
             }
-            pivotX = (float) ((minX + maxX) / 2.0);
-            pivotZ = (float) ((minZ + maxZ) / 2.0);
-            double ex = maxX - minX;
-            double ez = maxZ - minZ;
-            // The long axis is the one that should run into the screen.
-            viewYaw = ex > ez ? (float) (Math.PI / 2.0 - GROUP_VIEW_ANGLE) : GROUP_VIEW_ANGLE;
-            double swayRad = Math.toRadians(GROUP_SWAY_DEG);
+            float spanH = Math.max(maxY - minY, 0.4F);
+            float spanX = Math.max(maxX - minX, 0.4F);
+            float spanZ = Math.max(maxZ - minZ, 0.4F);
+            float core = Math.max(spanH, Math.min(spanX, spanZ));  // the size that must look right: height or thickness
+            float longest = Math.max(spanX, spanZ);
+            boolean elongated = longest > ELONGATED_RATIO * core;
+            float cap = elongated ? LENGTH_CAP * core : longest;    // how much of the length is fitted
+            float fitX = Math.min(spanX, cap);
+            float fitZ = Math.min(spanZ, cap);
+            if (elongated) {
+                // Turn it so the long axis mostly runs into the screen.
+                tYaw = spanX > spanZ ? (float) (Math.PI / 2.0 - GROUP_VIEW_ANGLE) : GROUP_VIEW_ANGLE;
+                swayDeg = GROUP_SWAY_DEG;
+            }
+            double swayRad = Math.toRadians(swayDeg);
             double worstW = 0.0;
             for (int k = -1; k <= 1; k++) {
-                double a = viewYaw + k * swayRad;
-                worstW = Math.max(worstW, ex * Math.abs(Math.cos(a)) + ez * Math.abs(Math.sin(a)));
+                double a = tYaw + k * swayRad;
+                worstW = Math.max(worstW, fitX * Math.abs(Math.cos(a)) + fitZ * Math.abs(Math.sin(a)));
             }
-            extentH = Math.max(extentH, (float) (maxY - minY));
-            extentW = (float) worstW + bbW;
-            centerY = (float) ((minY + maxY) / 2.0);
+            tScale = Math.min(55F, Math.min(panelH * 0.7F / spanH, rw * 0.8F / (float) Math.max(worstW, 0.4)));
+            tCenterY = (minY + maxY) / 2F;
+            tPivX = (minX + maxX) / 2F;
+            tPivZ = (minZ + maxZ) / 2F;
+            if (elongated && longest > cap) {
+                // Part of the length will be cut off: keep the end the mob's own origin (its head) is in on screen.
+                if (spanX > spanZ) {
+                    tPivX = Mth.clamp(0F, minX + cap / 2F, maxX - cap / 2F);
+                } else {
+                    tPivZ = Mth.clamp(0F, minZ + cap / 2F, maxZ - cap / 2F);
+                }
+            }
+        } else {
+            float extentH;
+            float extentW;
+            float fillH;
+            float fillW;
+            if (dragon) {
+                extentH = DRAGON_H;
+                extentW = DRAGON_W;
+                fillH = 0.95F;
+                fillW = 0.95F;
+            } else if (e instanceof Squid || e instanceof Ghast) {
+                extentH = e instanceof Ghast ? GHAST_EXTENT_H : SQUID_EXTENT_H;
+                extentW = bbW * 2.2F;
+                fillH = 0.7F;
+                fillW = 0.8F;
+            } else {
+                // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
+                extentH = Math.max(bbH, bbW * 1.2F);
+                extentW = bbW * 2.2F;
+                fillH = 0.7F;
+                fillW = 0.8F;
+            }
+            tCenterY = dragon ? DRAGON_CENTER_Y
+                    : e instanceof Squid ? SQUID_CENTER_Y
+                    : e instanceof Ghast ? GHAST_CENTER_Y
+                    : bbH / 2F;
+            tScale = Math.min(55F, Math.min(panelH * fillH / extentH, rw * fillW / extentW));
         }
-        // Never shrink a huge mob to a speck: below the minimum size the panel clips it instead.
-        float fit = Math.min((bottom - top) * fillH / extentH, rw * fillW / extentW);
-        float minScale = (bottom - top) / MIN_BLOCKS_VISIBLE;
-        boolean clipped = fit < minScale;
-        float scale = Math.min(55F, Math.max(fit, minScale));
-        if (group && clipped) {
-            // Part of the group is going to be cut off: keep the main mob (the head) near the middle rather than the middle
-            // of a body that is mostly off-screen.
-            pivotX *= 0.4F;
-            pivotZ *= 0.4F;
+
+        if (p.sScale < 0F) {
+            p.sScale = tScale;
+            p.sCenterY = tCenterY;
+            p.sPivX = tPivX;
+            p.sPivZ = tPivZ;
+            p.sYaw = tYaw;
+        } else {
+            p.sScale += (tScale - p.sScale) * SMOOTH;
+            p.sCenterY += (tCenterY - p.sCenterY) * SMOOTH;
+            p.sPivX += (tPivX - p.sPivX) * SMOOTH;
+            p.sPivZ += (tPivZ - p.sPivZ) * SMOOTH;
+            p.sYaw += (tYaw - p.sYaw) * SMOOTH;
         }
+        float scale = p.sScale;
         float cx = rx + rw / 2F;
-        float feetY = (top + bottom) / 2F + centerY * scale;
+        float feetY = (top + bottom) / 2F + p.sCenterY * scale;
 
         // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
         faceViewer(e);
         forceWet(e); // the fish renderer lays fish on their side unless they are in water
         e.setInvisible(false);
-        double swayDeg = group ? GROUP_SWAY_DEG : dragon ? 12.0 : 40.0;
         float sway = (float) Math.toRadians(swayDeg * Math.sin(Util.getMillis() / 1500.0));
-        final float px = pivotX;
-        final float pz = pivotZ;
+        final float px = p.sPivX;
+        final float pz = p.sPivZ;
+        final float yaw = p.sYaw;
         final List<Entity> drawExtras = extras;
 
         boolean failed = false;
@@ -1942,15 +2014,17 @@ public class MobEditorScreen extends Screen {
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
-            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + viewYaw + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
-            pose.translate(-px, 0.0F, -pz); // turn around the middle of the group, not the head
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + yaw + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
+            pose.translate(-px, 0.0F, -pz); // turn around the fitted middle, not the head
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
+            measuring = p.canMeasure();
             RenderSystem.runAsFancy(() -> drawModels(g, p, true, partial, drawExtras, realPartial, pose, dispatcher));
             g.flush();
         } catch (Exception ex) {
             failed = true;
         } finally {
+            measuring = false;
             dispatcher.setRenderShadow(true);
             pose.popPose();
             Lighting.setupFor3DItems();
