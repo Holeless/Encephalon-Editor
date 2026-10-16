@@ -3,6 +3,7 @@ package com.example.encephalon.client;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 import com.example.encephalon.EncephalonMod;
 import com.example.encephalon.config.EncephalonConfig;
@@ -27,13 +28,13 @@ import net.neoforged.neoforge.event.tick.EntityTickEvent;
 /**
  * The column of sky where the Mob Editor parks the previews (and the server-side twins of modded mobs, see MobEditorScreen).
  * Anything that appears in it while the editor is open belongs to the preview: the twin, and whatever it spawns
- * (body segments, a detached head, a portal, ...). Those must not hunt the player, take damage or make noise.
+ * (body segments, a detached head, orbiting bones, ...). Those must not hunt the player, take damage or make noise.
  * Sounds are silenced by position rather than per mob, so it works for any mod. Uses no client classes, so it is safe on any side.
  *
  * Containment: a twin runs its mod's real server code, and that code can reach outside the column (the Void Worm opens a portal
  * in the sky and a sister portal at its destination, next to the player, which then teleports the player). So while a preview
- * entity is spawning or ticking on the server, every entity it tries to add to a world is vetoed unless it is a living
- * companion inside the column that belongs to the twin's own mod (a body segment or a head, which the preview draws).
+ * entity is spawning or ticking on the server, every entity it tries to add to a world is vetoed unless it is a companion inside
+ * the column that belongs to the twin's own mod (a body segment, a head, bones, which the preview draws).
  * Minions of another mod or of vanilla (a ghoul that comes with a crowd of zombies) are vetoed too.
  *
  * Stability: twins are pinned to their spot after every tick (the preview draws their parts relative to that spot, and a mob
@@ -48,6 +49,9 @@ import net.neoforged.neoforge.event.tick.EntityTickEvent;
 public final class PreviewZone {
     /** Null while the editor is closed. */
     static volatile AABB zone;
+
+    /** Greater than zero while preview code (creating, ticking or drawing a preview mob) runs on the render thread. */
+    private static volatile int guard;
 
     /** Greater than zero while a twin is being created on the server thread (MobEditorScreen#startTwin). */
     private static volatile int spawning;
@@ -64,6 +68,31 @@ public final class PreviewZone {
     private static final Set<String> LOGGED = ConcurrentHashMap.newKeySet();
 
     private PreviewZone() {
+    }
+
+    /** True while preview code runs: anything that starts a sound then is the preview's, and is dropped (PreviewSilencer). */
+    static boolean guarding() {
+        return guard > 0;
+    }
+
+    /** Runs preview code with the guard up. */
+    static void guarded(Runnable r) {
+        guard++;
+        try {
+            r.run();
+        } finally {
+            guard--;
+        }
+    }
+
+    /** Same, for code that returns something. */
+    static <T> T guardedGet(Supplier<T> s) {
+        guard++;
+        try {
+            return s.get();
+        } finally {
+            guard--;
+        }
     }
 
     /** Server thread: this entity is the twin the editor is creating, let it into the level. */
@@ -109,15 +138,13 @@ public final class PreviewZone {
     }
 
     /**
-     * Whether a living entity next to a preview twin is a body part (a worm segment, a detached head) rather than a minion.
-     * It has to be from the twin's own mod, and then it counts as a minion if it is a mob in its own right (it has a spawn egg,
-     * so it is also listed in the editor) or if it hunts (it has target goals). Parts have neither. The config lists
+     * Whether an entity next to a preview twin is a body part (a worm segment, a detached head, orbiting bones) rather than a minion.
+     * It has to be from the twin's own mod. Things that are not alive count as parts (except the ones in EncephalonConfig's built-in
+     * not-part list, like the Void Worm's portal). A living one counts as a minion if it is a mob in its own right (it has a spawn
+     * egg, so it is also listed in the editor) or if it hunts (it has target goals); parts have neither. The config lists
      * partMobs / notPartMobs override this for any type it gets wrong.
      */
     static boolean isPart(Entity e) {
-        if (!(e instanceof LivingEntity)) {
-            return false;
-        }
         EntityType<?> t = e.getType();
         if (EncephalonConfig.isForcedNotPart(t)) {
             return false;
@@ -126,6 +153,9 @@ public final class PreviewZone {
             return false;
         }
         if (EncephalonConfig.isForcedPart(t)) {
+            return true;
+        }
+        if (!(e instanceof LivingEntity)) {
             return true;
         }
         if (SpawnEggItem.byId(t) != null) {
@@ -184,14 +214,12 @@ public final class PreviewZone {
             return;
         }
         boolean inside = contains(e.position());
-        // Whatever a preview entity creates is vetoed, except living companions of the same mod inside the column. This is what
+        // Whatever a preview entity creates is vetoed, except companions of the same mod inside the column. This is what
         // stops portals, their sister portals next to the player, projectiles, area clouds, items, minions and crowds of
         // zombies from ever existing.
         boolean twin = !event.getLevel().isClientSide() && EXPECTED.remove(e);
         if (!twin && !event.getLevel().isClientSide() && previewCodeRunning() && (!inside || !isPart(e))) {
-            if (e instanceof LivingEntity) {
-                logBlocked(e);
-            }
+            logBlocked(e);
             event.setCanceled(true);
             return;
         }

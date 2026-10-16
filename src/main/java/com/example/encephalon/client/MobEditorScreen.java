@@ -71,6 +71,7 @@ import net.minecraft.world.entity.animal.FlyingAnimal;
 import net.minecraft.world.entity.animal.Rabbit;
 import net.minecraft.world.entity.animal.Squid;
 import net.minecraft.world.entity.animal.Turtle;
+import net.minecraft.world.entity.animal.WaterAnimal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.monster.Ghast;
 import net.minecraft.world.entity.monster.Guardian;
@@ -81,6 +82,7 @@ import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.SpawnEggItem;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.fml.ModList;
@@ -90,6 +92,7 @@ import net.neoforged.fml.ModList;
  * Middle: behaviors for the selected scope, with a behavior search. Right: scrollable details and settings,
  * or an animated 3D mob preview while no behavior is selected.
  * Singleplayer only for now: it edits the integrated server's MobConfigData directly (networking is a TODO).
+ * Preview mobs live in dummy worlds (PreviewLevel) and every piece of their code runs inside PreviewSandbox.
  */
 public class MobEditorScreen extends Screen {
     private static final int TOP = 50;
@@ -151,8 +154,9 @@ public class MobEditorScreen extends Screen {
     private static final Field SHULKER_PEEK_O = field(Shulker.class, "currentPeekAmountO");
     private static final Field SHULKER_SLIDE = field(Shulker.class, "clientSideTeleportInterpolation");
 
-    // Fish are only upright when the game thinks they are in water: out of water the renderer lays them on their side.
-    // The preview mob is far above the world, so the flag is forced on just before drawing.
+    // Vanilla fish are only upright when the game thinks they are in water: out of water the renderer lays them on their side.
+    // Vanilla mobs live in the dry dummy world, so the flag is forced on just before drawing. (Modded swimmers live in the
+    // flooded dummy world and are really in water.)
     private static final Field WET = field(Entity.class, "wasTouchingWater");
     private static final Field WET_EYES = field(Entity.class, "wasEyeInWater");
 
@@ -506,7 +510,7 @@ public class MobEditorScreen extends Screen {
         addRenderableWidget(Button.builder(Component.translatable("encephalon.screen.reset_scope"), b -> resetScope())
                 .bounds(width / 2 - 155, height - 28, 150, 20).build()).active = editable;
 
-        buildTypes();
+        PreviewSandbox.run(this::buildTypes);
 
         int lw = Mth.clamp(width * 27 / 100, 100, 190);
         mw = Mth.clamp(width * 27 / 100, 100, 190);
@@ -1075,6 +1079,39 @@ public class MobEditorScreen extends Screen {
         }
     }
 
+    /** Modded swimmers are made in the flooded dummy world (see PreviewLevel); everything else in the dry one. */
+    private static final Map<EntityType<?>, Boolean> AQUATIC = new ConcurrentHashMap<>();
+
+    private boolean aquatic(EntityType<?> t) {
+        if (isVanilla(t)) {
+            return false;
+        }
+        Boolean known = AQUATIC.get(t);
+        if (known != null) {
+            return known;
+        }
+        MobCategory c = t.getCategory();
+        boolean water = c == MobCategory.WATER_CREATURE || c == MobCategory.WATER_AMBIENT
+                || c == MobCategory.UNDERGROUND_WATER_CREATURE || placedInWater(t);
+        if (!water) {
+            Class<?> k = classOf(t);
+            water = k != null && (AbstractFish.class.isAssignableFrom(k) || WaterAnimal.class.isAssignableFrom(k));
+        }
+        AQUATIC.put(t, water);
+        return water;
+    }
+
+    /** The dummy world preview mobs live in; the real client level only if a dummy could not be built. */
+    private Level levelFor(boolean flooded) {
+        PreviewLevel dummy = PreviewLevel.get(flooded);
+        return dummy != null ? dummy : this.minecraft.level;
+    }
+
+    /** Creates an entity of this type in a dummy world, inside the sandbox (its constructor is the mod's code). */
+    private static Entity createIn(EntityType<?> t, Level level) {
+        return PreviewSandbox.<Entity>asLevel(level, () -> t.create(level));
+    }
+
     private static void forceWet(LivingEntity e) {
         if (WET != null && isFish(e)) {
             try {
@@ -1095,16 +1132,17 @@ public class MobEditorScreen extends Screen {
      */
     private static Vec3 previewMotion(LivingEntity e) {
         // Modded land animals get a slow walk too: many mods start their walk animation from the mob's own velocity, not from
-        // the walk state, so a mob with zero velocity would only ever play its idle.
+        // the walk state, so a mob with zero velocity would only ever play its idle. Modded swimmers get a slow swim, forward.
         boolean moddedWalker = !isVanilla(e.getType()) && !isFlyer(e) && !isFish(e);
-        return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : moddedWalker ? 0.05 : 0.0);
+        boolean moddedSwimmer = !isVanilla(e.getType()) && isFish(e);
+        return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : moddedSwimmer ? -0.05 : moddedWalker ? 0.05 : 0.0);
     }
 
     private static boolean isVanilla(EntityType<?> t) {
         return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
     }
 
-    /** The entity class of a type (made once, never added to the level), or null if one can't be made. */
+    /** The entity class of a type (made once, never added to a level), or null if one can't be made. */
     private static final Map<EntityType<?>, Class<?>> CLASS_OF = new ConcurrentHashMap<>();
     private static final Map<Class<?>, Boolean> HAS_BOSS_BAR = new ConcurrentHashMap<>();
 
@@ -1113,7 +1151,7 @@ public class MobEditorScreen extends Screen {
         if (c == null && this.minecraft.level != null) {
             c = Void.class; // "unknown", so a type that can't be made is not tried again every frame
             try {
-                Entity e = t.create(this.minecraft.level);
+                Entity e = createIn(t, levelFor(false));
                 if (e != null) {
                     c = e.getClass();
                     e.discard();
@@ -1400,19 +1438,20 @@ public class MobEditorScreen extends Screen {
             }
         }
         PreviewZone.close();
+        PreviewLevel.close();
         super.removed();
     }
 
     /**
-     * Entities around a preview mob that belong to it: parts, a head, tails. Also decides when the group has settled
+     * Entities around a preview mob that belong to it: parts, a head, tails, orbiting bones. Also decides when the group has settled
      * (and learns which mob types have companions at all, so later previews know whether a twin is worth it).
      */
     private List<Entity> rawCompanions(Preview p) {
         if (p.slot < 0 || this.minecraft.level == null) {
             return List.of();
         }
-        // Living entities only: those are the segments and heads. Other things the mob makes (the Void Worm's portal) are
-        // effects of the twin standing still up there, not part of the mob.
+        // Companions of the twin's own mod (see PreviewZone.isPart). Things the twin made that are not part of the mob (the
+        // Void Worm's portal) are effects of the twin standing still up there, and are left out.
         List<Entity> found = this.minecraft.level.getEntities((Entity) null, p.box(),
                 en -> PreviewZone.isPart(en) && en.getId() != p.twinId && en != p.entity && en != this.minecraft.player);
         long now = this.minecraft.level.getGameTime();
@@ -1573,7 +1612,7 @@ public class MobEditorScreen extends Screen {
 
     private LivingEntity makeEntity(EntityType<?> t, double x, double y, double z) {
         try {
-            Entity e = t.create(this.minecraft.level);
+            Entity e = createIn(t, levelFor(aquatic(t)));
             if (e instanceof LivingEntity living) {
                 living.setSilent(true);
                 if (living instanceof Hoglin || living instanceof AbstractPiglin) {
@@ -1718,7 +1757,10 @@ public class MobEditorScreen extends Screen {
             if (measuring) {
                 source = new ExtentProbe(source, p, new Matrix4f(pose.last().pose()).invert());
             }
-            dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, source, 15728880);
+            final MultiBufferSource use = source;
+            // The renderer is the mod's code too: it runs with the singleton pointed at the dummy world.
+            PreviewSandbox.asLevelRun(p.entity.level(),
+                    () -> dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, use, 15728880));
         }
         for (Entity c : extras) {
             // These are ticked by the real client clock. A companion that fails to draw is skipped; it should not take
@@ -1842,6 +1884,11 @@ public class MobEditorScreen extends Screen {
         }
     }
 
+    /** One preview step, run inside the sandbox: the mob's tick is the mod's code, so Minecraft.level is the dummy world meanwhile. */
+    private void stepPreview(Preview p) {
+        PreviewSandbox.asLevelRun(p.entity.level(), () -> stepPreviewInner(p));
+    }
+
     /**
      * One 20 Hz step of the preview mob. The entity is ticked so its own animations run (dragon wings, bat, guardian, ...),
      * but the walk cycle is driven here at a fixed speed. If the walk state can't be pinned, only the dragon is
@@ -1849,7 +1896,7 @@ public class MobEditorScreen extends Screen {
      * The level normally does the per-tick bookkeeping (old position and tickCount) before entity.tick(); tickCount is the
      * "age" that rods, tentacles, wings and segments animate from, so it must advance here or those mobs vibrate.
      */
-    private void stepPreview(Preview p) {
+    private void stepPreviewInner(Preview p) {
         if (this.minecraft.level == null || this.minecraft.player == null) {
             return;
         }
@@ -1857,11 +1904,13 @@ public class MobEditorScreen extends Screen {
         boolean dragon = e instanceof EnderDragon;
         e.tickCount++;
         p.warmTicks++;
-        // A modded fish is not ticked at all: the game resets the water flag to dry at the start of every tick, before the
-        // mod's own tick code runs, and code like "if (!isInWaterOrBubble()) onLandProgress++" then lays the model on its side.
+        // Modded swimmers live in the flooded dummy world, where the game's own water logic works, so they are ticked like any
+        // other mob. Only if no dummy world could be built (the entity is in the real level) is a modded fish not ticked: the game
+        // resets the water flag to dry at the start of every tick, before the mod's own tick code runs.
         // Quiet mobs (listed in the config) are not ticked either: their client tick code can start boss music or
         // change the sky, which a preview must never do.
-        boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN) || (!isVanilla(e.getType()) && isFish(e))
+        boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN)
+                || (!isVanilla(e.getType()) && isFish(e) && !(e.level() instanceof PreviewLevel))
                 || quiet(e.getType());
         if (!p.tickFailed && !skipTick && (CAN_PIN_WALK || dragon)) {
             try {
@@ -2278,15 +2327,17 @@ public class MobEditorScreen extends Screen {
         }
         g.disableScissor();
         if (behavior == null) {
-            renderPreview(g, partialTick);
+            PreviewSandbox.run(() -> renderPreview(g, partialTick));
             g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
             drawWarning(g, 0);
             g.disableScissor();
             return;
         }
         // No preview while a behavior is open, but mobs in view keep warming up in the background.
-        computeWanted();
-        pumpWarm(g, partialTick);
+        PreviewSandbox.run(() -> {
+            computeWanted();
+            pumpWarm(g, partialTick);
+        });
 
         g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
         drawWarning(g, scroll);

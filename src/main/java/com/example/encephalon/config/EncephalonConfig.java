@@ -25,6 +25,9 @@ public final class EncephalonConfig {
             "bosses_of_mass_destruction:lich", "bosses_of_mass_destruction:gauntlet",
             "bosses_of_mass_destruction:obsidilith", "bosses_of_mass_destruction:void_blossom");
 
+    /** Never treated as a body part of a preview mob, whatever the config file says (a portal would be drawn and could do harm). */
+    private static final Set<String> BUILT_IN_NOT_PART = Set.of("alexsmobs:void_portal");
+
     static {
         ModConfigSpec.Builder b = new ModConfigSpec.Builder();
         SHOW_MOBS_WITHOUT_EGG = b
@@ -73,7 +76,8 @@ public final class EncephalonConfig {
     }
 
     public static boolean isForcedNotPart(EntityType<?> type) {
-        return SPEC.isLoaded() && NOT_PART_MOBS.get().contains(BuiltInRegistries.ENTITY_TYPE.getKey(type).toString());
+        String id = BuiltInRegistries.ENTITY_TYPE.getKey(type).toString();
+        return BUILT_IN_NOT_PART.contains(id) || (SPEC.isLoaded() && NOT_PART_MOBS.get().contains(id));
     }
 
     private EncephalonConfig() {
