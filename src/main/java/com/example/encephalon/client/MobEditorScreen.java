@@ -48,10 +48,13 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.FlyingMob;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.WalkAnimationState;
 import net.minecraft.world.entity.ambient.Bat;
 import net.minecraft.world.entity.animal.FlyingAnimal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
+import net.minecraft.world.entity.monster.Guardian;
+import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.SpawnEggItem;
 
@@ -72,15 +75,19 @@ public class MobEditorScreen extends Screen {
     // 3D preview tuning
     private static final long TICK_NANOS = 50_000_000L;
     private static final float WALK_SPEED = 0.5F;       // limb swing amount; the walk cycle advances about this much per tick
-    private static final float DRAGON_W = 19F;          // blocks: wingspan plus a little sway room
-    private static final float DRAGON_H = 13F;          // blocks: wing flap range
+    private static final float DRAGON_W = 16.5F;          // blocks: wingspan plus a little sway room
+    private static final float DRAGON_H = 11F;          // blocks: wing flap range
     private static final float DRAGON_CENTER_Y = 1F;    // blocks above the dragon's feet where the model's visual middle sits
 
     // The walk animation is advanced by hand, once per preview tick. The entity's own tick also updates it (twice-updating
     // makes limbs flutter), so its state is saved before the tick and put back after, through these fields.
-    private static final Field WALK_SPEED_OLD = walkField("speedOld");
-    private static final Field WALK_SPEED_NOW = walkField("speed");
-    private static final Field WALK_POS = walkField("position");
+    private static final Field WALK_SPEED_OLD = field(WalkAnimationState.class, "speedOld");
+    private static final Field WALK_SPEED_NOW = field(WalkAnimationState.class, "speed");
+    private static final Field WALK_POS = field(WalkAnimationState.class, "position");
+    // Out of water a guardian's tail advances 2 radians per tick; pin it to a gentle swim instead.
+    private static final float GUARDIAN_TAIL_SPEED = 0.15F;
+    private static final Field GUARDIAN_TAIL = field(Guardian.class, "clientSideTailAnimation");
+    private static final Field GUARDIAN_TAIL_O = field(Guardian.class, "clientSideTailAnimationO");
     private static final boolean CAN_PIN_WALK = WALK_SPEED_OLD != null && WALK_SPEED_NOW != null && WALK_POS != null;
 
     private MinecraftServer server;
@@ -624,6 +631,9 @@ public class MobEditorScreen extends Screen {
                 Entity e = t.create(this.minecraft.level);
                 if (e instanceof LivingEntity living) {
                     living.setSilent(true);
+                    if (living instanceof Mob mob) {
+                        mob.setNoAi(true); // stops hoglins/piglins shaking as if converting to zombified in the overworld
+                    }
                     tickFailed = false;
                     previewType = t;
                     previewEntity = living;
@@ -638,9 +648,9 @@ public class MobEditorScreen extends Screen {
         return null;
     }
 
-    private static Field walkField(String name) {
+    private static Field field(Class<?> owner, String name) {
         try {
-            Field f = WalkAnimationState.class.getDeclaredField(name);
+            Field f = owner.getDeclaredField(name);
             f.setAccessible(true);
             return f;
         } catch (ReflectiveOperationException | RuntimeException ex) {
@@ -675,9 +685,20 @@ public class MobEditorScreen extends Screen {
                 e.setOldPosAndRot();
                 // The dragon's wing flap rate depends on its speed; a stationary dragon flaps far too fast, so give it a cruise.
                 e.setDeltaMovement(0.0, 0.0, dragon ? -0.5 : 0.0);
-                e.setOnGround(!isFlyer(e));
+                // Slimes only squish on ground transitions, so make them hop in place.
+                boolean grounded = e instanceof Slime ? e.tickCount % 24 < 16 : !isFlyer(e);
+                e.setOnGround(grounded);
+                float tail = 0F;
+                boolean pinTail = e instanceof Guardian && GUARDIAN_TAIL != null && GUARDIAN_TAIL_O != null;
+                if (pinTail) {
+                    tail = GUARDIAN_TAIL.getFloat(e);
+                }
                 e.tick();
                 e.setPos(hx, hy, hz);
+                if (pinTail) {
+                    GUARDIAN_TAIL_O.setFloat(e, tail);
+                    GUARDIAN_TAIL.setFloat(e, tail + GUARDIAN_TAIL_SPEED);
+                }
                 if (walk != null) {
                     WALK_SPEED_OLD.setFloat(e.walkAnimation, walk[0]);
                     WALK_SPEED_NOW.setFloat(e.walkAnimation, walk[1]);
@@ -721,8 +742,8 @@ public class MobEditorScreen extends Screen {
         if (dragon) {
             extentH = DRAGON_H;
             extentW = DRAGON_W;
-            fillH = 0.9F;
-            fillW = 0.9F;
+            fillH = 0.95F;
+            fillW = 0.95F;
         } else {
             // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
             extentH = Math.max(bbH, bbW * 1.2F);
