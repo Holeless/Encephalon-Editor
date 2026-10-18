@@ -1,8 +1,10 @@
 package com.example.encephalon.config;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.example.encephalon.behavior.Behavior;
@@ -20,7 +22,8 @@ import net.minecraft.world.level.saveddata.SavedData;
 
 /**
  * Per-world overrides: toggles and setting values, keyed by scope + behavior (+ setting), custom drop lists per mob type,
- * the category (how a mob acts) per mob type, and attack damage per mob type + attack.
+ * the category (how a mob acts) per mob type, and attack damage per mob type + attack. An attack id that starts with cfg_ is
+ * a value of the mod's own config: setting or clearing it also writes it to the mod's live config (see DamageDefaults).
  * Saved as data/encephalon_config.dat.
  */
 public class MobConfigData extends SavedData {
@@ -36,7 +39,7 @@ public class MobConfigData extends SavedData {
     private final Map<String, List<DropEntry>> drops = new ConcurrentHashMap<>();
     /** Mob type id -> how the mob acts (hostile / neutral / passive). No entry means its default one. */
     private final Map<String, String> categories = new ConcurrentHashMap<>();
-    /** "mobId|attackId" -> damage points on Normal difficulty. No entry means the default damage. */
+    /** "mobId|attackId" -> damage points on Normal difficulty (or the value of a mod config for cfg_ ids). No entry means the default. */
     private final Map<String, Double> damages = new ConcurrentHashMap<>();
     /** Bumped on every edit so resolved-config caches know when to rebuild. */
     private volatile int version;
@@ -198,6 +201,9 @@ public class MobConfigData extends SavedData {
 
     public void setDamage(String mobId, String attack, double value) {
         damages.put(mobId + "|" + attack, value);
+        if (attack.startsWith(DamageDefaults.CONFIG_PREFIX)) {
+            DamageDefaults.applyConfig(attack, value);
+        }
         version++;
         setDirty();
     }
@@ -205,6 +211,9 @@ public class MobConfigData extends SavedData {
     /** Back to the default damage of one attack. */
     public void clearDamage(String mobId, String attack) {
         if (damages.remove(mobId + "|" + attack) != null) {
+            if (attack.startsWith(DamageDefaults.CONFIG_PREFIX)) {
+                DamageDefaults.resetConfig(attack);
+            }
             version++;
             setDirty();
         }
@@ -221,9 +230,32 @@ public class MobConfigData extends SavedData {
         return false;
     }
 
+    /** Mob type ids that have a value stored for one of the mod's config values (applied again when a world starts). */
+    public Set<String> configOverrideMobs() {
+        Set<String> out = new HashSet<>();
+        for (String k : damages.keySet()) {
+            int bar = k.indexOf('|');
+            if (bar > 0 && k.startsWith(DamageDefaults.CONFIG_PREFIX, bar + 1)) {
+                out.add(k.substring(0, bar));
+            }
+        }
+        return out;
+    }
+
+    /** Puts every mod config value stored for the mob type back to what it was. */
+    private void resetConfigsOf(String mobId) {
+        String p = mobId + "|";
+        for (String k : damages.keySet()) {
+            if (k.startsWith(p) && k.startsWith(DamageDefaults.CONFIG_PREFIX, p.length())) {
+                DamageDefaults.resetConfig(k.substring(p.length()));
+            }
+        }
+    }
+
     /** Back to the default damage of every attack of the mob type. */
     public void clearDamages(String mobId) {
         String p = mobId + "|";
+        resetConfigsOf(mobId);
         if (damages.keySet().removeIf(k -> k.startsWith(p))) {
             version++;
             setDirty();
@@ -268,6 +300,7 @@ public class MobConfigData extends SavedData {
         if (s.type() == ScopeType.MOB_TYPE) {
             drops.remove(s.id());
             categories.remove(s.id());
+            resetConfigsOf(s.id());
             String dp = s.id() + "|";
             damages.keySet().removeIf(k -> k.startsWith(dp));
         }
