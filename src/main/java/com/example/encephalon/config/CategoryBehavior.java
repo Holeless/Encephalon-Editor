@@ -39,8 +39,10 @@ import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
  * <li>Passive: never targets anything and never hurts anyone in melee.</li>
  * </ul>
  * Only a category that differs from the mob's default one changes anything. A mob that is made to attack but has no attack of
- * its own gets a melee goal; its damage is its default damage (see DamageDefaults). The goals are added once to a mob and check
- * the setting every time they are asked, so changing or resetting the category takes effect at once, on mobs that already exist.
+ * its own gets a melee goal; its damage is its default damage (see DamageDefaults). A mob that has attacks of its own in its
+ * code (see DamageDefaults.hardcodedAttack: a boss, a creeper) gets no melee goal: it only gets the targeting, and its own code
+ * does the attacking. The goals are added once to a mob and check the setting every time they are asked, so changing or
+ * resetting the category takes effect at once, on mobs that already exist.
  * <p>
  * The chase speed of that melee goal is worked out from the mob's own walking speed (see chaseSpeed), so a mob that walks
  * slowly because its goals and behaviors use a small speed factor (a villager: base speed 0.5, walks at about half of it) does
@@ -102,6 +104,12 @@ public final class CategoryBehavior {
         return false;
     }
 
+    /** True if the mob's own code attacks (see DamageDefaults.hardcodedAttack): nothing is added on top of it. */
+    private static boolean hardcodedAttack(Mob mob) {
+        MinecraftServer server = mob.getServer();
+        return server != null && DamageDefaults.hardcodedAttack(server, mob.getType());
+    }
+
     /**
      * The speed factor the melee goal chases with. The goal's factor multiplies the mob's speed attribute, and that attribute
      * differs a lot between mobs (a zombie 0.23, a villager 0.5, which its brain then walks at half of), so a fixed factor made
@@ -132,7 +140,8 @@ public final class CategoryBehavior {
         if (mob.level().isClientSide() || ARMED.put(mob, Boolean.TRUE) != null) {
             return;
         }
-        boolean nativeAttack = hasNativeAttack(mob);
+        // A mob with attacks of its own (a goal, or attacks found in its code) gets no melee goal on top of them.
+        boolean nativeAttack = hasNativeAttack(mob) || hardcodedAttack(mob);
         mob.targetSelector.addGoal(1, new Calm(mob));
         mob.targetSelector.addGoal(3, new Hunt(mob));
         if (mob instanceof PathfinderMob pm) {
