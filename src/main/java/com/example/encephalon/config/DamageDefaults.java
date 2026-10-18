@@ -1,5 +1,6 @@
 package com.example.encephalon.config;
 
+import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -7,12 +8,22 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.FieldVisitor;
+import org.objectweb.asm.Handle;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 
 import com.example.encephalon.EncephalonMod;
 
@@ -58,11 +69,15 @@ import net.neoforged.neoforge.event.entity.EntityAttributeModificationEvent;
  * damage of a victim farther away is scaled by the same factor, the radius is not changed.</li>
  * <li>DAMAGE: attacks that hurt in another way (arrows, fireballs, sonic boom, ...). The built-in table below names the vanilla
  * ones with their damage; a ranged goal of any other mob is listed as "ranged" with a default that varies.</li>
- * <li>EFFECT: special attacks that do no damage of their own (teleporting, poison, summoning). Listed with a short description,
- * nothing to edit. Modded ones are found by several methods (see moddedNames): goal classes (and what they hold), classes
- * nested in the entity, classes of the mod's jar that carry the mob's name or sit in a package named after it, attack-like
- * methods and animation fields of the entity class.</li>
+ * <li>EFFECT: special attacks that do no damage of their own (teleporting, poison, summoning), and every attack found in a
+ * modded mob. Listed with a description, nothing to edit.</li>
  * </ul>
+ * <b>Modded mobs.</b> Names are not trusted alone. The bytecode of the candidate classes is read (ASM, nothing is loaded or run)
+ * and what the code does is collected: hurts, explodes, fires a fireball, applies Slowness, summons something, teleports,
+ * sets on fire, ... A class that does such things counts as an attack whatever it is called, and the description of the attack
+ * is written from those facts. Candidates are: the mob's goals (and what they hold), classes nested in the mob, classes of the
+ * mod's jar that carry the mob's name, sit in a package named after it, or take the mob as a parameter, methods of the entity
+ * class such as startSlam / castMissile (with everything they call), and animation / attack strings in the entity's code.
  * A mob with no ATTACK_DAMAGE attribute is given a fallback from the size of its hitbox (micro / small / normal / big) as a real
  * attribute, so anything that makes it attack (the editor's category setting, or another mod) does not crash on a missing one.
  */
@@ -95,6 +110,10 @@ public final class DamageDefaults {
 
     /** What a scan found for one mob type. melee is null when the mob has no melee attack of its own. */
     private record Profile(Attack melee, List<Attack> others) {
+    }
+
+    /** A modded attack that was found: the name shown, and what it does (null when nothing could be told). */
+    private record Found(String label, String desc) {
     }
 
     /** Vanilla attacks that hurt in another way than melee, with their damage. */
@@ -137,32 +156,86 @@ public final class DamageDefaults {
     /** Melee damage of vanilla mobs whose hits are not a plain attack damage attribute. */
     private static final Map<String, Double> MELEE_DEFAULTS = Map.of("minecraft:ender_dragon", 10.0);
 
-    /** Words in the name of a modded goal / class / method that mark it as an attack, and words that rule it out. */
+    /**
+     * Words that mark a name as an attack. Matched against whole words of the name (split at capitals, _ and .): a word of up to
+     * 3 letters must be equal, a longer one only has to start with it ("explo" matches "explosion"). So "ram" matches "Ram" but
+     * not "Program", and "rain" does not match "Brain".
+     */
     private static final String[] ATTACK_WORDS = {"attack", "shoot", "spit", "breath", "sting", "blast", "explo", "fireball", "beam",
             "laser", "summon", "cast", "spell", "bite", "slam", "stomp", "roar", "charge", "pounce", "leap", "swoop", "smash",
             "strike", "throw", "lunge", "ram", "teleport", "poison", "action", "ability", "skill", "special",
             "missile", "projectile", "bolt", "nova", "wave", "barrage", "rain", "burst", "pulse", "slash", "swipe", "claw",
             "dash", "dive", "crush", "sweep", "volley", "orb", "meteor", "lightning", "curse", "drain", "shockwave", "quake",
-            "grab", "fling", "hurl", "bomb", "spawn_", "minion", "ultimate", "combo", "rush", "cleave", "impale", "spike"};
+            "grab", "fling", "hurl", "bomb", "minion", "ultimate", "combo", "rush", "cleave", "impale", "spike", "flame", "fire",
+            "blow", "kick", "punch", "pound", "tail", "gaze", "scream", "howl", "bash", "stab", "shatter", "erupt", "vortex"};
+    /** Words that rule a name out (movement, targeting, idle behaviour). Same whole-word matching. */
     private static final String[] NOT_ATTACK_WORDS = {"target", "avoid", "flee", "retreat", "panic", "look", "follow", "wander",
-            "stroll", "float", "swim", "breed", "sleep", "tempt", "eat", "attackable"};
+            "stroll", "float", "swim", "breed", "sleep", "tempt", "eat", "attackable", "hover", "idle", "random", "fly", "move"};
     /** Class names with these words are rendering, networking or registration code, never an attack. */
     private static final String[] NOT_CLASS_WORDS = {"render", "model", "layer", "packet", "message", "event", "sound", "particle",
-            "registry", "register", "handler", "config", "entity", "client", "screen", "gui", "data", "provider", "recipe",
-            "loot", "tag", "mixin", "attribute", "effect", "item", "block", "spawnegg", "egg", "bossbar", "bar"};
+            "registry", "register", "handler", "config", "entity", "client", "screen", "provider", "recipe", "loot", "mixin",
+            "attribute", "item", "block", "egg", "bossbar", "effect"};
+    /** Strings with these words are timers and settings, not attack names. */
+    private static final String[] NOT_STRING_WORDS = {"cooldown", "timer", "tick", "time", "count", "damage", "speed", "range",
+            "delay", "chance", "duration", "length", "radius", "height", "texture", "geo", "key", "tag", "state"};
     private static final int MAX_SPECIAL = 12;
+    private static final int MAX_CANDIDATES = 600;
     /** Goal names that only wrap the real attacks (an "ActionGoal" holding a list of actions): the actions are looked for inside. */
-    private static final String[] WRAPPER_WORDS = {"action", "ability", "skill", "special", "spell"};
+    private static final String[] WRAPPER_WORDS = {"action", "ability", "skill", "special", "spell", "behavior", "behaviour", "phase"};
     /** Names too generic to show as an attack. */
     private static final Set<String> GENERIC = Set.of("action", "ability", "skill", "special", "attack", "spell", "boss", "custom",
-            "cooldown", "mob", "entity", "default", "phase", "move", "ai", "task");
+            "cooldown", "mob", "entity", "default", "phase", "move", "ai", "task", "behavior", "behaviour");
     /** Verbs an entity class's attack methods often start with. */
     private static final String[] METHOD_PREFIXES = {"do", "start", "perform", "cast", "use", "shoot", "summon", "trigger",
             "begin", "execute", "fire", "launch", "spawn", "throw", "unleash", "release", "tryto", "try"};
     /** Package segments that usually hold a mod's attacks / AI. */
-    private static final String[] ATTACK_PACKAGES = {".goal", ".goals", ".ai", ".attack", ".attacks", ".ability", ".abilities",
-            ".action", ".actions", ".move", ".moves", ".skill", ".skills", ".spell", ".spells", ".behavior", ".behaviour",
-            ".behaviors", ".behaviours", ".phase", ".phases"};
+    private static final String[] ATTACK_PACKAGES = {".goal", ".ai", ".attack", ".ability", ".abilities", ".action", ".move",
+            ".skill", ".spell", ".behavior", ".behaviour", ".phase"};
+
+    /** Engine projectile / area classes, by simple name, with how they read in a description. */
+    private static final Map<String, String> ENGINE_THINGS = Map.ofEntries(
+            Map.entry("LargeFireball", "large fireballs"), Map.entry("SmallFireball", "small fireballs"),
+            Map.entry("DragonFireball", "dragon fireballs"), Map.entry("WitherSkull", "wither skulls"),
+            Map.entry("Arrow", "arrows"), Map.entry("SpectralArrow", "spectral arrows"), Map.entry("ThrownTrident", "tridents"),
+            Map.entry("ShulkerBullet", "shulker bullets"), Map.entry("Snowball", "snowballs"), Map.entry("ThrownPotion", "potions"),
+            Map.entry("ThrownEgg", "eggs"), Map.entry("LlamaSpit", "spit"), Map.entry("WindCharge", "wind charges"),
+            Map.entry("BreezeWindCharge", "wind charges"), Map.entry("EvokerFangs", "evoker fangs"),
+            Map.entry("LightningBolt", "lightning bolts"), Map.entry("AreaEffectCloud", "lingering effect clouds"),
+            Map.entry("PrimedTnt", "primed TNT"), Map.entry("FireworkRocketEntity", "firework rockets"));
+
+    /** MobEffects field names that read differently in the game. */
+    private static final Map<String, String> EFFECT_NAMES = Map.ofEntries(
+            Map.entry("MOVEMENT_SLOWDOWN", "Slowness"), Map.entry("MOVEMENT_SPEED", "Speed"),
+            Map.entry("DIG_SLOWDOWN", "Mining Fatigue"), Map.entry("DIG_SPEED", "Haste"),
+            Map.entry("DAMAGE_BOOST", "Strength"), Map.entry("DAMAGE_RESISTANCE", "Resistance"),
+            Map.entry("JUMP", "Jump Boost"), Map.entry("HARM", "Instant Damage"), Map.entry("HEAL", "Instant Health"),
+            Map.entry("CONFUSION", "Nausea"), Map.entry("UNLUCK", "Bad Luck"));
+
+    /** What a name suggests when the code says nothing. */
+    private static final String[][] NAME_HINTS = {
+            {"slam", "a heavy slam, probably damaging and knocking back nearby targets"},
+            {"stomp", "a ground stomp that probably hits everything near its feet"},
+            {"smash", "a smashing blow"}, {"crush", "a crushing blow"},
+            {"roar", "a roar, probably pushing back or weakening nearby targets"},
+            {"scream", "a scream, probably hurting or pushing back nearby targets"},
+            {"howl", "a howl, probably affecting nearby targets"},
+            {"charge", "a charge at its target"}, {"dash", "a fast dash at its target"}, {"rush", "a rush at its target"},
+            {"leap", "a leap onto its target"}, {"pounce", "a pounce onto its target"},
+            {"dive", "a dive at its target"}, {"swoop", "a swooping dive at its target"},
+            {"beam", "a beam fired at its target"}, {"laser", "a laser fired at its target"},
+            {"missile", "missiles fired at its target"}, {"fireball", "fireballs fired at its target"},
+            {"projectile", "projectiles fired at its target"}, {"volley", "a volley of projectiles"},
+            {"barrage", "a barrage of projectiles"}, {"shoot", "shots fired at its target"},
+            {"summon", "summoning other creatures to fight for it"}, {"minion", "calling in minions"},
+            {"teleport", "teleporting"}, {"drain", "draining health from its target"},
+            {"nova", "an expanding blast around itself"}, {"pulse", "a pulse around itself"},
+            {"shockwave", "a shockwave around itself"}, {"quake", "a quake that shakes the ground around it"},
+            {"claw", "a clawing strike"}, {"slash", "a slashing strike"}, {"swipe", "a sweeping swipe"},
+            {"bite", "a bite"}, {"sting", "a sting"}, {"poison", "a poisoning attack"}, {"curse", "a curse on its target"},
+            {"lightning", "calling down lightning"}, {"meteor", "meteors raining down"}, {"explo", "an explosion"},
+            {"bomb", "a bomb"}, {"breath", "a breath attack"}, {"flame", "flames"}, {"fire", "fire"}};
+
+    private static final Pattern DESC_REF = Pattern.compile("L([^;]+);");
 
     /** Types that had no attack damage and were given the size fallback. */
     private static final Map<EntityType<?>, Double> FALLBACK = new ConcurrentHashMap<>();
@@ -170,6 +243,8 @@ public final class DamageDefaults {
     private static final Map<EntityType<?>, Profile> PROFILES = new ConcurrentHashMap<>();
     /** Class names of one mod's jar, per mod id (read once from the mod's scan data, nothing is loaded). */
     private static final Map<String, List<String>> MOD_CLASSES = new ConcurrentHashMap<>();
+    /** Bytecode facts per class name (class files are read once). */
+    private static final Map<String, ClassInfo> CLASS_INFO = new ConcurrentHashMap<>();
     private static final Field CREEPER_RADIUS = radiusField();
 
     private DamageDefaults() {
@@ -323,6 +398,7 @@ public final class DamageDefaults {
     private static Profile scan(MinecraftServer server, EntityType<?> t) {
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(t).toString();
         boolean vanilla = id.startsWith("minecraft:");
+        String namespace = id.substring(0, id.indexOf(':'));
         List<Attack> others = new ArrayList<>();
         List<Attack> extra = EXTRAS.get(id);
         if (extra != null) {
@@ -345,13 +421,17 @@ public final class DamageDefaults {
         boolean isMob = false;
         double blast = 0.0;
         List<String> goalClasses = new ArrayList<>();
-        // Found names, in order, without repeats (a name found by two methods is listed once).
-        Map<String, String> found = new java.util.LinkedHashMap<>();
+        Map<String, Found> found = new LinkedHashMap<>();
         Entity e = null;
+        Class<?> entityClass = null;
         try {
             e = t.create(server.overworld());
+            if (e != null) {
+                entityClass = e.getClass();
+            }
             if (e instanceof Mob mob) {
                 isMob = true;
+                List<String> mods = vanilla ? List.of() : classesOfMod(namespace);
                 for (WrappedGoal w : mob.goalSelector.getAvailableGoals()) {
                     Goal g = w.getGoal();
                     if (g instanceof MeleeAttackGoal) {
@@ -363,8 +443,10 @@ public final class DamageDefaults {
                         swell = true;
                     } else if (!vanilla) {
                         goalClasses.add(g.getClass().getName());
-                        for (String name : specialNames(g)) {
-                            addFound(found, name);
+                        try {
+                            goalFinds(g, mods, found);
+                        } catch (RuntimeException | LinkageError ex) {
+                            // a goal that cannot be read: skip it
                         }
                     }
                 }
@@ -372,33 +454,22 @@ public final class DamageDefaults {
                     blast = Math.round(explosionMax(mob));
                 }
             }
-            if (!vanilla && e != null) {
-                for (String name : moddedNames(t, e.getClass(), id)) {
-                    addFound(found, name);
-                }
-            } else if (!vanilla) {
-                for (String name : moddedNames(t, null, id)) {
-                    addFound(found, name);
-                }
-            }
         } catch (RuntimeException | LinkageError ex) {
             EncephalonMod.LOGGER.warn("Mob Editor: could not work out the attacks of {}", id, ex);
-            if (!vanilla && found.isEmpty()) {
-                try {
-                    for (String name : moddedNames(t, null, id)) {
-                        addFound(found, name);
-                    }
-                } catch (RuntimeException | LinkageError ex2) {
-                    // nothing more to try
-                }
-            }
         } finally {
             if (e != null) {
                 e.discard();
             }
         }
         if (!vanilla) {
-            EncephalonMod.LOGGER.info("Mob Editor attacks: {} has goals {} -> found {}", id, goalClasses, found.values());
+            // Not tied to the mob being creatable: even without an instance the mod's jar can be searched.
+            try {
+                moddedFinds(entityClass, namespace, id, found);
+            } catch (RuntimeException | LinkageError ex) {
+                EncephalonMod.LOGGER.warn("Mob Editor: could not search the code of {} for attacks", id, ex);
+            }
+            EncephalonMod.LOGGER.info("Mob Editor attacks: {} has goals {} -> found {}", id, goalClasses,
+                    found.values().stream().map(Found::label).toList());
         }
         if (swell) {
             others.add(0, new Attack(EXPLOSION, blast, DamageTypes.EXPLOSION, Kind.EXPLOSION, null));
@@ -407,11 +478,9 @@ public final class DamageDefaults {
         if (ranged && extra == null && special == null) {
             others.add(new Attack(RANGED, -1, null, Kind.DAMAGE, null));
         }
-        for (Map.Entry<String, String> f : found.entrySet()) {
-            if (others.size() >= MAX_SPECIAL + 4) {
-                break;
-            }
-            others.add(new Attack("special_" + f.getKey().replaceAll("[^a-z0-9]+", "_"), -1, null, Kind.EFFECT, f.getValue()));
+        for (Map.Entry<String, Found> f : found.entrySet()) {
+            others.add(new Attack("special_" + f.getKey().replaceAll("[^a-z0-9]+", "_"), -1, null, Kind.EFFECT,
+                    f.getValue().label(), f.getValue().desc()));
         }
         if (!vanilla && others.isEmpty() && EncephalonConfig.isQuiet(t)) {
             // A modded boss whose attacks live in the mod's own code: say so instead of showing only a made-up default.
@@ -431,18 +500,27 @@ public final class DamageDefaults {
         return new Profile(melee, List.copyOf(others));
     }
 
-    private static void addFound(Map<String, String> found, String name) {
-        if (name == null || name.isBlank() || found.size() >= MAX_SPECIAL) {
+    private static void addFound(Map<String, Found> found, String label, String desc) {
+        if (label == null || label.isBlank()) {
             return;
         }
-        found.putIfAbsent(name.toLowerCase(Locale.ROOT).trim(), name.trim());
+        String key = label.toLowerCase(Locale.ROOT).trim();
+        Found old = found.get(key);
+        if (old == null) {
+            if (found.size() < MAX_SPECIAL) {
+                found.put(key, new Found(label.trim(), desc));
+            }
+        } else if (old.desc() == null && desc != null) {
+            found.put(key, new Found(old.label(), desc));
+        }
     }
 
     private static boolean isEngine(String cn) {
         return cn.startsWith("java.") || cn.startsWith("javax.") || cn.startsWith("jdk.") || cn.startsWith("sun.")
                 || cn.startsWith("net.minecraft.") || cn.startsWith("net.neoforged.") || cn.startsWith("com.mojang.")
                 || cn.startsWith("kotlin.") || cn.startsWith("org.slf4j.") || cn.startsWith("it.unimi.") || cn.startsWith("com.google.")
-                || cn.startsWith("software.bernie.") || cn.startsWith("org.joml.") || cn.startsWith("org.objectweb.");
+                || cn.startsWith("software.bernie.") || cn.startsWith("org.joml.") || cn.startsWith("org.objectweb.")
+                || cn.startsWith("com.example.encephalon.");
     }
 
     /** The plain class name ("MissileAction"), or null for anonymous classes and lambdas. */
@@ -454,13 +532,35 @@ public final class DamageDefaults {
         return n;
     }
 
-    private static boolean hasWord(String lower, String[] words) {
-        for (String w : words) {
-            if (lower.contains(w)) {
-                return true;
+    // ------------------------------------------------------------------ names
+
+    /** Lower-case words of a name, split at capitals, digits-to-letters and any non-alphanumeric. */
+    private static String[] tokens(String raw) {
+        return raw.replaceAll("(?<=[a-z0-9])(?=[A-Z])", " ").replaceAll("(?<=[A-Z])(?=[A-Z][a-z])", " ")
+                .toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
+    }
+
+    /** True if a whole word of the name equals (3 letters or fewer) or starts with (longer) one of the words. */
+    private static boolean tokenHit(String raw, String[] words) {
+        for (String t : tokens(raw)) {
+            if (t.isEmpty()) {
+                continue;
+            }
+            for (String w : words) {
+                if (w.length() <= 3 ? t.equals(w) : t.startsWith(w)) {
+                    return true;
+                }
             }
         }
         return false;
+    }
+
+    private static boolean looksAttack(String raw) {
+        return tokenHit(raw, ATTACK_WORDS);
+    }
+
+    private static boolean notAttack(String raw) {
+        return tokenHit(raw, NOT_ATTACK_WORDS);
     }
 
     /** "FireBreathGoal" -> "Fire Breath", "MissileAction" -> "Missile", "SLAM_ATTACK" -> "Slam Attack". */
@@ -471,9 +571,9 @@ public final class DamageDefaults {
         if (n.endsWith("Action") && n.length() > 6) {
             n = n.substring(0, n.length() - 6);
         }
-        if (n.indexOf('_') >= 0 || n.equals(n.toUpperCase(Locale.ROOT))) {
+        if (n.indexOf('_') >= 0 || n.indexOf('.') >= 0 || n.equals(n.toUpperCase(Locale.ROOT)) || n.equals(n.toLowerCase(Locale.ROOT))) {
             StringBuilder sb = new StringBuilder();
-            for (String part : n.toLowerCase(Locale.ROOT).split("_+")) {
+            for (String part : n.toLowerCase(Locale.ROOT).split("[_.\\- ]+")) {
                 if (part.isEmpty()) {
                     continue;
                 }
@@ -492,51 +592,489 @@ public final class DamageDefaults {
         return GENERIC.contains(readable.toLowerCase(Locale.ROOT).replace(" ", ""));
     }
 
-    /**
-     * Readable names for a modded goal that looks like an attack. A goal named after an attack gives its own name. A goal that
-     * only wraps actions (an ActionGoal) is searched: the classes of the objects it holds, two levels down, are the attacks.
-     * Any other modded goal is searched one level down too, keeping only the held objects whose class names look like attacks
-     * (a "BossAttackGoal" holding a list of AttackPattern objects, say).
-     */
-    private static List<String> specialNames(Goal g) {
-        String raw = g.getClass().getName();
-        if (isEngine(raw)) {
-            return List.of();
-        }
-        String n = simpleName(raw);
-        if (n == null) {
-            return List.of();
-        }
-        String lower = n.toLowerCase(Locale.ROOT);
-        if (hasWord(lower, NOT_ATTACK_WORDS)) {
-            return List.of();
-        }
-        boolean attackLike = hasWord(lower, ATTACK_WORDS);
-        List<String> out = new ArrayList<>();
-        if (attackLike) {
-            String base = readable(n);
-            if (!genericName(base)) {
-                out.add(base);
+    private static String stripEntityWord(String s) {
+        String lower = s.toLowerCase(Locale.ROOT);
+        return lower.endsWith("entity") && s.length() > 6 ? s.substring(0, s.length() - 6) : s;
+    }
+
+    /** Removes the mob's own name from an attack name ("Lich Missile" -> "Missile"), if something is left. */
+    private static String cleanName(String readable, String... keys) {
+        String result = readable;
+        for (String k : keys) {
+            if (k == null || k.length() < 3) {
+                continue;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (String word : result.split(" ")) {
+                if (!word.toLowerCase(Locale.ROOT).equals(k)) {
+                    if (sb.length() > 0) {
+                        sb.append(' ');
+                    }
+                    sb.append(word);
+                }
+            }
+            if (sb.length() >= 3) {
+                result = sb.toString();
             }
         }
-        boolean wrapper = hasWord(lower, WRAPPER_WORDS);
-        Set<String> dug = new LinkedHashSet<>();
-        dive(g, wrapper ? 2 : 1, wrapper ? 2 : 1, !wrapper, dug, Collections.newSetFromMap(new IdentityHashMap<>()));
-        for (String d : dug) {
-            if (!out.contains(d)) {
-                out.add(d);
+        return result;
+    }
+
+    private static boolean startsWithPrefix(String lower) {
+        for (String p : METHOD_PREFIXES) {
+            if (lower.startsWith(p) && lower.length() > p.length()) {
+                return true;
             }
+        }
+        return false;
+    }
+
+    private static String stripPrefix(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        for (String p : METHOD_PREFIXES) {
+            if (lower.startsWith(p) && name.length() > p.length() && Character.isUpperCase(name.charAt(p.length()))) {
+                return name.substring(p.length());
+            }
+        }
+        return name;
+    }
+
+    /** The attack name in a string constant ("animation.boss.slam" -> "Slam"), or null if the string is not one. */
+    private static String attackString(String s) {
+        if (s.length() < 3 || s.length() > 40 || !s.matches("[a-zA-Z][a-zA-Z0-9_.\\- ]*")) {
+            return null;
+        }
+        String last = s.substring(s.lastIndexOf('.') + 1);
+        if (last.length() < 3 || !looksAttack(last) || notAttack(last) || tokenHit(s, NOT_STRING_WORDS)) {
+            return null;
+        }
+        String r = readable(last);
+        return r.length() < 3 || genericName(r) ? null : r;
+    }
+
+    // ------------------------------------------------------------------ bytecode facts
+
+    /** What a piece of code does, read from its bytecode (nothing is run). */
+    private static final class Facts {
+        boolean hurts;
+        boolean explodes;
+        boolean fire;
+        boolean knock;
+        boolean teleport;
+        boolean heal;
+        boolean area;
+        boolean blocks;
+        boolean shoots;
+        boolean spawnsAny;
+        final Set<String> effects = new LinkedHashSet<>();
+        final Set<String> things = new LinkedHashSet<>();
+        final Set<String> spawns = new LinkedHashSet<>();
+        final Set<String> strings = new LinkedHashSet<>();
+        /** Methods of the same class this code calls (so a method can be followed into its helpers). */
+        final Set<String> calls = new LinkedHashSet<>();
+
+        void merge(Facts o) {
+            hurts |= o.hurts;
+            explodes |= o.explodes;
+            fire |= o.fire;
+            knock |= o.knock;
+            teleport |= o.teleport;
+            heal |= o.heal;
+            area |= o.area;
+            blocks |= o.blocks;
+            shoots |= o.shoots;
+            spawnsAny |= o.spawnsAny;
+            effects.addAll(o.effects);
+            things.addAll(o.things);
+            spawns.addAll(o.spawns);
+            strings.addAll(o.strings);
+        }
+
+        /** Does something that only an attack does. Knockback and area scans alone do not count (movement code has them too). */
+        boolean offensive() {
+            return hurts || explodes || fire || shoots || spawnsAny || !effects.isEmpty() || !things.isEmpty() || !spawns.isEmpty();
+        }
+    }
+
+    private static final class ClassInfo {
+        final String internal;
+        String superName;
+        final Map<String, Facts> methods = new LinkedHashMap<>();
+        /** Every class named in a field or method type, or used by an instruction. */
+        final Set<String> refs = new HashSet<>();
+
+        ClassInfo(String name) {
+            this.internal = name.replace('.', '/');
+        }
+    }
+
+    private static void descRefs(Set<String> refs, String desc) {
+        Matcher m = DESC_REF.matcher(desc);
+        while (m.find()) {
+            refs.add(m.group(1));
+        }
+    }
+
+    private static ClassInfo classInfo(String cn, ClassLoader cl) {
+        ClassInfo cached = CLASS_INFO.get(cn);
+        if (cached != null) {
+            return cached;
+        }
+        ClassInfo ci = read(cn, cl);
+        CLASS_INFO.put(cn, ci);
+        return ci;
+    }
+
+    private static ClassInfo read(String cn, ClassLoader cl) {
+        ClassInfo ci = new ClassInfo(cn);
+        ClassLoader use = cl != null ? cl : DamageDefaults.class.getClassLoader();
+        try (InputStream in = use.getResourceAsStream(cn.replace('.', '/') + ".class")) {
+            if (in == null) {
+                return ci;
+            }
+            ClassReader reader = new ClassReader(in);
+            reader.accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public void visit(int version, int access, String name, String signature, String superName, String[] interfaces) {
+                    ci.superName = superName;
+                }
+
+                @Override
+                public FieldVisitor visitField(int access, String name, String desc, String signature, Object value) {
+                    descRefs(ci.refs, desc);
+                    return null;
+                }
+
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
+                    descRefs(ci.refs, desc);
+                    Facts f = ci.methods.computeIfAbsent(name, k -> new Facts());
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visitMethodInsn(int opcode, String owner, String mname, String mdesc, boolean itf) {
+                            ci.refs.add(owner);
+                            descRefs(ci.refs, mdesc);
+                            if (owner.equals(ci.internal)) {
+                                f.calls.add(mname);
+                            }
+                            methodHit(f, mname);
+                        }
+
+                        @Override
+                        public void visitFieldInsn(int opcode, String owner, String fname, String fdesc) {
+                            ci.refs.add(owner);
+                            if (opcode == Opcodes.GETSTATIC) {
+                                fieldHit(f, owner, fname);
+                            }
+                        }
+
+                        @Override
+                        public void visitTypeInsn(int opcode, String type) {
+                            ci.refs.add(type);
+                            if (opcode == Opcodes.NEW) {
+                                newHit(f, type, ci.internal);
+                            }
+                        }
+
+                        @Override
+                        public void visitLdcInsn(Object v) {
+                            if (v instanceof String s && f.strings.size() < 10 && attackString(s) != null) {
+                                f.strings.add(s);
+                            }
+                        }
+
+                        @Override
+                        public void visitInvokeDynamicInsn(String dname, String ddesc, Handle bsm, Object... bsmArgs) {
+                            for (Object a : bsmArgs) {
+                                if (a instanceof Handle h && h.getOwner().equals(ci.internal)) {
+                                    f.calls.add(h.getName());
+                                }
+                            }
+                        }
+                    };
+                }
+            }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        } catch (Exception | LinkageError ex) {
+            // class not readable: no facts
+        }
+        return ci;
+    }
+
+    private static void methodHit(Facts f, String name) {
+        switch (name) {
+            case "explode" -> f.explodes = true;
+            case "hurt", "doHurtTarget" -> f.hurts = true;
+            case "igniteForSeconds", "setRemainingFireTicks", "setSecondsOnFire", "setSecondsOnFire$" -> f.fire = true;
+            case "setDeltaMovement", "push", "hurtMarked", "knockback", "addDeltaMovement" -> f.knock = true;
+            case "heal", "setHealth" -> f.heal = true;
+            case "getEntitiesOfClass", "getEntities", "getNearbyEntities" -> f.area = true;
+            case "addFreshEntity", "addEntity" -> f.spawnsAny = true;
+            case "shoot", "shootFromRotation" -> f.shoots = true;
+            case "setBlock", "destroyBlock", "removeBlock", "setBlockAndUpdate" -> f.blocks = true;
+            default -> {
+                if (name.toLowerCase(Locale.ROOT).contains("teleport")) {
+                    f.teleport = true;
+                }
+            }
+        }
+    }
+
+    private static String effectName(String field) {
+        String n = EFFECT_NAMES.get(field);
+        return n != null ? n : readable(field);
+    }
+
+    private static void fieldHit(Facts f, String owner, String name) {
+        if (owner.equals("net/minecraft/world/effect/MobEffects")) {
+            f.effects.add(effectName(name));
+        } else if (owner.equals("net/minecraft/world/entity/EntityType")) {
+            if (!name.equals("PLAYER")) {
+                f.spawns.add(readable(name).toLowerCase(Locale.ROOT));
+            }
+        } else if (!owner.startsWith("net/minecraft/") && !owner.startsWith("java/")) {
+            String so = owner.substring(owner.lastIndexOf('/') + 1).toLowerCase(Locale.ROOT);
+            if (so.contains("entit")) {
+                f.spawns.add(readable(name).toLowerCase(Locale.ROOT));
+            } else if (so.contains("effect") && !so.contains("particle")) {
+                f.effects.add(readable(name));
+            }
+        }
+    }
+
+    private static void newHit(Facts f, String type, String own) {
+        String simple = type.substring(type.lastIndexOf('/') + 1);
+        if (type.startsWith("net/minecraft/")) {
+            String p = ENGINE_THINGS.get(simple);
+            if (p != null) {
+                f.things.add(p);
+            }
+            return;
+        }
+        if (isEngine(type.replace('/', '.')) || type.equals(own) || type.startsWith(own + "$") || simple.indexOf('$') >= 0) {
+            return;
+        }
+        String ls = simple.toLowerCase(Locale.ROOT);
+        if (ls.contains("goal") || ls.contains("packet") || ls.contains("event") || ls.contains("render") || ls.contains("exception")
+                || ls.contains("builder") || ls.contains("supplier")) {
+            return;
+        }
+        if (ls.contains("entity") || ls.contains("projectile") || looksAttack(simple)) {
+            String r = readable(stripEntityWord(simple)).toLowerCase(Locale.ROOT);
+            if (r.length() >= 3) {
+                f.spawns.add(r);
+            }
+        }
+    }
+
+    private static String join(Set<String> set) {
+        List<String> l = new ArrayList<>(set);
+        if (l.size() > 4) {
+            l = l.subList(0, 4);
+        }
+        if (l.size() == 1) {
+            return l.get(0);
+        }
+        return String.join(", ", l.subList(0, l.size() - 1)) + " and " + l.get(l.size() - 1);
+    }
+
+    /** A sentence or two about what the code does, or null if nothing recognisable was found. */
+    private static String describeFacts(Facts f) {
+        List<String> s = new ArrayList<>();
+        if (!f.things.isEmpty()) {
+            s.add("Uses " + join(f.things) + ".");
+        } else if (f.shoots) {
+            s.add("Fires projectiles.");
+        }
+        if (!f.spawns.isEmpty()) {
+            s.add("Creates or summons " + join(f.spawns) + ".");
+        } else if (f.spawnsAny) {
+            s.add("Creates extra entities.");
+        }
+        if (f.explodes) {
+            s.add("Causes an explosion.");
+        }
+        if (f.hurts) {
+            s.add("Damages what it hits.");
+        }
+        if (!f.effects.isEmpty()) {
+            s.add("Applies " + join(f.effects) + ".");
+        }
+        if (f.fire) {
+            s.add("Sets targets on fire.");
+        }
+        if (f.knock) {
+            s.add("Pushes or launches (knockback or a dash).");
+        }
+        if (f.teleport) {
+            s.add("Teleports.");
+        }
+        if (f.heal) {
+            s.add("Heals or changes its own health.");
+        }
+        if (f.area) {
+            s.add("Affects entities in an area around it.");
+        }
+        if (f.blocks) {
+            s.add("Breaks or places blocks.");
+        }
+        if (s.isEmpty()) {
+            return null;
+        }
+        String out = String.join(" ", s);
+        return out.length() > 230 ? out.substring(0, 227) + "..." : out;
+    }
+
+    private static String hintFor(String name) {
+        for (String[] h : NAME_HINTS) {
+            if (tokenHit(name, new String[] {h[0]})) {
+                return h[1];
+            }
+        }
+        return null;
+    }
+
+    /** What to tell about an attack: what its code does, else what its name suggests, else nothing. */
+    private static String describe(Facts f, String name) {
+        String d = describeFacts(f);
+        if (d != null) {
+            return d + " (read from its code)";
+        }
+        String h = name == null ? null : hintFor(name);
+        return h == null ? null : "Guessed from its name: " + h + ".";
+    }
+
+    private static String labelFromFacts(Facts f) {
+        if (!f.things.isEmpty() || f.shoots) {
+            return "Projectile Attack";
+        }
+        if (f.explodes) {
+            return "Explosion Attack";
+        }
+        if (!f.spawns.isEmpty() || f.spawnsAny) {
+            return "Summon";
+        }
+        if (!f.effects.isEmpty()) {
+            return "Effect Attack";
+        }
+        if (f.fire) {
+            return "Fire Attack";
+        }
+        return "Strike";
+    }
+
+    /** The class and the modded classes it extends. */
+    private static List<ClassInfo> chain(String cn, ClassLoader cl) {
+        List<ClassInfo> out = new ArrayList<>();
+        String cur = cn;
+        for (int i = 0; i < 6 && cur != null && !isEngine(cur); i++) {
+            ClassInfo ci = classInfo(cur, cl);
+            out.add(ci);
+            cur = ci.superName == null ? null : ci.superName.replace('/', '.');
         }
         return out;
     }
 
+    /** Everything a class does: all its methods, its modded superclasses, and the classes nested in it. */
+    private static Facts classFacts(String cn, ClassLoader cl, List<String> modClasses) {
+        Facts all = new Facts();
+        for (ClassInfo ci : chain(cn, cl)) {
+            for (Facts f : ci.methods.values()) {
+                all.merge(f);
+            }
+        }
+        int nested = 0;
+        for (String mc : modClasses) {
+            if (mc.startsWith(cn + "$") && nested++ < 12) {
+                for (ClassInfo ci : chain(mc, cl)) {
+                    for (Facts f : ci.methods.values()) {
+                        all.merge(f);
+                    }
+                }
+            }
+        }
+        return all;
+    }
+
+    /** What one method does, following the calls it makes inside the class (and its modded superclasses). */
+    private static void closure(List<ClassInfo> chain, String method, int depth, Set<String> seen, Facts out) {
+        if (depth < 0 || !seen.add(method)) {
+            return;
+        }
+        for (ClassInfo ci : chain) {
+            Facts f = ci.methods.get(method);
+            if (f != null) {
+                out.merge(f);
+                for (String c : new ArrayList<>(f.calls)) {
+                    closure(chain, c, depth - 1, seen, out);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ modded mobs: finding attacks
+
     /**
-     * Collects readable class names of the mod's objects held (in fields, lists) by o, down to the given depth.
-     * top is the depth the goal itself is at (its own name is not collected). onlyAttackLike keeps just the names that
-     * contain an attack word.
+     * Adds the attack a class stands for, if it is one. A class counts when its name looks like an attack, or (above all) when
+     * its code does something only an attack does. Anonymous classes are named after what they do. needSignal false
+     * accepts any name that is not ruled out (for the contents of an "ActionGoal").
      */
-    private static void dive(Object o, int depth, int top, boolean onlyAttackLike, Set<String> out, Set<Object> seen) {
-        if (o == null || depth < 0 || out.size() >= MAX_SPECIAL || !seen.add(o) || o instanceof Entity || o instanceof Level) {
+    private static void addClassFind(Map<String, Found> found, String cn, ClassLoader cl, List<String> mods,
+                                     boolean needSignal, String... keys) {
+        if (isEngine(cn)) {
+            return;
+        }
+        String simple = simpleName(cn);
+        Facts f = classFacts(cn, cl, mods);
+        if (simple == null) {
+            if (f.offensive()) {
+                String label = labelFromFacts(f);
+                addFound(found, label, describe(f, null));
+            }
+            return;
+        }
+        if (notAttack(simple)) {
+            return;
+        }
+        boolean attackName = looksAttack(simple);
+        if (needSignal && !attackName && !f.offensive()) {
+            return;
+        }
+        String r = cleanName(readable(simple), keys);
+        if (r.length() < 3 || genericName(r)) {
+            if (!f.offensive()) {
+                return;
+            }
+            r = labelFromFacts(f);
+        }
+        addFound(found, r, describe(f, simple));
+        int n = 0;
+        for (String s : f.strings) {
+            String name = attackString(s);
+            if (name != null && n++ < 3) {
+                addFound(found, name, describe(new Facts(), name));
+            }
+        }
+    }
+
+    private static void goalFinds(Goal g, List<String> mods, Map<String, Found> found) {
+        String raw = g.getClass().getName();
+        if (isEngine(raw)) {
+            return;
+        }
+        ClassLoader cl = g.getClass().getClassLoader();
+        String n = simpleName(raw);
+        boolean wrapper = n != null && tokenHit(n, WRAPPER_WORDS);
+        addClassFind(found, raw, cl, mods, true);
+        Set<String> held = new LinkedHashSet<>();
+        dive(g, wrapper ? 2 : 1, wrapper ? 2 : 1, held, Collections.newSetFromMap(new IdentityHashMap<>()));
+        for (String hc : held) {
+            addClassFind(found, hc, cl, mods, !wrapper);
+        }
+    }
+
+    /** Collects the class names of the mod's objects held (in fields, lists, maps) by o, down to the given depth. */
+    private static void dive(Object o, int depth, int top, Set<String> out, Set<Object> seen) {
+        if (o == null || depth < 0 || out.size() >= 40 || !seen.add(o) || o instanceof Entity || o instanceof Level) {
             return;
         }
         String cn = o.getClass().getName();
@@ -544,16 +1082,7 @@ public final class DamageDefaults {
             return;
         }
         if (depth < top) {
-            String n = simpleName(cn);
-            if (n != null) {
-                String lower = n.toLowerCase(Locale.ROOT);
-                if (!hasWord(lower, NOT_ATTACK_WORDS) && (!onlyAttackLike || hasWord(lower, ATTACK_WORDS))) {
-                    String r = readable(n);
-                    if (r.length() >= 3 && !genericName(r)) {
-                        out.add(r);
-                    }
-                }
-            }
+            out.add(cn);
         }
         if (depth == 0) {
             return;
@@ -578,7 +1107,7 @@ public final class DamageDefaults {
                             if (count++ >= 20) {
                                 break;
                             }
-                            dive(x, depth - 1, top, onlyAttackLike, out, seen);
+                            dive(x, depth - 1, top, out, seen);
                         }
                     } else if (v instanceof Map<?, ?> map) {
                         int count = 0;
@@ -586,10 +1115,10 @@ public final class DamageDefaults {
                             if (count++ >= 20) {
                                 break;
                             }
-                            dive(x, depth - 1, top, onlyAttackLike, out, seen);
+                            dive(x, depth - 1, top, out, seen);
                         }
                     } else {
-                        dive(v, depth - 1, top, onlyAttackLike, out, seen);
+                        dive(v, depth - 1, top, out, seen);
                     }
                 } catch (ReflectiveOperationException | RuntimeException | LinkageError ex) {
                     // a field that cannot be read: skip it
@@ -598,216 +1127,163 @@ public final class DamageDefaults {
         }
     }
 
-    // ------------------------------------------------------------------ modded mobs: everything beyond the goal list
+    private static boolean notClass(String simple) {
+        return tokenHit(simple, NOT_CLASS_WORDS);
+    }
+
+    private static boolean goalish(String simple) {
+        return tokenHit(simple, new String[] {"goal", "action", "attack", "ability", "behavior", "behaviour", "skill", "spell", "phase"});
+    }
 
     /**
-     * Attack names for a modded mob, found without any table and without a goal list (many boss mods run their attacks from
-     * their own state machine, a brain, or a GeckoLib controller, so the goal list says nothing):
-     * <ol>
-     * <li>classes of the mod's jar (read from its scan data, nothing is loaded) that carry the mob's name or are nested in the
-     * mob's class, or that sit in a package named after the mob, and whose names look like attacks;</li>
-     * <li>methods of the entity class (and its modded superclasses) like startSlam / performLaserBeam / castMissile;</li>
-     * <li>fields of the entity class that hold an animation and are named like an attack (SLAM_ATTACK, laserBeamAnim);</li>
-     * <li>classes declared inside the entity class.</li>
-     * </ol>
-     * Everything found is only listed (nothing to edit); the config option extraAttacks overrides any miss or wrong guess.
+     * Attacks of a modded mob that its goal list does not show (many boss mods run their attacks from a state machine, a brain
+     * or an animation controller):
+     * 1. classes of the mod's jar (from its scan data, nothing is loaded) that belong to the mob, that is: nested in its class,
+     *    named after it, in a package named after it, or taking it as a parameter or field; they count if they look like an
+     *    attack or do something only an attack does;
+     * 2. methods of the entity class like startSlam / castMissile, with everything they call;
+     * 3. attack-like animation fields and string constants of the entity class (animation triggers).
+     * Anything found is only listed (nothing to edit); extraAttacks in the config overrides any miss or wrong guess.
      */
-    private static List<String> moddedNames(EntityType<?> type, Class<?> entityClass, String id) {
-        Set<String> out = new LinkedHashSet<>();
-        ResourceLocationParts parts = new ResourceLocationParts(id);
+    private static void moddedFinds(Class<?> entityClass, String namespace, String id, Map<String, Found> found) {
+        String path = id.substring(id.indexOf(':') + 1).toLowerCase(Locale.ROOT).replace("_", "");
         String ownClass = entityClass == null ? "" : entityClass.getName();
-        String classKey = entityClass == null ? "" : stripEntityWord(entityClass.getSimpleName().toLowerCase(Locale.ROOT));
+        String classKey = entityClass == null ? "" : stripEntityWord(entityClass.getSimpleName()).toLowerCase(Locale.ROOT);
+        String ownInternal = ownClass.replace('.', '/');
+        ClassLoader cl = entityClass != null ? entityClass.getClassLoader() : DamageDefaults.class.getClassLoader();
+        List<String> mods = classesOfMod(namespace);
 
         // 1. the mod's jar
-        try {
-            for (String cn : classesOfMod(parts.namespace)) {
-                if (cn.equals(ownClass) || out.size() >= MAX_SPECIAL) {
-                    continue;
-                }
-                String simple = simpleName(cn);
-                if (simple == null) {
-                    continue;
-                }
-                String lowerSimple = simple.toLowerCase(Locale.ROOT);
-                String lowerFull = cn.toLowerCase(Locale.ROOT);
-                if (hasWord(lowerSimple, NOT_ATTACK_WORDS) || !hasWord(lowerSimple, ATTACK_WORDS)) {
-                    continue;
-                }
-                if (hasWord(lowerSimple.replace("entity", ""), NOT_CLASS_WORDS) && !hasWord(lowerSimple, WRAPPER_WORDS)) {
-                    if (hasNotClassWord(lowerSimple)) {
-                        continue;
-                    }
-                }
-                boolean nested = !ownClass.isEmpty() && cn.startsWith(ownClass + "$");
-                boolean named = (parts.key.length() >= 3 && lowerFull.contains(parts.key))
-                        || (classKey.length() >= 3 && lowerFull.contains(classKey));
-                boolean packaged = false;
-                if (!named) {
-                    // a package named after the mob, e.g. com.mod.entity.lich.ai.SpellGoal
-                    String pkg = lowerFull.substring(0, Math.max(0, lowerFull.lastIndexOf('.')));
-                    for (String seg : pkg.split("\\.")) {
-                        if ((parts.key.length() >= 3 && seg.equals(parts.key)) || (classKey.length() >= 3 && seg.equals(classKey))) {
-                            packaged = true;
-                            break;
-                        }
-                    }
-                }
-                if (nested || named || packaged) {
-                    String r = cleanName(readable(simple), parts.key, classKey);
-                    if (r.length() >= 3 && !genericName(r)) {
-                        out.add(r);
-                    }
-                }
+        int checked = 0;
+        for (String cn : mods) {
+            if (found.size() >= MAX_SPECIAL || checked >= MAX_CANDIDATES) {
+                break;
             }
-        } catch (RuntimeException | LinkageError ex) {
-            // scan data not available: the other methods still run
-        }
-
-        if (entityClass != null) {
-            // 2 + 3. methods and animation fields of the entity class hierarchy (modded classes only)
-            for (Class<?> k = entityClass; k != null && k != Object.class && !isEngine(k.getName()); k = k.getSuperclass()) {
-                try {
-                    for (Method m : k.getDeclaredMethods()) {
-                        if (m.isSynthetic() || m.isBridge() || m.getName().startsWith("lambda$") || m.getName().contains("$")) {
-                            continue;
-                        }
-                        String name = m.getName();
-                        String lower = name.toLowerCase(Locale.ROOT);
-                        if (!startsWithPrefix(lower) || !hasWord(lower, ATTACK_WORDS) || hasWord(lower, NOT_ATTACK_WORDS)
-                                || lower.startsWith("is") || lower.startsWith("get") || lower.startsWith("set")
-                                || lower.startsWith("can") || lower.startsWith("should") || lower.startsWith("has")
-                                || lower.contains("hurt") || lower.contains("target")) {
-                            continue;
-                        }
-                        String r = readable(stripPrefix(name));
-                        if (r.length() >= 3 && !genericName(r) && out.size() < MAX_SPECIAL) {
-                            out.add(r);
-                        }
-                    }
-                    for (Field f : k.getDeclaredFields()) {
-                        String tn = f.getType().getSimpleName().toLowerCase(Locale.ROOT);
-                        String name = f.getName();
-                        String lower = name.toLowerCase(Locale.ROOT);
-                        if (!(tn.contains("animation") || tn.contains("animstate")) || !hasWord(lower, ATTACK_WORDS)
-                                || hasWord(lower, NOT_ATTACK_WORDS)) {
-                            continue;
-                        }
-                        String r = readable(name.replaceAll("(?i)(anim|animation|state)$", ""));
-                        if (r.length() >= 3 && !genericName(r) && out.size() < MAX_SPECIAL) {
-                            out.add(r);
-                        }
-                    }
-                    // 4. classes declared inside the entity class
-                    for (Class<?> inner : k.getDeclaredClasses()) {
-                        String n = simpleName(inner.getName());
-                        if (n == null) {
-                            continue;
-                        }
-                        String lower = n.toLowerCase(Locale.ROOT);
-                        if (hasWord(lower, ATTACK_WORDS) && !hasWord(lower, NOT_ATTACK_WORDS) && !hasNotClassWord(lower)) {
-                            String r = readable(n);
-                            if (r.length() >= 3 && !genericName(r) && out.size() < MAX_SPECIAL) {
-                                out.add(r);
-                            }
-                        }
-                    }
-                } catch (LinkageError | RuntimeException ex) {
-                    // a member type from a mod that is not installed: skip this class level
-                }
-            }
-        }
-        return new ArrayList<>(out);
-    }
-
-    private static boolean hasNotClassWord(String lower) {
-        for (String w : NOT_CLASS_WORDS) {
-            if (lower.contains(w)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean startsWithPrefix(String lower) {
-        for (String p : METHOD_PREFIXES) {
-            if (lower.startsWith(p) && lower.length() > p.length()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static String stripPrefix(String name) {
-        String lower = name.toLowerCase(Locale.ROOT);
-        for (String p : METHOD_PREFIXES) {
-            if (lower.startsWith(p) && name.length() > p.length() && Character.isUpperCase(name.charAt(p.length()))) {
-                return name.substring(p.length());
-            }
-        }
-        return name;
-    }
-
-    private static String stripEntityWord(String lower) {
-        return lower.endsWith("entity") && lower.length() > 6 ? lower.substring(0, lower.length() - 6) : lower;
-    }
-
-    /** Removes the mob's own name from an attack name ("Lich Missile" -> "Missile"), if something is left. */
-    private static String cleanName(String readable, String key, String classKey) {
-        String result = readable;
-        for (String k : new String[] {key, classKey}) {
-            if (k == null || k.length() < 3) {
+            if (cn.equals(ownClass) || isEngine(cn)) {
                 continue;
             }
-            StringBuilder sb = new StringBuilder();
-            for (String word : result.split(" ")) {
-                if (!word.toLowerCase(Locale.ROOT).equals(k)) {
-                    if (sb.length() > 0) {
-                        sb.append(' ');
-                    }
-                    sb.append(word);
+            String simple = simpleName(cn);
+            String lowerFull = cn.toLowerCase(Locale.ROOT);
+            String pkg = lowerFull.substring(0, Math.max(0, lowerFull.lastIndexOf('.')));
+            boolean nested = !ownClass.isEmpty() && cn.startsWith(ownClass + "$");
+            boolean named = (path.length() >= 3 && lowerFull.contains(path)) || (classKey.length() >= 3 && lowerFull.contains(classKey));
+            boolean packaged = false;
+            for (String seg : pkg.split("\\.")) {
+                if ((path.length() >= 3 && seg.equals(path)) || (classKey.length() >= 3 && seg.equals(classKey))) {
+                    packaged = true;
+                    break;
                 }
             }
-            if (sb.length() >= 3) {
-                result = sb.toString();
+            boolean attackPkg = false;
+            for (String p : ATTACK_PACKAGES) {
+                if (pkg.contains(p)) {
+                    attackPkg = true;
+                    break;
+                }
+            }
+            boolean attackName = simple != null && looksAttack(simple);
+            if (!(nested || named || packaged || attackPkg || attackName)) {
+                continue; // not a candidate: its class file is not even read
+            }
+            if (simple != null && (notAttack(simple) || (notClass(simple) && !goalish(simple)))) {
+                continue;
+            }
+            boolean associated = nested || named || packaged;
+            checked++;
+            if (!associated && !ownInternal.isEmpty()) {
+                // A goal or ability that takes the mob as a parameter or field belongs to it, whatever it is called.
+                associated = classInfo(cn, cl).refs.contains(ownInternal);
+            }
+            if (!associated) {
+                continue;
+            }
+            addClassFind(found, cn, cl, mods, true, path, classKey);
+        }
+
+        if (entityClass == null) {
+            return;
+        }
+        // 2 + 3. the entity class and its modded superclasses
+        List<ClassInfo> chain = chain(ownClass, cl);
+        int strings = 0;
+        for (ClassInfo ci : chain) {
+            for (Facts f : ci.methods.values()) {
+                for (String s : f.strings) {
+                    String name = attackString(s);
+                    if (name != null && strings++ < 6) {
+                        addFound(found, name, describe(new Facts(), name));
+                    }
+                }
             }
         }
-        return result;
-    }
-
-    /** namespace and a lowercase, underscore-free key of an entity id ("chaos:ender_king" -> "chaos", "enderking"). */
-    private static final class ResourceLocationParts {
-        final String namespace;
-        final String key;
-
-        ResourceLocationParts(String id) {
-            int c = id.indexOf(':');
-            this.namespace = c < 0 ? "minecraft" : id.substring(0, c);
-            this.key = (c < 0 ? id : id.substring(c + 1)).toLowerCase(Locale.ROOT).replace("_", "");
+        for (Class<?> k = entityClass; k != null && k != Object.class && !isEngine(k.getName()); k = k.getSuperclass()) {
+            try {
+                for (Method m : k.getDeclaredMethods()) {
+                    if (m.isSynthetic() || m.isBridge() || m.getName().contains("$")) {
+                        continue;
+                    }
+                    String name = m.getName();
+                    String lower = name.toLowerCase(Locale.ROOT);
+                    if (!startsWithPrefix(lower) || !looksAttack(name) || notAttack(name)
+                            || lower.startsWith("is") || lower.startsWith("get") || lower.startsWith("set")
+                            || lower.startsWith("can") || lower.startsWith("should") || lower.startsWith("has")
+                            || lower.contains("hurt") || lower.contains("target")) {
+                        continue;
+                    }
+                    String r = readable(stripPrefix(name));
+                    if (r.length() < 3 || genericName(r)) {
+                        continue;
+                    }
+                    Facts f = new Facts();
+                    closure(chain, name, 4, new HashSet<>(), f);
+                    addFound(found, r, describe(f, stripPrefix(name)));
+                }
+                for (Field f : k.getDeclaredFields()) {
+                    String tn = f.getType().getSimpleName().toLowerCase(Locale.ROOT);
+                    String name = f.getName();
+                    if (!(tn.contains("animation") || tn.contains("animstate")) || !looksAttack(name) || notAttack(name)) {
+                        continue;
+                    }
+                    String r = readable(name.replaceAll("(?i)(anim|animation|state)$", ""));
+                    if (r.length() >= 3 && !genericName(r)) {
+                        addFound(found, r, describe(new Facts(), r));
+                    }
+                }
+                for (Class<?> inner : k.getDeclaredClasses()) {
+                    addClassFind(found, inner.getName(), cl, mods, true, path, classKey);
+                }
+            } catch (LinkageError | RuntimeException ex) {
+                // a member type from a mod that is not installed: skip this class level
+            }
         }
     }
 
     /** Names of every class in the jar of the mod (from its scan data, so nothing is loaded). Empty if unavailable. */
     private static List<String> classesOfMod(String modId) {
-        return MOD_CLASSES.computeIfAbsent(modId, k -> {
-            List<String> names = new ArrayList<>();
-            try {
-                var info = ModList.get().getModFileById(k);
-                if (info != null) {
-                    var scan = info.getFile().getScanResult();
-                    if (scan != null) {
-                        for (var data : scan.getClasses()) {
-                            names.add(data.clazz().getClassName());
-                        }
+        List<String> cached = MOD_CLASSES.get(modId);
+        if (cached != null) {
+            return cached;
+        }
+        List<String> names = new ArrayList<>();
+        try {
+            var info = ModList.get().getModFileById(modId);
+            if (info != null) {
+                var scan = info.getFile().getScanResult();
+                if (scan != null) {
+                    for (var data : scan.getClasses()) {
+                        names.add(data.clazz().getClassName());
                     }
                 }
-            } catch (RuntimeException | LinkageError ex) {
-                EncephalonMod.LOGGER.warn("Mob Editor: could not read the classes of mod {}", k);
             }
-            return List.copyOf(names);
-        });
+        } catch (RuntimeException | LinkageError ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor: could not read the classes of mod {}", modId);
+        }
+        List<String> result = List.copyOf(names);
+        MOD_CLASSES.put(modId, result);
+        return result;
     }
 
-    // ------------------------------------------------------------------ names
+    // ------------------------------------------------------------------ names (display)
 
     /** The name of an attack in the editor. */
     public static Component nameOf(Attack a) {
