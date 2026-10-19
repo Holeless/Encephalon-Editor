@@ -18,6 +18,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.electronwill.nightconfig.core.UnmodifiableConfig;
+
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.FieldVisitor;
@@ -29,6 +31,7 @@ import com.example.encephalon.EncephalonMod;
 
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.damagesource.DamageSource;
@@ -54,7 +57,10 @@ import net.minecraft.world.level.Level;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.fml.config.ModConfig;
+import net.neoforged.neoforge.common.ModConfigSpec;
 import net.neoforged.neoforge.event.entity.EntityAttributeModificationEvent;
+import net.neoforged.neoforge.event.server.ServerStartedEvent;
 
 /**
  * Attacks of mobs, for the editor's "Attacks" entry and for the damage overrides.
@@ -78,6 +84,10 @@ import net.neoforged.neoforge.event.entity.EntityAttributeModificationEvent;
  * is written from those facts. Candidates are: the mob's goals (and what they hold), classes nested in the mob, classes of the
  * mod's jar that carry the mob's name, sit in a package named after it, or take the mob as a parameter, methods of the entity
  * class such as startSlam / castMissile (with everything they call), and animation / attack strings in the entity's code.
+ * <b>Hardcoded attacks.</b> A mob that has attacks of its own (a goal, an explosion, a modded attack found in its code) gets no
+ * extra melee row and no melee goal from this mod, like the creeper. <b>Config values.</b> Numbers the mod exposes in its own
+ * config (damage, cooldown, interval, duration, ...) that belong to the mob are listed as editable rows (id prefix cfg_) and
+ * written to the mod's live config value.
  * A mob with no ATTACK_DAMAGE attribute is given a fallback from the size of its hitbox (micro / small / normal / big) as a real
  * attribute, so anything that makes it attack (the editor's category setting, or another mod) does not crash on a missing one.
  */
@@ -86,6 +96,8 @@ public final class DamageDefaults {
     public static final String MELEE = "melee";
     public static final String EXPLOSION = "explosion";
     public static final String RANGED = "ranged";
+    /** Prefix of the attack ids that stand for a value of the mod's own config. */
+    public static final String CONFIG_PREFIX = "cfg_";
 
     public enum Kind { MELEE, DAMAGE, EXPLOSION, EFFECT }
 
@@ -109,7 +121,7 @@ public final class DamageDefaults {
     }
 
     /** What a scan found for one mob type. melee is null when the mob has no melee attack of its own. */
-    private record Profile(Attack melee, List<Attack> others) {
+    private record Profile(Attack melee, List<Attack> others, boolean hardcoded) {
     }
 
     /** A modded attack that was found: the name shown, and what it does (null when nothing could be told). */
@@ -178,10 +190,21 @@ public final class DamageDefaults {
     /** Strings with these words are timers and settings, not attack names. */
     private static final String[] NOT_STRING_WORDS = {"cooldown", "timer", "tick", "time", "count", "damage", "speed", "range",
             "delay", "chance", "duration", "length", "radius", "height", "texture", "geo", "key", "tag", "state"};
+    /** Names that are never an attack themselves (they manage, track or hold attacks); what they hold is searched instead. */
+    private static final String[] HARD_NOT_WORDS = {"controller", "manager", "helper", "util", "tracker", "holder", "context",
+            "selector", "machine", "registry", "handler", "state", "stage", "brain", "timer", "data", "cooldowns"};
+    /** Words of a config path that mark a setting of an attack or a mob. */
+    private static final String[] SETTING_WORDS = {"damage", "dmg", "attack", "cooldown", "interval", "delay", "duration", "time",
+            "tick", "chance", "radius", "range", "amplifier", "power", "strength", "speed", "count", "amount", "health", "hp",
+            "armor", "armour", "knockback", "rate", "frequency", "level", "size", "length", "distance", "windup", "warmup",
+            "recharge", "charge"};
+    private static final String[] NOT_SETTING_WORDS = {"spawn", "weight", "biome", "group", "dimension"};
+    private static final int MAX_CONFIG_ROWS = 16;
     private static final int MAX_SPECIAL = 12;
     private static final int MAX_CANDIDATES = 600;
     /** Goal names that only wrap the real attacks (an "ActionGoal" holding a list of actions): the actions are looked for inside. */
-    private static final String[] WRAPPER_WORDS = {"action", "ability", "skill", "special", "spell", "behavior", "behaviour", "phase"};
+    private static final String[] WRAPPER_WORDS = {"action", "ability", "skill", "special", "spell", "behavior", "behaviour", "phase",
+            "controller", "manager", "selector", "machine", "state"};
     /** Names too generic to show as an attack. */
     private static final Set<String> GENERIC = Set.of("action", "ability", "skill", "special", "attack", "spell", "boss", "custom",
             "cooldown", "mob", "entity", "default", "phase", "move", "ai", "task", "behavior", "behaviour");
@@ -374,21 +397,45 @@ public final class DamageDefaults {
 
     // ------------------------------------------------------------------ scanning
 
-    /**
-     * Every attack of the type that is listed in the editor: melee first, then the others. Server thread (it may create one
-     * throw-away mob the first time). forcedHostile: the category setting makes the mob attack although it normally does not,
-     * so a melee row is listed even if it has other attacks.
-     */
-    public static List<Attack> attacksOf(MinecraftServer server, EntityType<?> t, boolean forcedHostile) {
+    private static Profile profileOf(MinecraftServer server, EntityType<?> t) {
         Profile p = PROFILES.get(t);
         if (p == null) {
             p = scan(server, t);
             PROFILES.put(t, p);
         }
+        return p;
+    }
+
+    /**
+     * True if the type has attacks of its own in its code (a melee / ranged / swell goal, a modded attack found in its code, an
+     * attack named in the config). Such a mob gets no melee row and no melee goal from this mod: its own code attacks, like a
+     * creeper that only explodes.
+     */
+    public static boolean hardcodedAttack(MinecraftServer server, EntityType<?> t) {
+        try {
+            return profileOf(server, t).hardcoded();
+        } catch (RuntimeException | LinkageError ex) {
+            return false;
+        }
+    }
+
+    /**
+     * Every attack of the type that is listed in the editor: melee first, then the others. Server thread (it may create one
+     * throw-away mob the first time). A mob with attacks of its own gets no melee row, whatever its category is set to.
+     */
+    public static List<Attack> attacksOf(MinecraftServer server, EntityType<?> t, boolean forcedHostile) {
+        Profile p = profileOf(server, t);
         List<Attack> out = new ArrayList<>();
+        boolean realOthers = false;
+        for (Attack a : p.others()) {
+            if (!a.id().startsWith(CONFIG_PREFIX)) {
+                realOthers = true;
+                break;
+            }
+        }
         if (p.melee() != null) {
             out.add(p.melee());
-        } else if (p.others().isEmpty() || forcedHostile) {
+        } else if (!p.hardcoded() && !realOthers) {
             out.add(new Attack(MELEE, defaultMelee(t), null, Kind.MELEE, null));
         }
         out.addAll(p.others());
@@ -471,6 +518,9 @@ public final class DamageDefaults {
             EncephalonMod.LOGGER.info("Mob Editor attacks: {} has goals {} -> found {}", id, goalClasses,
                     found.values().stream().map(Found::label).toList());
         }
+        // Attacks of its own: nothing is added on top of them (no melee row, no melee goal), like a creeper that only explodes.
+        boolean hardcoded = meleeGoal || ranged || swell || extra != null || !configured.isEmpty()
+                || (!vanilla && !found.isEmpty());
         if (swell) {
             others.add(0, new Attack(EXPLOSION, blast, DamageTypes.EXPLOSION, Kind.EXPLOSION, null));
         }
@@ -482,22 +532,250 @@ public final class DamageDefaults {
             others.add(new Attack("special_" + f.getKey().replaceAll("[^a-z0-9]+", "_"), -1, null, Kind.EFFECT,
                     f.getValue().label(), f.getValue().desc()));
         }
-        if (!vanilla && others.isEmpty() && EncephalonConfig.isQuiet(t)) {
+        if (!vanilla && found.isEmpty() && configured.isEmpty() && EncephalonConfig.isQuiet(t)) {
             // A modded boss whose attacks live in the mod's own code: say so instead of showing only a made-up default.
             others.add(new Attack("custom_code", -1, null, Kind.EFFECT, null));
+            hardcoded = true;
+        }
+        if (!vanilla) {
+            try {
+                List<Attack> cfg = configRows(namespace, id, entityClass, found.values().stream().map(Found::label).toList());
+                if (!cfg.isEmpty()) {
+                    MobConfigData data = MobConfigData.get(server);
+                    for (Attack a : cfg) {
+                        Double stored = data.damage(id, a.id());
+                        if (stored != null) {
+                            applyConfig(a.id(), stored);
+                        }
+                    }
+                    others.addAll(cfg);
+                }
+            } catch (RuntimeException | LinkageError ex) {
+                EncephalonMod.LOGGER.warn("Mob Editor: could not read the config values of {}", id, ex);
+            }
         }
         if (!isMob) {
-            return new Profile(null, List.copyOf(others));
+            return new Profile(null, List.copyOf(others), hardcoded);
         }
         // Melee: a melee goal, or a real attack damage on a mob that does not explode (a blaze, warden, phantom or vex
         // fight up close with their own code, not with a melee goal). A few vanilla mobs have the attribute but never melee.
+        // A modded mob with attacks found in its code is left without a melee row: those are its attacks.
         Double fixed = MELEE_DEFAULTS.get(id);
-        // A mob that explodes (a creeper has a melee goal too) never lists melee.
         boolean ownAttack = fixed != null
-                || (!swell && (meleeGoal || (!NO_MELEE.contains(id) && hasOwnAttackDamage(t))));
+                || (!swell && (meleeGoal || (!NO_MELEE.contains(id) && hasOwnAttackDamage(t) && (vanilla || !hardcoded))));
         Attack melee = ownAttack
                 ? new Attack(MELEE, fixed != null ? fixed : defaultMelee(t), null, Kind.MELEE, null) : null;
-        return new Profile(melee, List.copyOf(others));
+        return new Profile(melee, List.copyOf(others), hardcoded);
+    }
+
+    // ------------------------------------------------------------------ the mod's own config values
+
+    /** A value of a mod's config that is editable from the Mob Editor; orig is the value it had when first seen. */
+    private record ConfigRef(ModConfigSpec spec, ModConfigSpec.ConfigValue<?> value, List<String> path, Object orig) {
+    }
+
+    private static final Map<String, ConfigRef> CONFIG_REFS = new ConcurrentHashMap<>();
+
+    private static void flatten(Object o, List<ModConfig> out) {
+        if (o instanceof ModConfig mc) {
+            out.add(mc);
+        } else if (o instanceof Map<?, ?> m) {
+            for (Object v : m.values()) {
+                flatten(v, out);
+            }
+        } else if (o instanceof Iterable<?> it) {
+            for (Object v : it) {
+                flatten(v, out);
+            }
+        }
+    }
+
+    /** The configs a mod registered. Read by reflection, so a different FML version only costs this feature, not the build. */
+    private static List<ModConfig> modConfigs(String modId) {
+        List<ModConfig> out = new ArrayList<>();
+        try {
+            Class<?> tracker = Class.forName("net.neoforged.fml.config.ConfigTracker");
+            Object instance = tracker.getField("INSTANCE").get(null);
+            Object result;
+            try {
+                result = tracker.getMethod("getConfigsForMod", String.class).invoke(instance, modId);
+            } catch (NoSuchMethodException ex) {
+                result = tracker.getMethod("configSets").invoke(instance);
+                List<ModConfig> all = new ArrayList<>();
+                flatten(result, all);
+                for (ModConfig mc : all) {
+                    if (mc.getModId().equals(modId)) {
+                        out.add(mc);
+                    }
+                }
+                return out;
+            }
+            flatten(result, out);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor: could not list the configs of mod {}", modId);
+        }
+        return out;
+    }
+
+    private static void walk(UnmodifiableConfig cfg, List<ModConfigSpec.ConfigValue<?>> out, int depth) {
+        for (UnmodifiableConfig.Entry en : cfg.entrySet()) {
+            Object v = en.getValue();
+            if (v instanceof ModConfigSpec.ConfigValue<?> cv) {
+                out.add(cv);
+            } else if (v instanceof UnmodifiableConfig sub && depth < 6) {
+                walk(sub, out, depth + 1);
+            }
+        }
+    }
+
+    private static Object readValue(ModConfigSpec.ConfigValue<?> cv) {
+        try {
+            return cv.get();
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static String numText(Object o) {
+        if (o instanceof Double d && d != Math.rint(d)) {
+            return String.valueOf(d);
+        }
+        return o instanceof Double d ? String.valueOf((long) d.doubleValue()) : String.valueOf(o);
+    }
+
+    /**
+     * Numbers in the mod's own config (damage, cooldown, interval, duration, radius, ...) that belong to this mob: the path or the
+     * file name carries its name, or the name of one of its attacks. Each becomes an editable row; a value typed there is written
+     * to the mod's live config value (not to its file), and the stored value is applied again when a world starts. Hardcoded
+     * numbers inside a mod's code cannot be changed, so only what the mod exposes in its config is listed.
+     */
+    private static List<Attack> configRows(String ns, String id, Class<?> entityClass, List<String> attackLabels) {
+        List<Attack> out = new ArrayList<>();
+        String key = id.substring(id.indexOf(':') + 1).toLowerCase(Locale.ROOT).replace("_", "");
+        String classKey = entityClass == null ? "" : stripEntityWord(entityClass.getSimpleName()).toLowerCase(Locale.ROOT);
+        List<String> labelKeys = new ArrayList<>();
+        for (String l : attackLabels) {
+            String k = l.toLowerCase(Locale.ROOT).replace(" ", "");
+            if (k.length() >= 4) {
+                labelKeys.add(k);
+            }
+        }
+        for (ModConfig mc : modConfigs(ns)) {
+            try {
+                Object sp = mc.getSpec();
+                if (!(sp instanceof ModConfigSpec spec) || !spec.isLoaded()) {
+                    continue;
+                }
+                String file = mc.getFileName().toLowerCase(Locale.ROOT).replace("_", "").replace("-", "");
+                List<ModConfigSpec.ConfigValue<?>> values = new ArrayList<>();
+                walk(spec.getValues(), values, 0);
+                for (ModConfigSpec.ConfigValue<?> cv : values) {
+                    if (out.size() >= MAX_CONFIG_ROWS) {
+                        break;
+                    }
+                    Object cur = readValue(cv);
+                    if (!(cur instanceof Integer || cur instanceof Long || cur instanceof Double)) {
+                        continue;
+                    }
+                    List<String> path = cv.getPath();
+                    String joined = String.join(".", path);
+                    if (!tokenHit(joined, SETTING_WORDS) || tokenHit(joined, NOT_SETTING_WORDS)) {
+                        continue;
+                    }
+                    String flat = joined.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "");
+                    boolean mine = (key.length() >= 3 && (flat.contains(key) || file.contains(key)))
+                            || (classKey.length() >= 3 && (flat.contains(classKey) || file.contains(classKey)));
+                    for (String lk : labelKeys) {
+                        if (flat.contains(lk)) {
+                            mine = true;
+                        }
+                    }
+                    if (!mine) {
+                        continue;
+                    }
+                    String rid = CONFIG_PREFIX + (mc.getModId() + "." + joined).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_.]+", "_");
+                    final Object first = cur;
+                    ConfigRef ref = CONFIG_REFS.computeIfAbsent(rid, k -> new ConfigRef(spec, cv, List.copyOf(path), first));
+                    String last = path.get(path.size() - 1);
+                    String prev = path.size() >= 2 ? path.get(path.size() - 2) : "";
+                    String base = cleanName(prev.isEmpty() ? readable(last) : readable(prev) + " " + readable(last), key, classKey);
+                    out.add(new Attack(rid, -1, null, Kind.DAMAGE, base + " (default " + numText(ref.orig()) + ")", null));
+                }
+            } catch (RuntimeException | LinkageError ex) {
+                // a config that cannot be read: skip it
+            }
+        }
+        return out;
+    }
+
+    private static boolean valid(ConfigRef r, Object nv) {
+        try {
+            Object vs = r.spec().getSpec().get(r.path());
+            if (vs != null) {
+                Object res = vs.getClass().getMethod("test", Object.class).invoke(vs, nv);
+                return !(res instanceof Boolean b) || b;
+            }
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ex) {
+            // cannot check: let it through
+        }
+        return true;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void setConfig(String id, ConfigRef r, Object nv) {
+        try {
+            if (!valid(r, nv)) {
+                EncephalonMod.LOGGER.warn("Mob Editor: {} is not a valid value for config {}", nv, id);
+                return;
+            }
+            ((ModConfigSpec.ConfigValue) r.value()).set(nv);
+        } catch (RuntimeException | LinkageError ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor: could not set config {}", id, ex);
+        }
+    }
+
+    /** Writes a value typed in the editor to the mod's live config value (ids that are not config rows are ignored). */
+    public static void applyConfig(String id, double v) {
+        ConfigRef r = CONFIG_REFS.get(id);
+        if (r == null) {
+            return;
+        }
+        Object o = r.orig();
+        Object nv;
+        if (o instanceof Integer) {
+            nv = (int) Math.round(v);
+        } else if (o instanceof Long) {
+            nv = Math.round(v);
+        } else if (o instanceof Double) {
+            nv = v;
+        } else {
+            return;
+        }
+        setConfig(id, r, nv);
+    }
+
+    /** Puts the config value back to what it was before the editor changed it. */
+    public static void resetConfig(String id) {
+        ConfigRef r = CONFIG_REFS.get(id);
+        if (r != null) {
+            setConfig(id, r, r.orig());
+        }
+    }
+
+    /** Server started: re-applies stored config values (the mod's configs are loaded again with every world). */
+    @SubscribeEvent
+    public static void onServerStarted(ServerStartedEvent event) {
+        MinecraftServer server = event.getServer();
+        try {
+            for (String mobId : MobConfigData.get(server).configOverrideMobs()) {
+                EntityType<?> t = BuiltInRegistries.ENTITY_TYPE.getOptional(ResourceLocation.parse(mobId)).orElse(null);
+                if (t != null) {
+                    profileOf(server, t); // scanning applies the stored values
+                }
+            }
+        } catch (RuntimeException | LinkageError ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor: could not re-apply stored config values", ex);
+        }
     }
 
     private static void addFound(Map<String, Found> found, String label, String desc) {
@@ -692,8 +970,11 @@ public final class DamageDefaults {
 
         /** Does something that only an attack does. Knockback and area scans alone do not count (movement code has them too). */
         boolean offensive() {
-            return hurts || explodes || fire || shoots || spawnsAny || !effects.isEmpty() || !things.isEmpty() || !spawns.isEmpty();
+            return hurts || explodes || fire || shoots || !effects.isEmpty() || !things.isEmpty() || !spawns.isEmpty();
         }
+
+        /** True if the code of the class could be read at all. */
+        boolean any;
     }
 
     private static final class ClassInfo {
@@ -978,6 +1259,9 @@ public final class DamageDefaults {
     private static Facts classFacts(String cn, ClassLoader cl, List<String> modClasses) {
         Facts all = new Facts();
         for (ClassInfo ci : chain(cn, cl)) {
+            if (!ci.methods.isEmpty()) {
+                all.any = true;
+            }
             for (Facts f : ci.methods.values()) {
                 all.merge(f);
             }
@@ -1013,30 +1297,35 @@ public final class DamageDefaults {
 
     // ------------------------------------------------------------------ modded mobs: finding attacks
 
+    private static boolean hardNot(String simple) {
+        return tokenHit(simple, HARD_NOT_WORDS);
+    }
+
     /**
-     * Adds the attack a class stands for, if it is one. A class counts when its name looks like an attack, or (above all) when
-     * its code does something only an attack does. Anonymous classes are named after what they do. needSignal false
-     * accepts any name that is not ruled out (for the contents of an "ActionGoal").
+     * Adds the attack a class stands for, if it is one. The code must do something only an attack does (hurt, explode, fire
+     * something, apply an effect, summon). nameRequired: the name has to look like an attack too (classes found by searching the
+     * jar); a goal that really runs on the mob needs no attack name. Controllers, managers and the like are never attacks.
+     * Anonymous classes are named after what they do (allowAnon: only for goals that really run on the mob).
      */
     private static void addClassFind(Map<String, Found> found, String cn, ClassLoader cl, List<String> mods,
-                                     boolean needSignal, String... keys) {
+                                     boolean nameRequired, boolean allowAnon, String... keys) {
         if (isEngine(cn)) {
             return;
         }
         String simple = simpleName(cn);
         Facts f = classFacts(cn, cl, mods);
         if (simple == null) {
-            if (f.offensive()) {
-                String label = labelFromFacts(f);
-                addFound(found, label, describe(f, null));
+            if (allowAnon && f.offensive()) {
+                addFound(found, labelFromFacts(f), describe(f, null));
             }
             return;
         }
-        if (notAttack(simple)) {
+        if (hardNot(simple) || notAttack(simple) || (notClass(simple) && !goalish(simple))) {
             return;
         }
         boolean attackName = looksAttack(simple);
-        if (needSignal && !attackName && !f.offensive()) {
+        boolean ok = f.any ? (f.offensive() && (attackName || !nameRequired)) : attackName;
+        if (!ok) {
             return;
         }
         String r = cleanName(readable(simple), keys);
@@ -1047,13 +1336,6 @@ public final class DamageDefaults {
             r = labelFromFacts(f);
         }
         addFound(found, r, describe(f, simple));
-        int n = 0;
-        for (String s : f.strings) {
-            String name = attackString(s);
-            if (name != null && n++ < 3) {
-                addFound(found, name, describe(new Facts(), name));
-            }
-        }
     }
 
     private static void goalFinds(Goal g, List<String> mods, Map<String, Found> found) {
@@ -1064,11 +1346,11 @@ public final class DamageDefaults {
         ClassLoader cl = g.getClass().getClassLoader();
         String n = simpleName(raw);
         boolean wrapper = n != null && tokenHit(n, WRAPPER_WORDS);
-        addClassFind(found, raw, cl, mods, true);
+        addClassFind(found, raw, cl, mods, false, true);
         Set<String> held = new LinkedHashSet<>();
         dive(g, wrapper ? 2 : 1, wrapper ? 2 : 1, held, Collections.newSetFromMap(new IdentityHashMap<>()));
         for (String hc : held) {
-            addClassFind(found, hc, cl, mods, !wrapper);
+            addClassFind(found, hc, cl, mods, !wrapper, false);
         }
     }
 
@@ -1132,7 +1414,7 @@ public final class DamageDefaults {
     }
 
     private static boolean goalish(String simple) {
-        return tokenHit(simple, new String[] {"goal", "action", "attack", "ability", "behavior", "behaviour", "skill", "spell", "phase"});
+        return tokenHit(simple, new String[] {"goal", "action", "attack", "ability", "behavior", "behaviour", "skill", "spell"});
     }
 
     /**
@@ -1185,7 +1467,7 @@ public final class DamageDefaults {
             if (!(nested || named || packaged || attackPkg || attackName)) {
                 continue; // not a candidate: its class file is not even read
             }
-            if (simple != null && (notAttack(simple) || (notClass(simple) && !goalish(simple)))) {
+            if (simple == null || hardNot(simple) || notAttack(simple) || (notClass(simple) && !goalish(simple))) {
                 continue;
             }
             boolean associated = nested || named || packaged;
@@ -1197,7 +1479,7 @@ public final class DamageDefaults {
             if (!associated) {
                 continue;
             }
-            addClassFind(found, cn, cl, mods, true, path, classKey);
+            addClassFind(found, cn, cl, mods, true, false, path, classKey);
         }
 
         if (entityClass == null) {
@@ -1205,16 +1487,9 @@ public final class DamageDefaults {
         }
         // 2 + 3. the entity class and its modded superclasses
         List<ClassInfo> chain = chain(ownClass, cl);
-        int strings = 0;
+        boolean readableCode = false;
         for (ClassInfo ci : chain) {
-            for (Facts f : ci.methods.values()) {
-                for (String s : f.strings) {
-                    String name = attackString(s);
-                    if (name != null && strings++ < 6) {
-                        addFound(found, name, describe(new Facts(), name));
-                    }
-                }
-            }
+            readableCode |= !ci.methods.isEmpty();
         }
         for (Class<?> k = entityClass; k != null && k != Object.class && !isEngine(k.getName()); k = k.getSuperclass()) {
             try {
@@ -1236,6 +1511,9 @@ public final class DamageDefaults {
                     }
                     Facts f = new Facts();
                     closure(chain, name, 4, new HashSet<>(), f);
+                    if (readableCode && !f.offensive()) {
+                        continue;
+                    }
                     addFound(found, r, describe(f, stripPrefix(name)));
                 }
                 for (Field f : k.getDeclaredFields()) {
@@ -1250,10 +1528,24 @@ public final class DamageDefaults {
                     }
                 }
                 for (Class<?> inner : k.getDeclaredClasses()) {
-                    addClassFind(found, inner.getName(), cl, mods, true, path, classKey);
+                    addClassFind(found, inner.getName(), cl, mods, true, false, path, classKey);
                 }
             } catch (LinkageError | RuntimeException ex) {
                 // a member type from a mod that is not installed: skip this class level
+            }
+        }
+        if (found.isEmpty()) {
+            // Last resort: animation / attack names in the entity's string constants.
+            int strings = 0;
+            for (ClassInfo ci : chain) {
+                for (Facts f : ci.methods.values()) {
+                    for (String str : f.strings) {
+                        String name = attackString(str);
+                        if (name != null && strings++ < 4) {
+                            addFound(found, name, describe(new Facts(), name));
+                        }
+                    }
+                }
             }
         }
     }
