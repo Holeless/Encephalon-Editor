@@ -23,7 +23,9 @@ import com.example.encephalon.behavior.Behaviors;
 import com.example.encephalon.behavior.Setting;
 import com.example.encephalon.config.CategoryBehavior;
 import com.example.encephalon.config.ConfigResolver;
+import com.example.encephalon.config.CombatInfo;
 import com.example.encephalon.config.DamageDefaults;
+import com.example.encephalon.config.HitboxData;
 import com.example.encephalon.config.EncephalonConfig;
 import com.example.encephalon.config.MobConfigData;
 import com.example.encephalon.config.Tri;
@@ -45,6 +47,7 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.LogoRenderer;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
@@ -93,8 +96,12 @@ import net.neoforged.fml.ModList;
 
 /**
  * Mob Editor. Left: collapsible scope tree (All Mobs > Hostile / Neutral / Passive > mob), with a mob search.
- * Middle: behaviors for the selected scope, with a behavior search (a mob type also gets "Drops", "Category" and "Damage" entries there).
- * Right: scrollable details and settings (or the drops / category / damage editor), or an animated 3D mob preview while nothing is selected.
+ * Middle: behaviors for the selected scope, with a behavior search (a mob type also gets "Drops", "Category", "Attacks" and
+ * "Behaviors" entries there).
+ * Right: scrollable details and settings (or the drops / category / attacks / behaviors editor), or an animated 3D mob preview
+ * while nothing is selected.
+ * Attacks: damage values of what the mob attacks with. Behaviors: ONLY what can be edited of what the mob does (values of the
+ * mod's own config, the duration and level of effects it applies), nothing that cannot be changed.
  * The tree always files a mob under its default category; the Category entry changes how the mob acts in the game, not where it is listed.
  * Singleplayer only for now: it edits the integrated server's MobConfigData directly (networking is a TODO).
  * Preview mobs live in dummy worlds (PreviewLevel) and every piece of their code runs inside PreviewSandbox.
@@ -215,13 +222,28 @@ public class MobEditorScreen extends Screen {
     private static final int DROP_MAX_AMOUNT = 64;
     /** Key of the "Category" row in the behavior list. */
     private static final Object CATEGORY_KEY = new Object();
-    /** Key of the "Damage" row in the behavior list. */
+    /** Key of the "Attacks" row in the behavior list. */
     private static final Object DAMAGE_KEY = new Object();
+    /** Key of the "Behaviors" row in the behavior list. */
+    private static final Object BEHAVIORS_KEY = new Object();
+    /** Key of the "Hitboxes" row in the behavior list. */
+    private static final Object HITBOX_KEY = new Object();
+    private static final int HIT_PANEL_H = 84;
+    /** True while the "Hitboxes" row is the open entry: the preview shows the hitbox and the size settings sit below it. */
+    private boolean hitboxOpen;
+    private HitboxData hitData;
+    private int hitInfoY;
+    private Button hitFit;
+    private Button hitReset;
+    private final List<HitBox> hitBoxes = new ArrayList<>();
     private static final double DAMAGE_MAX = 1000.0;
+    private static final double BEHAVIOR_MAX = 1_000_000.0;
     /** True while the "Category" row is the open entry (only for a mob type; behavior is null then). */
     private boolean categoryOpen;
-    /** True while the "Damage" row is the open entry (only for a mob type; behavior is null then). */
+    /** True while the "Attacks" row is the open entry (only for a mob type; behavior is null then). */
     private boolean damageOpen;
+    /** True while the "Behaviors" row is the open entry (only for a mob type; behavior is null then). Shares the attack panel's rows. */
+    private boolean behaviorsOpen;
     /** When the default drops of the shown mob were first asked for (0 = not waiting); the loading text only shows after a pause. */
     private long loadingSince;
 
@@ -260,15 +282,16 @@ public class MobEditorScreen extends Screen {
     private record PickEntry(Item item, String name, String id) {
     }
 
-    // ------------------------------------------------------------------ damage editor state
+    // ------------------------------------------------------------------ attacks / behaviors editor state
     private List<FormattedCharSequence> damageDesc = List.of();
     private int damageStateY;
     /** True when the shown mob has no attack of its own, so its default melee damage comes from its size. */
     private boolean damageFallback;
     private final List<DamageRow> damageRows = new ArrayList<>();
-    private Button damageReset;    private List<DamageDefaults.Attack> damageAttacks = List.of();
+    private Button damageReset;
+    private List<DamageDefaults.Attack> damageAttacks = List.of();
 
-        private record DamageRow(DamageDefaults.Attack attack, int y, List<FormattedCharSequence> info) {
+    private record DamageRow(DamageDefaults.Attack attack, int y, List<FormattedCharSequence> info) {
     }
 
     // ------------------------------------------------------------------ 3D preview state
@@ -560,7 +583,7 @@ public class MobEditorScreen extends Screen {
 
     /** The mob preview takes the whole right panel (the drops live in the behavior list now). */
     private int previewBottom() {
-        return viewBottom();
+        return hitboxOpen ? viewBottom() - HIT_PANEL_H : viewBottom();
     }
 
     private int viewBottom() {
@@ -587,6 +610,9 @@ public class MobEditorScreen extends Screen {
             MobConfigData[] box = new MobConfigData[1];
             server.executeBlocking(() -> box[0] = MobConfigData.get(server));
             data = box[0];
+            HitboxData[] hb = new HitboxData[1];
+            server.executeBlocking(() -> hb[0] = HitboxData.get(server));
+            hitData = hb[0];
             listing = MobListing.scan(this.minecraft, server);
             setupPreviewZone();
             sweepOrphans();
@@ -882,20 +908,27 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ behavior list
 
+    private boolean listMatches(String key) {
+        return behaviorFilter.isEmpty() || Component.translatable(key).getString().toLowerCase().contains(behaviorFilter);
+    }
+
     private void rebuildBehaviors() {
         List<PickList.Item> items = new ArrayList<>();
-        // A mob type gets "Drops", "Category" and "Damage" entries at the top of its behaviors.
-        if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
-                || Component.translatable("encephalon.screen.drops_title").getString().toLowerCase().contains(behaviorFilter))) {
+        // A mob type gets "Drops", "Category", "Attacks" and "Behaviors" entries at the top of its list.
+        if (scope.type() == ScopeType.MOB_TYPE && listMatches("encephalon.screen.drops_title")) {
             items.add(new DropsItem());
         }
-        if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
-                || Component.translatable("encephalon.screen.category_title").getString().toLowerCase().contains(behaviorFilter))) {
+        if (scope.type() == ScopeType.MOB_TYPE && listMatches("encephalon.screen.category_title")) {
             items.add(new CategoryItem());
         }
-        if (scope.type() == ScopeType.MOB_TYPE && (behaviorFilter.isEmpty()
-                || Component.translatable("encephalon.screen.damage_title").getString().toLowerCase().contains(behaviorFilter))) {
+        if (scope.type() == ScopeType.MOB_TYPE && listMatches("encephalon.screen.damage_title")) {
             items.add(new DamageItem());
+        }
+        if (scope.type() == ScopeType.MOB_TYPE && listMatches("encephalon.screen.behaviors_title")) {
+            items.add(new BehaviorsItem());
+        }
+        if (scope.type() == ScopeType.MOB_TYPE && listMatches("encephalon.screen.hitbox_title")) {
+            items.add(new HitboxItem());
         }
         for (Behavior b : Behaviors.all()) {
             if (b.scopes().contains(scope.type())
@@ -921,6 +954,14 @@ public class MobEditorScreen extends Screen {
             damageOpen = false;
             changed = true;
         }
+        if (behaviorsOpen && scope.type() != ScopeType.MOB_TYPE) {
+            behaviorsOpen = false;
+            changed = true;
+        }
+        if (hitboxOpen && scope.type() != ScopeType.MOB_TYPE) {
+            hitboxOpen = false;
+            changed = true;
+        }
         behaviorList.setItems(items);
         if (dropsOpen) {
             behaviorList.select(DROPS_KEY);
@@ -928,12 +969,26 @@ public class MobEditorScreen extends Screen {
             behaviorList.select(CATEGORY_KEY);
         } else if (damageOpen) {
             behaviorList.select(DAMAGE_KEY);
+        } else if (behaviorsOpen) {
+            behaviorList.select(BEHAVIORS_KEY);
+        } else if (hitboxOpen) {
+            behaviorList.select(HITBOX_KEY);
         } else if (behavior != null) {
             behaviorList.select(behavior);
         }
         if (changed && placed != null && behaviorList != null && stateButton != null) {
             rebuildDetail();
         }
+    }
+
+    /** Closes every special entry (drops, category, attacks, behaviors) before one of them, or a behavior, is opened. */
+    private void closeEntries() {
+        dropsOpen = false;
+        categoryOpen = false;
+        damageOpen = false;
+        behaviorsOpen = false;
+        hitboxOpen = false;
+        addMode = false;
     }
 
     private final class BehaviorItem implements PickList.Item {
@@ -971,15 +1026,12 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             behavior = b;
-            dropsOpen = false;
-            categoryOpen = false;
-            damageOpen = false;
-            addMode = false;
+            closeEntries();
             rebuildDetail();
         }
     }
 
-    /** The "Drops" entry of a mob type's behavior list: opens the drops editor in the right panel. */
+    /** The "Drops" entry of a mob type's list: opens the drops editor in the right panel. */
     private final class DropsItem implements PickList.Item {
         @Override
         public Object key() {
@@ -1002,17 +1054,15 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             behavior = null;
+            closeEntries();
             dropsOpen = true;
-            categoryOpen = false;
-            damageOpen = false;
-            addMode = false;
             gridScroll = 0;
             pickFilter = "";
             rebuildDetail();
         }
     }
 
-    /** The "Category" entry of a mob type's behavior list: opens the category picker in the right panel. */
+    /** The "Category" entry of a mob type's list: opens the category picker in the right panel. */
     private final class CategoryItem implements PickList.Item {
         @Override
         public Object key() {
@@ -1036,15 +1086,13 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             behavior = null;
-            dropsOpen = false;
+            closeEntries();
             categoryOpen = true;
-            damageOpen = false;
-            addMode = false;
             rebuildDetail();
         }
     }
 
-    /** The "Damage" entry of a mob type's behavior list: opens the damage editor in the right panel. */
+    /** The "Attacks" entry of a mob type's list: opens the attack damage editor in the right panel. */
     private final class DamageItem implements PickList.Item {
         @Override
         public Object key() {
@@ -1054,7 +1102,7 @@ public class MobEditorScreen extends Screen {
         @Override
         public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
             g.renderFakeItem(new ItemStack(Items.IRON_SWORD), x + 1, y + (h - 16) / 2);
-            boolean custom = scope.type() == ScopeType.MOB_TYPE && data.hasDamages(scope.id());
+            boolean custom = scope.type() == ScopeType.MOB_TYPE && CombatInfo.hasAttackValues(data, scope.id());
             Component state = Component.translatable(custom ? "encephalon.state.custom" : "encephalon.screen.default");
             int color = custom ? 0xFFAA00 : 0xA0A0A0;
             int stateW = f.width(state);
@@ -1067,11 +1115,209 @@ public class MobEditorScreen extends Screen {
         @Override
         public void picked() {
             behavior = null;
-            dropsOpen = false;
-            categoryOpen = false;
+            closeEntries();
             damageOpen = true;
-            addMode = false;
             rebuildDetail();
+        }
+    }
+
+    /** The "Behaviors" entry of a mob type's list: only what the mob does that can be edited (see DamageDefaults.behaviorsOf). */
+    private final class BehaviorsItem implements PickList.Item {
+        @Override
+        public Object key() {
+            return BEHAVIORS_KEY;
+        }
+
+        @Override
+        public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
+            g.renderFakeItem(new ItemStack(Items.REDSTONE), x + 1, y + (h - 16) / 2);
+            boolean custom = scope.type() == ScopeType.MOB_TYPE && CombatInfo.hasBehaviorValues(data, scope.id());
+            Component state = Component.translatable(custom ? "encephalon.state.custom" : "encephalon.screen.default");
+            int color = custom ? 0xFFAA00 : 0xA0A0A0;
+            int stateW = f.width(state);
+            int ty = y + (h - 8) / 2 + 1;
+            g.drawString(f, fit(Component.translatable("encephalon.screen.behaviors_title").getString(), w - 20 - stateW - 6),
+                    x + 20, ty, 0xFFFFFF, true);
+            g.drawString(f, state, x + w - stateW - 2, ty, color, true);
+        }
+
+        @Override
+        public void picked() {
+            behavior = null;
+            closeEntries();
+            behaviorsOpen = true;
+            rebuildDetail();
+        }
+    }
+
+    /** The "Hitboxes" entry of a mob type's list: preview with the hitbox drawn, size settings below it. */
+    private final class HitboxItem implements PickList.Item {
+        @Override
+        public Object key() {
+            return HITBOX_KEY;
+        }
+
+        @Override
+        public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
+            g.renderFakeItem(new ItemStack(Items.SPYGLASS), x + 1, y + (h - 16) / 2);
+            boolean custom = scope.type() == ScopeType.MOB_TYPE && hitData != null && hitData.has(scope.id());
+            Component state = Component.translatable(custom ? "encephalon.state.custom" : "encephalon.screen.default");
+            int stateW = f.width(state);
+            int ty = y + (h - 8) / 2 + 1;
+            g.drawString(f, fit(hitText("encephalon.screen.hitbox_title", "Hitboxes").getString(), w - 20 - stateW - 6),
+                    x + 20, ty, 0xFFFFFF, true);
+            g.drawString(f, state, x + w - stateW - 2, ty, custom ? 0xFFAA00 : 0xA0A0A0, true);
+        }
+
+        @Override
+        public void picked() {
+            behavior = null;
+            closeEntries();
+            hitboxOpen = true;
+            rebuildDetail();
+        }
+    }
+
+    private static Component hitText(String key, String fallback, Object... args) {
+        return Component.translatableWithFallback(key, fallback, args);
+    }
+
+    private void buildHitboxPanel() {
+        hitBoxes.clear();
+        String id = scope.id();
+        int base = viewBottom() - HIT_PANEL_H;
+        hitInfoY = base + 2;
+        int half = (rw - 4) / 2;
+        int by = base + 24;
+        HitboxData.Hitbox cur = hitData.hitbox(id);
+        HitBox wBox = track(new HitBox(this.font, rx, by, half, 0, cur));
+        HitBox hBox = track(new HitBox(this.font, rx + half + 4, by, rw - half - 4, 1, cur));
+        wBox.setEditable(editable);
+        hBox.setEditable(editable);
+        hitBoxes.add(wBox);
+        hitBoxes.add(hBox);
+        hitFit = track(Button.builder(hitText("encephalon.screen.hitbox_fit", "Fit to Model"), b -> fitHitbox())
+                .bounds(rx, by + 24, half, 20)
+                .tooltip(Tooltip.create(hitText("encephalon.screen.hitbox_fit_tip",
+                        "Measures the model that is drawn and makes a hitbox that fits it. The result is stored as plain numbers, so it costs nothing in the game."))).build());
+        hitReset = track(Button.builder(hitText("encephalon.screen.hitbox_reset", "Reset Hitbox"), b -> resetHitbox())
+                .bounds(rx + half + 4, by + 24, rw - half - 4, 20).build());
+        hitFit.active = false;
+        hitReset.active = editable && hitData.has(id);
+        contentHeight = 0;
+        layoutDetail();
+    }
+
+    private boolean fitReady() {
+        Preview p = active;
+        return editable && p != null && scope.type() == ScopeType.MOB_TYPE && p.type == selectedType() && p.hasMeasure()
+                && (isVanilla(p.type) || p.stable);
+    }
+
+    private void fitHitbox() {
+        Preview p = active;
+        if (!fitReady() || p == null) {
+            return;
+        }
+        float[] r = new float[2];
+        p.range(1, r);
+        double h = Mth.clamp(r[1], 0.1, 32.0);
+        double w = Mth.clamp(2.0 * p.radius(), 0.1, 32.0);
+        String id = scope.id();
+        HitboxData.Hitbox old = hitData.hitbox(id);
+        HitboxData.Hitbox nh = new HitboxData.Hitbox(old.wMul(), old.hMul(), true, w, h);
+        edit(() -> hitData.set(id, nh));
+        refreshHitboxWidgets();
+    }
+
+    private void resetHitbox() {
+        setFocused(null);
+        String id = scope.id();
+        edit(() -> hitData.clear(id));
+        rebuildDetail();
+    }
+
+    private void refreshHitboxWidgets() {
+        if (hitReset != null) {
+            hitReset.active = editable && hitData.has(scope.id());
+        }
+    }
+
+    /** Size multiplier field: kind 0 = width, 1 = height. 1 (or empty) is the normal size. Enter or clicking away applies it. */
+    private final class HitBox extends EditBox {
+        private final int kind;
+
+        HitBox(Font font, int x, int y, int w, int kind, HitboxData.Hitbox cur) {
+            super(font, x, y, w, 20, Component.literal("hitbox"));
+            this.kind = kind;
+            setMaxLength(6);
+            double v = kind == 0 ? cur.wMul() : cur.hMul();
+            if (v != 1.0) {
+                setValue(fmt(v));
+            }
+            setFilter(s -> s.matches("\\d*\\.?\\d*"));
+            setHint(hitText(kind == 0 ? "encephalon.screen.hitbox_width" : "encephalon.screen.hitbox_height",
+                    kind == 0 ? "Width x (1 = normal)" : "Height x (1 = normal)"));
+        }
+
+        void commit() {
+            if (!editable) {
+                return;
+            }
+            String id = scope.id();
+            HitboxData.Hitbox old = hitData.hitbox(id);
+            double v = 1.0;
+            String txt = getValue().trim();
+            if (!txt.isEmpty()) {
+                try {
+                    v = Mth.clamp(Double.parseDouble(txt), 0.1, 10.0);
+                } catch (NumberFormatException e) {
+                    v = 1.0;
+                }
+            }
+            HitboxData.Hitbox nh = kind == 0 ? new HitboxData.Hitbox(v, old.hMul(), old.fit(), old.fitW(), old.fitH())
+                    : new HitboxData.Hitbox(old.wMul(), v, old.fit(), old.fitW(), old.fitH());
+            if (!nh.equals(old)) {
+                edit(() -> hitData.set(id, nh));
+            }
+            setValue(v == 1.0 ? "" : fmt(v));
+            refreshHitboxWidgets();
+        }
+
+        @Override
+        public void setFocused(boolean focused) {
+            boolean was = isFocused();
+            super.setFocused(focused);
+            if (was && !focused) {
+                commit();
+            }
+        }
+
+        @Override
+        public boolean keyPressed(int key, int scan, int mods) {
+            if (isFocused() && (key == 257 || key == 335)) {
+                commit();
+                return true;
+            }
+            return super.keyPressed(key, scan, mods);
+        }
+    }
+
+    /** Text under the preview: default and current hitbox size, and what the two fields do. */
+    private void drawHitboxInfo(GuiGraphics g) {
+        EntityType<?> t = selectedType();
+        HitboxData.Hitbox h = hitData.hitbox(scope.id());
+        float[] cur = h.size(t.getWidth(), t.getHeight());
+        Component line = hitText("encephalon.screen.hitbox_info", "Default %s x %s   Now %s x %s blocks",
+                fmt(Math.round(t.getWidth() * 100) / 100.0), fmt(Math.round(t.getHeight() * 100) / 100.0),
+                fmt(Math.round(cur[0] * 100) / 100.0), fmt(Math.round(cur[1] * 100) / 100.0));
+        g.drawString(this.font, fit(line.getString(), rw), rx, hitInfoY, h.isDefault() ? 0xA0A0A0 : 0xFFAA00, true);
+        Component sub = h.fit()
+                ? hitText("encephalon.screen.hitbox_fitted", "Fitted to the model (grey box: default, yellow: now)")
+                : hitText("encephalon.screen.hitbox_legend", "Grey box: default, yellow: now");
+        g.drawString(this.font, fit(sub.getString(), rw), rx, hitInfoY + 11, 0x808080, true);
+        if (hitFit != null) {
+            hitFit.active = fitReady();
         }
     }
 
@@ -1103,7 +1349,11 @@ public class MobEditorScreen extends Screen {
             buildCategoryPanel();
             return;
         }
-        if (damageOpen && scope.type() == ScopeType.MOB_TYPE && data != null) {
+        if (hitboxOpen && scope.type() == ScopeType.MOB_TYPE && data != null && hitData != null) {
+            buildHitboxPanel();
+            return;
+        }
+        if ((damageOpen || behaviorsOpen) && scope.type() == ScopeType.MOB_TYPE && data != null) {
             buildDamagePanel();
             return;
         }
@@ -1221,6 +1471,9 @@ public class MobEditorScreen extends Screen {
         String mobId = sc.type() == ScopeType.MOB_TYPE ? sc.id() : null;
         edit(() -> {
             data.clearScope(sc);
+            if (mobId != null && hitData != null) {
+                hitData.clear(mobId);
+            }
             if (mobId != null) {
                 CategoryBehavior.refresh(server, mobId);
             }
@@ -1797,26 +2050,30 @@ public class MobEditorScreen extends Screen {
         g.drawString(this.font, fit(state.getString(), rw), rx, categoryStateY - scroll, own != null ? 0xFFAA00 : 0xA0A0A0, true);
     }
 
-    // ------------------------------------------------------------------ damage editor
+    // ------------------------------------------------------------------ attacks / behaviors editor
+    // One panel for both entries: Attacks lists the attacks of the mob (damage values), Behaviors lists only values that can be
+    // edited (the mod's own config values, the duration and level of effects it applies). The rows are the same kind of box.
 
-        private void buildDamagePanel() {
+    private void buildDamagePanel() {
         EntityType<?> type = selectedType();
         String mobId = scope.id();
+        boolean behaviors = behaviorsOpen;
         String own = data.category(mobId);
         boolean forced = own != null && !"passive".equals(own) && !own.equals(MobGroups.categoryOf(type));
         java.util.concurrent.atomic.AtomicReference<List<DamageDefaults.Attack>> found =
                 new java.util.concurrent.atomic.AtomicReference<>(List.of());
-        edit(() -> found.set(DamageDefaults.attacksOf(server, type, forced)));
+        edit(() -> found.set(behaviors ? CombatInfo.behaviorsOf(server, type)
+                : CombatInfo.attacksOf(server, type, forced)));
         damageAttacks = found.get();
-        damageFallback = DamageDefaults.isFallback(type)
+        damageFallback = !behaviors && DamageDefaults.isFallback(type)
                 && damageAttacks.stream().anyMatch(a -> a.kind() == DamageDefaults.Kind.MELEE);
-        damageDesc = this.font.split(Component.translatable("encephalon.screen.damage_desc"), rw);
+        damageDesc = this.font.split(Component.translatable(behaviors ? "encephalon.screen.behaviors_desc" : "encephalon.screen.damage_desc"), rw);
         int y = TOP + 2 + warnH + damageDesc.size() * 10 + 4;
         damageStateY = y;
         y += damageFallback ? 24 : 14;
         damageReset = track(Button.builder(Component.translatable("encephalon.screen.damage_reset"), b -> resetDamage())
                 .bounds(rx, y, rw, 20).build());
-        damageReset.active = editable && data.hasDamages(scope.id());
+        damageReset.active = editable && (behaviors ? CombatInfo.hasBehaviorValues(data, mobId) : CombatInfo.hasAttackValues(data, mobId));
         y += 28;
         if (damageAttacks.isEmpty()) {
             y += 14;
@@ -1841,28 +2098,39 @@ public class MobEditorScreen extends Screen {
         layoutDetail();
     }
 
+    /** The "Reset to Default" button of the panel: the attack values or the behavior values of the mob, whichever is open. */
     private void resetDamage() {
         setFocused(null);
         String id = scope.id();
-        edit(() -> data.clearDamages(id));
+        boolean behaviors = behaviorsOpen;
+        edit(() -> {
+            if (behaviors) {
+                CombatInfo.clearBehaviorValues(data, id);
+            } else {
+                CombatInfo.clearAttackValues(data, id, damageAttacks);
+            }
+        });
         rebuildDetail();
     }
 
-    /** Damage field of one attack: the greyed hint is the default; Enter or clicking away applies it (0 - 1000), empty resets it. */
+    /** Value field of one row: the greyed hint is the default; Enter or clicking away applies it, empty resets it. */
     private final class DamageBox extends EditBox {
         private final String mobId;
         private final DamageDefaults.Attack attack;
+        private final boolean behaviorRow;
 
         DamageBox(Font font, int x, int y, int w, String mobId, DamageDefaults.Attack attack, Double current) {
             super(font, x, y, w, 20, Component.literal(attack.id()));
             this.mobId = mobId;
             this.attack = attack;
-            setMaxLength(8);
+            this.behaviorRow = CombatInfo.isBehaviorId(attack.id());
+            setMaxLength(behaviorRow ? 12 : 8);
             if (current != null) {
                 setValue(fmt(current));
             }
-            setFilter(s -> s.matches("\\d*\\.?\\d*"));
-                        setHint(attack.def() < 0 ? Component.translatable("encephalon.screen.damage_varies") : Component.literal(fmt(attack.def())));
+            setFilter(behaviorRow ? s -> s.matches("-?\\d*\\.?\\d*") : s -> s.matches("\\d*\\.?\\d*"));
+            setHint(attack.def() < 0
+                    ? Component.translatable("encephalon.screen.damage_varies") : Component.literal(fmt(attack.def())));
         }
 
         void commit() {
@@ -1874,7 +2142,8 @@ public class MobEditorScreen extends Screen {
             Double nv = null;
             if (!txt.isEmpty()) {
                 try {
-                    nv = Mth.clamp(Double.parseDouble(txt), 0.0, DAMAGE_MAX);
+                    nv = behaviorRow ? Mth.clamp(Double.parseDouble(txt), -BEHAVIOR_MAX, BEHAVIOR_MAX)
+                            : Mth.clamp(Double.parseDouble(txt), 0.0, DAMAGE_MAX);
                 } catch (NumberFormatException e) {
                     setValue(old == null ? "" : fmt(old));
                     return;
@@ -1891,7 +2160,7 @@ public class MobEditorScreen extends Screen {
                     }
                 });
                 if (damageReset != null) {
-                    damageReset.active = data.hasDamages(mobId);
+                    damageReset.active = behaviorRow ? CombatInfo.hasBehaviorValues(data, mobId) : CombatInfo.hasAttackValues(data, mobId);
                 }
             }
             setValue(nv == null ? "" : fmt(nv));
@@ -1921,7 +2190,11 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-        private static Component attackInfo(DamageDefaults.Attack a) {
+    private static Component attackInfo(DamageDefaults.Attack a) {
+        if (CombatInfo.isBehaviorId(a.id())) {
+            return a.def() < 0 ? Component.translatable("encephalon.screen.damage_info_varies")
+                    : Component.translatable("encephalon.screen.behavior_info", fmt(a.def()));
+        }
         if (a.def() < 0) {
             return Component.translatable("encephalon.screen.damage_info_varies");
         }
@@ -1932,11 +2205,14 @@ public class MobEditorScreen extends Screen {
     }
 
     private void drawDamageEditor(GuiGraphics g) {
+        boolean behaviors = behaviorsOpen;
         for (int i = 0; i < damageDesc.size(); i++) {
             g.drawString(this.font, damageDesc.get(i), rx, TOP + 2 + warnH + i * 10 - scroll, 0xC8C8C8, true);
         }
-        boolean custom = data.hasDamages(scope.id());
-        Component state = Component.translatable(custom ? "encephalon.screen.damage_state_custom" : "encephalon.screen.damage_state_default");
+        boolean custom = behaviors ? CombatInfo.hasBehaviorValues(data, scope.id()) : CombatInfo.hasAttackValues(data, scope.id());
+        Component state = Component.translatable(behaviors
+                ? (custom ? "encephalon.screen.behaviors_state_custom" : "encephalon.screen.behaviors_state_default")
+                : (custom ? "encephalon.screen.damage_state_custom" : "encephalon.screen.damage_state_default"));
         g.drawString(this.font, fit(state.getString(), rw), rx, damageStateY - scroll, custom ? 0xFFAA00 : 0xA0A0A0, true);
         if (damageFallback) {
             Component note = Component.translatable("encephalon.screen.damage_fallback",
@@ -1945,7 +2221,8 @@ public class MobEditorScreen extends Screen {
         }
         if (damageAttacks.isEmpty()) {
             int ny = damageStateY + (damageFallback ? 24 : 14) + 28 - scroll;
-            g.drawString(this.font, Component.translatable("encephalon.screen.attacks_none"), rx, ny, 0x808080, true);
+            g.drawString(this.font, Component.translatable(behaviors ? "encephalon.screen.behaviors_none" : "encephalon.screen.attacks_none"),
+                    rx, ny, 0x808080, true);
         }
         for (DamageRow row : damageRows) {
             DamageDefaults.Attack a = row.attack();
@@ -1959,7 +2236,7 @@ public class MobEditorScreen extends Screen {
                 continue;
             }
             boolean set = data.damage(scope.id(), a.id()) != null;
-            g.drawString(this.font, name, rx, y, set ? 0xFFFFFF : 0xA0A0A0, true);
+            g.drawString(this.font, fit(name.getString(), rw), rx, y, set ? 0xFFFFFF : 0xA0A0A0, true);
             g.drawString(this.font, fit(attackInfo(a).getString(), rw), rx, y + 10, 0x808080, true);
         }
     }
@@ -1981,11 +2258,7 @@ public class MobEditorScreen extends Screen {
         return e instanceof FlyingAnimal || e instanceof FlyingMob || e instanceof Bat || e instanceof EnderDragon;
     }
 
-    /**
-     * Fish-like mobs, vanilla or modded: renderers lay them on their side whenever isInWater() is false, so they need the
-     * wet flag. Judged by mob category rather than class so modded fish that do not extend AbstractFish are covered.
-     * Dolphins and squids are left out: they are handled separately and animate fine as they are.
-     */
+    /** Fish-like mobs, vanilla or modded: renderers lay them on their side whenever isInWater() is false, so they need the wet flag. */
     private static boolean isFish(LivingEntity e) {
         if (e instanceof Dolphin || e instanceof Squid) {
             return false;
@@ -1998,13 +2271,9 @@ public class MobEditorScreen extends Screen {
                 || (!isVanilla(e.getType()) && placedInWater(e.getType()));
     }
 
-    /** placedInWater answers, per type (asked several times per preview tick, and the answer never changes). */
     private static final Map<EntityType<?>, Boolean> IN_WATER = new ConcurrentHashMap<>();
 
-    /**
-     * Modded swimmers are often filed under MONSTER (the Skelewag), so category alone misses them and they get drawn as if
-     * stranded on land (lying on their side). Their spawn placement says where they really live.
-     */
+    /** Modded swimmers are often filed under MONSTER, so their spawn placement says where they really live. */
     private static boolean placedInWater(EntityType<?> t) {
         return IN_WATER.computeIfAbsent(t, k -> {
             try {
@@ -2015,7 +2284,6 @@ public class MobEditorScreen extends Screen {
         });
     }
 
-    /** Modded swimmers are made in the flooded dummy world (see PreviewLevel); everything else in the dry one. */
     private static final Map<EntityType<?>, Boolean> AQUATIC = new ConcurrentHashMap<>();
 
     private boolean aquatic(EntityType<?> t) {
@@ -2037,13 +2305,11 @@ public class MobEditorScreen extends Screen {
         return water;
     }
 
-    /** The dummy world preview mobs live in; the real client level only if a dummy could not be built. */
     private Level levelFor(boolean flooded) {
         PreviewLevel dummy = PreviewLevel.get(flooded);
         return dummy != null ? dummy : this.minecraft.level;
     }
 
-    /** Creates an entity of this type in a dummy world, inside the sandbox (its constructor is the mod's code). */
     private static Entity createIn(EntityType<?> t, Level level) {
         return PreviewSandbox.<Entity>asLevel(level, () -> t.create(level));
     }
@@ -2061,14 +2327,7 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /**
-     * The velocity the preview mob is given each step. It is also applied when the mob is created: models such as the
-     * dolphin's switch between a still and a swimming pose depending on whether the mob is moving, so a mob that starts
-     * with zero velocity jolts from one pose to the other on its first step.
-     */
     private static Vec3 previewMotion(LivingEntity e) {
-        // Modded land animals get a slow walk too: many mods start their walk animation from the mob's own velocity, not from
-        // the walk state, so a mob with zero velocity would only ever play its idle. Modded swimmers get a slow swim, forward.
         boolean moddedWalker = !isVanilla(e.getType()) && !isFlyer(e) && !isFish(e);
         boolean moddedSwimmer = !isVanilla(e.getType()) && isFish(e);
         return new Vec3(0.0, 0.0, e instanceof EnderDragon ? -0.5 : e instanceof Dolphin ? -0.05 : moddedSwimmer ? -0.05 : moddedWalker ? 0.05 : 0.0);
@@ -2078,14 +2337,13 @@ public class MobEditorScreen extends Screen {
         return BuiltInRegistries.ENTITY_TYPE.getKey(t).getNamespace().equals("minecraft");
     }
 
-    /** The entity class of a type (made once, never added to a level), or null if one can't be made. */
     private static final Map<EntityType<?>, Class<?>> CLASS_OF = new ConcurrentHashMap<>();
     private static final Map<Class<?>, Boolean> HAS_BOSS_BAR = new ConcurrentHashMap<>();
 
     private Class<?> classOf(EntityType<?> t) {
         Class<?> c = CLASS_OF.get(t);
         if (c == null && this.minecraft.level != null) {
-            c = Void.class; // "unknown", so a type that can't be made is not tried again every frame
+            c = Void.class;
             try {
                 Entity e = createIn(t, levelFor(false));
                 if (e != null) {
@@ -2100,7 +2358,6 @@ public class MobEditorScreen extends Screen {
         return c == null || c == Void.class ? null : c;
     }
 
-    /** Whether the class (or one it extends) holds a boss bar: a boss, whatever the mod calls it or tags it as. */
     private static boolean hasBossBar(Class<?> c) {
         for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
             try {
@@ -2121,11 +2378,6 @@ public class MobEditorScreen extends Screen {
         return c != null && Mob.class.isAssignableFrom(c);
     }
 
-    /**
-     * Modded mobs the preview must draw but never tick, and give no server twin: the ones in the built-in / config list, modded
-     * bosses (tagged c:bosses), and anything whose class holds a boss bar. Their own code changes the sky, starts music and
-     * so on when they merely exist. Asked on every preview tick, so the answer is cached per type for this editor session.
-     */
     private boolean quiet(EntityType<?> t) {
         Boolean known = quietCache.get(t);
         if (known == null) {
@@ -2146,12 +2398,6 @@ public class MobEditorScreen extends Screen {
         return c != null && HAS_BOSS_BAR.computeIfAbsent(c, MobEditorScreen::hasBossBar);
     }
 
-    /**
-     * Mobs that get no server twin (so none of their body parts exist). Only the ones named in the built-in / config lists.
-     * Bosses that are merely detected as bosses (tag or boss bar) are not in that group: a multi-part boss such as the Void
-     * Worm needs its twin to have a body. Its boss bar is hidden and disarmed by PreviewBossBars, and its sounds and music are
-     * dropped; set bossTwins=false in the config to give detected bosses no twin again.
-     */
     private boolean noTwin(EntityType<?> t) {
         if (isVanilla(t)) {
             return false;
@@ -2162,21 +2408,16 @@ public class MobEditorScreen extends Screen {
         return !EncephalonConfig.bossTwins() && quiet(t);
     }
 
-    // Size to screen curve: the fraction of the panel height a mob of `size` blocks gets. It is smooth (no hard minimum), so
-    // relative sizes hold: a chicken is clearly smaller than a zombie, which is clearly smaller than a giant.
-    // Raise SIZE_K to make everything bigger. Lower SIZE_EXP to make small mobs bigger relative to big ones.
     private static final float SIZE_K = 0.38F;
     private static final float SIZE_EXP = 0.65F;
     private static final float MIN_FRAC = 0.14F;
 
-    /** The scale (pixels per block) a mob of this size (blocks) is drawn at, before the fit rules shrink it further. */
     private static float baseScale(float panelH, float size) {
         size = Math.max(size, 0.05F);
         float frac = Mth.clamp(SIZE_K * (float) Math.pow(size, SIZE_EXP), MIN_FRAC, 1F);
         return panelH * frac / size;
     }
 
-    /** Logs a preview step that took long, with the mob id, so lag spikes can be traced to a mob and a phase. */
     private static void slow(String what, EntityType<?> t, long startNanos) {
         long ms = (System.nanoTime() - startNanos) / 1_000_000L;
         if (ms >= 25) {
@@ -2196,7 +2437,6 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ preview zone / server twins
 
-    /** Fixes where previews are parked and tells PreviewZone to silence / protect everything that appears there. */
     private void setupPreviewZone() {
         if (anchorReady || this.minecraft.player == null || this.minecraft.level == null) {
             return;
@@ -2215,7 +2455,6 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Removes anything left over from a preview that never got cleaned up (a crash, say): nothing else lives this high. */
     private void sweepOrphans() {
         if (server == null || this.minecraft.level == null || this.minecraft.player == null) {
             return;
@@ -2247,10 +2486,6 @@ public class MobEditorScreen extends Screen {
         return -1;
     }
 
-    /**
-     * Queues the hidden twin of a modded mob so the entities its server logic creates exist for the preview. Nothing here waits
-     * for the server: the result is picked up by twinReady() on a later frame.
-     */
     private void startTwin(Preview p) {
         EntityType<?> type = p.type;
         var dim = this.minecraft.level.dimension();
@@ -2268,13 +2503,12 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Server thread. Spawns and fast-forwards the twin; returns its entity id, or TWIN_FAILED. */
     private int spawnTwin(ResourceKey<Level> dim, EntityType<?> type, AABB box, double x, double y, double z, String namespace) {
         if (PreviewZone.zone == null || server == null) {
-            return TWIN_FAILED; // the editor was closed before this ran
+            return TWIN_FAILED;
         }
         int id = TWIN_FAILED;
-        PreviewZone.beginSpawn(namespace); // anything this mob creates outside the column, or that is not from its own mod, is vetoed
+        PreviewZone.beginSpawn(namespace);
         try {
             ServerLevel sl = server.getLevel(dim);
             if (sl == null) {
@@ -2297,11 +2531,10 @@ public class MobEditorScreen extends Screen {
                 mob.setSilent(true);
                 mob.setPersistenceRequired();
                 mob.addTag(PREVIEW_TAG);
-                // Same as /summon: lets mods set up what they normally set up on spawn (emerge state, riders, ...).
                 mob.finalizeSpawn(sl, sl.getCurrentDifficultyAt(mob.blockPosition()), MobSpawnType.COMMAND, null);
                 if (sl.addFreshEntity(mob)) {
                     id = mob.getId();
-                    PreviewZone.pinTwin(mob, new Vec3(x, y, z)); // it must not drift: its parts are drawn relative to this spot
+                    PreviewZone.pinTwin(mob, new Vec3(x, y, z));
                 }
             } catch (RuntimeException | LinkageError ex) {
                 EncephalonMod.LOGGER.warn("Mob Editor preview: could not spawn the server twin of {}", type, ex);
@@ -2314,13 +2547,11 @@ public class MobEditorScreen extends Screen {
             PreviewZone.endSpawn();
         }
         if (id >= 0) {
-            // Do not wait for the real-time server ticks that build the body (segments, heads, ...): run them now.
             preTickTwin(dim, box, x, y, z, id, namespace);
         }
         return id;
     }
 
-    /** Render thread. True once the twin exists; a failed twin is dropped here (and the mob is shown without one). */
     private boolean twinReady(Preview p) {
         if (p.twinId >= 0) {
             return true;
@@ -2346,14 +2577,6 @@ public class MobEditorScreen extends Screen {
         return true;
     }
 
-    /**
-     * Server thread. Fast-forwards a freshly spawned twin: the twin and everything it has made so far (each pass re-reads the
-     * box, so parts created by earlier passes are ticked too) are ticked up to TWIN_PRETICKS times, within a time budget,
-     * without waiting 50 ms per tick. A body that a mod assembles over a second or two of ticks is therefore complete (or
-     * nearly) when the client first sees it. Runs inside the same containment as spawning (PreviewZone.beginSpawn), so
-     * everything that is not a body part of the twin is still vetoed. A tick that throws just skips that entity this pass.
-     * Works for any mod: nothing here knows what the twin makes.
-     */
     private void preTickTwin(ResourceKey<Level> dim, AABB box, double x, double y, double z, int twinId, String namespace) {
         ServerLevel sl = server == null ? null : server.getLevel(dim);
         if (sl == null || PreviewZone.zone == null) {
@@ -2380,7 +2603,7 @@ public class MobEditorScreen extends Screen {
                     }
                 }
                 if (!twin.isRemoved()) {
-                    twin.setPos(x, y, z); // same pin PreviewZone applies after each real tick
+                    twin.setPos(x, y, z);
                     twin.setDeltaMovement(Vec3.ZERO);
                 }
             }
@@ -2389,7 +2612,6 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Removes a mob's twin and everything it spawned, and gives its slot back. */
     private void stopTwin(Preview p) {
         if (p.slot < 0) {
             return;
@@ -2444,7 +2666,6 @@ public class MobEditorScreen extends Screen {
     public void removed() {
         clearAllTwins();
         active = null;
-        // Anything a preview mob's client code added to the client level up there (the server twins are removed above).
         AABB zone = PreviewZone.zone;
         if (zone != null && this.minecraft.level != null) {
             for (Entity stray : this.minecraft.level.getEntities((Entity) null, zone, c -> !(c instanceof Player))) {
@@ -2456,11 +2677,6 @@ public class MobEditorScreen extends Screen {
         super.removed();
     }
 
-    /**
-     * Entities around a preview mob that belong to it: parts, a head, tails, orbiting bones. Also decides when the group has settled
-     * (and learns which mob types have companions at all, so later previews know whether a twin is worth it).
-     * Scanned once per frame and shared by every caller of that frame (the scan walks a big box of the client level).
-     */
     private List<Entity> rawCompanions(Preview p) {
         if (p.slot < 0 || this.minecraft.level == null) {
             return List.of();
@@ -2471,8 +2687,6 @@ public class MobEditorScreen extends Screen {
         if (p.twinId < 0 && !twinReady(p)) {
             return List.of();
         }
-        // Companions of the twin's own mod (see PreviewZone.isPart). Things the twin made that are not part of the mob (the
-        // Void Worm's portal) are effects of the twin standing still up there, and are left out.
         List<Entity> found = this.minecraft.level.getEntities((Entity) null, p.box(),
                 en -> PreviewZone.isPart(en) && en.getId() != p.twinId && en != p.entity && en != this.minecraft.player);
         long now = this.minecraft.level.getGameTime();
@@ -2505,10 +2719,6 @@ public class MobEditorScreen extends Screen {
         return p.warmTicks >= WARMUP_TICKS && p.stable;
     }
 
-    /**
-     * Whether the mob may be shown. A mob known to have parts waits until they have settled so it never appears piecemeal;
-     * one not known to have any shows after the warm-up (parts that turn up later still wait to appear together).
-     */
     private boolean revealable(Preview p) {
         if (!warmedUp(p)) {
             return false;
@@ -2519,7 +2729,6 @@ public class MobEditorScreen extends Screen {
         return p.lastCount <= 0 && !MULTI.contains(p.type);
     }
 
-    /** The preview of the selected mob type: made on first use (and any previous one released), then reused every frame. */
     private Preview current() {
         if (this.minecraft.level == null || scope.type() != ScopeType.MOB_TYPE) {
             return null;
@@ -2540,14 +2749,12 @@ public class MobEditorScreen extends Screen {
         return p;
     }
 
-    /** The preview of a mob that is no longer shown is dropped, together with its server twin. */
     private void release(Preview old) {
         if (old != null) {
             stopTwin(old);
         }
     }
 
-    /** Creates and sets up a preview mob (and its twin when it may need one), or returns null if it can't be made. */
     private Preview create(EntityType<?> t) {
         long t0 = System.nanoTime();
         Preview made = createImpl(t);
@@ -2584,17 +2791,12 @@ public class MobEditorScreen extends Screen {
             if (e instanceof LivingEntity living) {
                 living.setSilent(true);
                 if (living instanceof Hoglin || living instanceof AbstractPiglin) {
-                    // Stops them shaking as if converting to zombified in the overworld. Not for other mobs: the dragon,
-                    // for one, freezes its wings when it has no AI.
                     ((Mob) living).setNoAi(true);
                 }
                 faceViewer(living);
-                // Park it at its spot now, while tickCount is still 0: entities treat a move after that as a teleport
-                // (a shulker, for one, slides in from its old position).
                 living.setPos(x, y, z);
                 living.setOldPosAndRot();
                 living.setDeltaMovement(previewMotion(living));
-                // Start in the steady walking state instead of ramping up to it after the first frame.
                 living.walkAnimation.update(WALK_SPEED, 1.0F);
                 return living;
             }
@@ -2607,7 +2809,6 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ hidden draws
 
-    /** Draws with an empty clip area: the animation library runs, nothing is shown. Returns false if drawing failed. */
     private boolean hiddenRender(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras, float realPartial) {
         long t0 = System.nanoTime();
         boolean done = hiddenRenderImpl(g, p, withMain, partial, extras, realPartial);
@@ -2646,7 +2847,7 @@ public class MobEditorScreen extends Screen {
         return ok;
     }
 
-    /** Draws the mob and its companions. Companions are placed relative to the mob, which sits at its anchor. */
+    /** Draws the mob and its companions (placed relative to the mob, which sits at its anchor), and the hitbox in Hitboxes mode. */
     private void drawModels(GuiGraphics g, Preview p, boolean withMain, float partial, List<Entity> extras,
                             float realPartial, PoseStack pose, EntityRenderDispatcher dispatcher) {
         if (withMain) {
@@ -2655,13 +2856,13 @@ public class MobEditorScreen extends Screen {
                 source = new ExtentProbe(source, p, new Matrix4f(pose.last().pose()).invert());
             }
             final MultiBufferSource use = source;
-            // The renderer is the mod's code too: it runs with the singleton pointed at the dummy world.
             PreviewSandbox.asLevelRun(p.entity.level(),
                     () -> dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, use, 15728880));
+            if (hitboxOpen && !measuring && hitData != null) {
+                drawHitbox(g, p, pose);
+            }
         }
         for (Entity c : extras) {
-            // These are ticked by the real client clock. A companion that fails to draw is skipped; it should not take
-            // the whole preview down with it.
             try {
                 double dx = Mth.lerp(realPartial, c.xOld, c.getX()) - p.ax;
                 double dy = Mth.lerp(realPartial, c.yOld, c.getY()) - p.ay;
@@ -2674,13 +2875,18 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /**
-     * Animation libraries (GeckoLib and the like) blend from the bind pose into idle over a number of ticks of the mob's age.
-     * Instead of waiting for that in real time, a batch of ticks is simulated in one frame, each one advancing tickCount, and the
-     * mob is then rendered off-screen once, so the blend is over before the mob is ever shown. The draw is the expensive part,
-     * so there is one per frame whatever the batch size. Rendered at partial 0 so the animation clock never runs backwards when the real-time stepping takes over.
-     * Returns false if drawing failed.
-     */
+    /** The default hitbox (grey) and the edited one (yellow), as line boxes around the mob's feet. Drawn straight to the real buffer, never measured. */
+    private void drawHitbox(GuiGraphics g, Preview p, PoseStack pose) {
+        float dw = p.type.getWidth();
+        float dh = p.type.getHeight();
+        float[] s = hitData.hitbox(BuiltInRegistries.ENTITY_TYPE.getKey(p.type).toString()).size(dw, dh);
+        VertexConsumer lines = g.bufferSource().getBuffer(RenderType.lines());
+        if (Math.abs(s[0] - dw) > 1.0E-3F || Math.abs(s[1] - dh) > 1.0E-3F) {
+            LevelRenderer.renderLineBox(pose, lines, new AABB(-dw / 2.0, 0.0, -dw / 2.0, dw / 2.0, dh, dw / 2.0), 0.6F, 0.6F, 0.6F, 1F);
+        }
+        LevelRenderer.renderLineBox(pose, lines, new AABB(-s[0] / 2.0, 0.0, -s[0] / 2.0, s[0] / 2.0, s[1], s[0] / 2.0), 1F, 0.85F, 0.1F, 1F);
+    }
+
     private boolean fastForward(GuiGraphics g, Preview p, List<Entity> raw, float realPartial) {
         int steps = FAST_STEPS;
         for (int i = 0; i < steps; i++) {
@@ -2692,11 +2898,7 @@ public class MobEditorScreen extends Screen {
         return ok;
     }
 
-    /**
-     * Passes everything through to the real buffer and records where the vertices land. Each vertex is put back through the
-     * inverse of the pose the mob is drawn with, which gives its position in blocks around the mob's anchor whatever the
-     * scale, sway or turn of the pose is.
-     */
+    /** Passes everything through to the real buffer and records where the vertices land (in blocks around the mob's anchor). */
     private static final class ExtentProbe implements MultiBufferSource {
         private final MultiBufferSource delegate;
         private final Preview p;
@@ -2763,10 +2965,9 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ stepping
 
-    /** Fixed-timestep simulation driven by the real clock, so age = tickCount + partial never goes backwards. */
     private void stepFrames(Preview p, long now) {
         if (now - p.sim > 1_000_000_000L) {
-            p.sim = now; // was not rendering for a while (cached, or a behavior was open); don't fast-forward
+            p.sim = now;
         }
         int steps = 0;
         while (now - p.sim >= TICK_NANOS) {
@@ -2777,18 +2978,10 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** One preview step, run inside the sandbox: the mob's tick is the mod's code, so Minecraft.level is the dummy world meanwhile. */
     private void stepPreview(Preview p) {
         PreviewSandbox.asLevelRun(p.entity.level(), () -> stepPreviewInner(p));
     }
 
-    /**
-     * One 20 Hz step of the preview mob. The entity is ticked so its own animations run (dragon wings, bat, guardian, ...),
-     * but the walk cycle is driven here at a fixed speed. If the walk state can't be pinned, only the dragon is
-     * ticked and everything else is animated by hand.
-     * The level normally does the per-tick bookkeeping (old position and tickCount) before entity.tick(); tickCount is the
-     * "age" that rods, tentacles, wings and segments animate from, so it must advance here or those mobs vibrate.
-     */
     private void stepPreviewInner(Preview p) {
         if (this.minecraft.level == null || this.minecraft.player == null) {
             return;
@@ -2797,11 +2990,6 @@ public class MobEditorScreen extends Screen {
         boolean dragon = e instanceof EnderDragon;
         e.tickCount++;
         p.warmTicks++;
-        // Modded swimmers live in the flooded dummy world, where the game's own water logic works, so they are ticked like any
-        // other mob. Only if no dummy world could be built (the entity is in the real level) is a modded fish not ticked: the game
-        // resets the water flag to dry at the start of every tick, before the mod's own tick code runs.
-        // Quiet mobs (listed in the config) are not ticked either: their client tick code can start boss music or
-        // change the sky, which a preview must never do.
         boolean skipTick = (e instanceof Guardian && !CAN_PIN_GUARDIAN)
                 || (!isVanilla(e.getType()) && isFish(e) && !(e.level() instanceof PreviewLevel))
                 || quiet(e.getType());
@@ -2815,20 +3003,14 @@ public class MobEditorScreen extends Screen {
                     walk = new float[] {WALK_SPEED_OLD.getFloat(e.walkAnimation), WALK_SPEED_NOW.getFloat(e.walkAnimation),
                             WALK_POS.getFloat(e.walkAnimation)};
                 }
-                faceViewer(e); // the dragon records its yaw every tick and renders from that history
+                faceViewer(e);
                 e.setPos(hx, hy, hz);
                 e.setOldPosAndRot();
-                // The dragon's wing flap rate depends on its speed (a stationary one flaps far too fast), and the dolphin
-                // only animates while it is moving.
                 e.setDeltaMovement(previewMotion(e));
-                // Slimes only squish on ground transitions, so make them hop in place.
-                // Fish stay "airborne" so they do not flop about, as they would out of water.
-                // A dry dolphin on the ground also flops (random hop, random yaw), which showed as a stutter.
                 boolean grounded = e instanceof Slime ? e.tickCount % 24 < 16
                         : !isFlyer(e) && !isFish(e) && !(e instanceof Dolphin);
                 e.setOnGround(grounded);
                 forceWet(e);
-                // Rabbits only animate while hopping, and nothing starts a hop client-side, so start one every so often.
                 if (e instanceof Rabbit rabbit && rabbit.getJumpCompletion(0F) == 0F && e.tickCount % RABBIT_HOP_INTERVAL == 0) {
                     rabbit.startJumping();
                 }
@@ -2837,12 +3019,9 @@ public class MobEditorScreen extends Screen {
                 if (pinGuardian) {
                     tail = GUARDIAN_TAIL.getFloat(e);
                 }
-                // Slimes set oSquish = squish every tick, which makes the squish step at 20 Hz; keep the previous value to lerp.
                 float squish = e instanceof Slime sl ? sl.squish : 0F;
                 long tickStart = System.nanoTime();
                 e.tick();
-                // A mob whose own tick is expensive (a big modded model that scans blocks or entities around it, say) is a
-                // frame-time problem on every frame, so after a few slow ticks it is drawn but no longer ticked.
                 if (System.nanoTime() - tickStart > SLOW_TICK_NANOS) {
                     if (++p.slowTicks >= SLOW_TICK_LIMIT) {
                         p.tickFailed = true;
@@ -2854,14 +3033,11 @@ public class MobEditorScreen extends Screen {
                 }
                 e.setPos(hx, hy, hz);
                 forceWet(e);
-                // Some mobs hide themselves until something server-side reveals them (the Farseer stays invisible until a
-                // player walks up); the preview has no such trigger, so keep it visible.
                 e.setInvisible(false);
                 if (e instanceof Slime sl) {
                     sl.oSquish = squish;
                 }
                 if (e instanceof Squid squid) {
-                    // Out of water a squid slowly tips over; keep it upright with the tentacles hanging down.
                     squid.xBodyRot = 0F;
                     squid.xBodyRotO = 0F;
                     squid.zBodyRot = 0F;
@@ -2888,12 +3064,10 @@ public class MobEditorScreen extends Screen {
         e.walkAnimation.update(e instanceof Turtle ? TURTLE_WALK_SPEED : WALK_SPEED, 0.4F);
     }
 
-    /** How far the shulker's lid is open (0 closed, 1 fully open): a slow cycle that rests briefly at each end. */
     private static float shulkerPeek(int tick) {
         return Mth.clamp(0.5F + 0.7F * (float) Math.sin(tick * 0.1), 0F, 1F);
     }
 
-    /** Opens and closes the lid by hand and cancels the slide-in animation. Best effort: a missing field is ignored. */
     private static void pinShulker(Shulker s) {
         try {
             if (SHULKER_PEEK != null && SHULKER_PEEK_O != null) {
@@ -2919,7 +3093,6 @@ public class MobEditorScreen extends Screen {
                 drawPreviewOff(g);
             }
         } else {
-            // Vanilla Mobs / a category / a mod: no mob, just the Minecraft logo or the mod's name.
             release(active);
             active = null;
             drawScopeIcon(g);
@@ -2928,10 +3101,6 @@ public class MobEditorScreen extends Screen {
 
     private static LogoRenderer mcLogo;
 
-    /**
-     * Vanilla scopes show the Minecraft logo. Mod and mod-category scopes show just the mod's name written out (no mod logos).
-     * All / Modded Mobs show nothing.
-     */
     private void drawScopeIcon(GuiGraphics g) {
         String mod = null;
         boolean vanilla = false;
@@ -2955,7 +3124,7 @@ public class MobEditorScreen extends Screen {
             g.pose().pushPose();
             g.pose().translate(cx, cy, 0F);
             g.pose().scale(s, s, 1F);
-            mcLogo.renderLogo(g, 0, 1F, -26); // screen width 0 centres it on the origin
+            mcLogo.renderLogo(g, 0, 1F, -26);
             g.pose().popPose();
             return;
         }
@@ -2978,12 +3147,6 @@ public class MobEditorScreen extends Screen {
         govern(p, took);
     }
 
-    /**
-     * Frame-time governor for the shown mob, whatever its size or mod. The cost of one frame of it (tick + draw) is tracked as a
-     * moving average. Above FREEZE_NANOS its own tick is switched off (the model is still drawn and animated from its age); if it
-     * is still above OFF_NANOS, or a couple of frames are enormous, the preview of this mob is switched off for the session
-     * instead of freezing the game. The reason is written to the log with the mob id.
-     */
     private void govern(Preview p, long took) {
         if (active != p) {
             return;
@@ -3024,7 +3187,6 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Panel text for a mob whose preview could not be made or was switched off (badTypes). */
     private void drawPreviewOff(GuiGraphics g) {
         List<FormattedCharSequence> lines = this.font.split(Component.translatable("encephalon.screen.preview_off"), Math.max(40, rw - 16));
         int y0 = (TOP + previewBottom()) / 2 - lines.size() * 5;
@@ -3048,7 +3210,6 @@ public class MobEditorScreen extends Screen {
 
         List<Entity> raw = rawCompanions(p);
         p.growEnv(raw);
-        // Companions are only drawn together once the group has settled; until then they are just warmed up hidden.
         List<Entity> extras = p.settled && !raw.isEmpty() ? (raw.size() > 64 ? raw.subList(0, 64) : raw) : List.of();
         boolean visible = revealable(p);
 
@@ -3057,8 +3218,6 @@ public class MobEditorScreen extends Screen {
         boolean dragon = e instanceof EnderDragon;
         boolean modded = !isVanilla(p.type);
         if (!modded && !p.vanillaMeasured && !dragon && !(e instanceof Squid || e instanceof Ghast)) {
-            // Size a vanilla mob by what is really drawn (a giant's model is six times its type's default, say), not by its
-            // hitbox: one hidden draw, before anything is shown, so nothing jumps afterwards.
             p.vanillaMeasured = true;
             p.forceMeasure = true;
             hiddenRender(g, p, true, 0F, List.of(), realPartial);
@@ -3077,7 +3236,6 @@ public class MobEditorScreen extends Screen {
         float tPivZ = 0F;
         float tYaw = 0F;
         if (fitNew) {
-            // Bounds of what is really drawn (blocks around the anchor); the hitbox only stands in until it has been measured.
             float minX = -bbW / 2F;
             float maxX = bbW / 2F;
             float minY = 0F;
@@ -3107,7 +3265,7 @@ public class MobEditorScreen extends Screen {
             float spanH = Math.max(maxY - minY, 0.4F);
             float spanX = Math.max(maxX - minX, 0.4F);
             float spanZ = Math.max(maxZ - minZ, 0.4F);
-            float core = Math.max(spanH, Math.min(spanX, spanZ));  // the size that must look right: height or thickness
+            float core = Math.max(spanH, Math.min(spanX, spanZ));
             float longest = Math.max(spanX, spanZ);
             boolean elongatedNow = longest > ELONGATED_RATIO * core;
             boolean elongated = p.elongLatched || elongatedNow;
@@ -3116,11 +3274,10 @@ public class MobEditorScreen extends Screen {
                 p.elongLatched = true;
                 p.longX = longX;
             }
-            float cap = elongated ? LENGTH_CAP * core : longest;    // how much of the length is fitted
+            float cap = elongated ? LENGTH_CAP * core : longest;
             float fitX = Math.min(spanX, cap);
             float fitZ = Math.min(spanZ, cap);
             if (elongated) {
-                // Turn it so the long axis mostly runs into the screen.
                 tYaw = longX ? (float) (Math.PI / 2.0 - GROUP_VIEW_ANGLE) : GROUP_VIEW_ANGLE;
                 swayDeg = GROUP_SWAY_DEG;
             }
@@ -3131,8 +3288,6 @@ public class MobEditorScreen extends Screen {
                 worstW = Math.max(worstW, fitX * Math.abs(Math.cos(a)) + fitZ * Math.abs(Math.sin(a)));
             }
             if (!elongated && measured && !p.hasEnv) {
-                // A round mob is narrower than its box: turning it about the middle of the box, no vertex gets farther from
-                // the middle than the farthest one is from the anchor plus the offset of the middle.
                 double radial = 2.0 * (p.radius() + Math.hypot((minX + maxX) / 2.0, (minZ + maxZ) / 2.0));
                 worstW = Math.min(worstW, Math.max(radial, spanH * 0.0 + 0.4));
             }
@@ -3141,7 +3296,6 @@ public class MobEditorScreen extends Screen {
             tPivX = (minX + maxX) / 2F;
             tPivZ = (minZ + maxZ) / 2F;
             if (elongated && longest > cap) {
-                // Part of the length will be cut off: keep the end the mob's own origin (its head) is in on screen.
                 if (longX) {
                     tPivX = Mth.clamp(0F, minX + cap / 2F, maxX - cap / 2F);
                 } else {
@@ -3166,7 +3320,6 @@ public class MobEditorScreen extends Screen {
                 fillH = 0.7F;
                 fillW = 0.8F;
             } else {
-                // Models are often longer/wider than their hitbox (camel), so fit against a padded extent.
                 extentH = Math.max(bbH, bbW * 1.2F);
                 extentW = bbW * 2.2F;
                 fillH = 0.9F;
@@ -3175,7 +3328,6 @@ public class MobEditorScreen extends Screen {
                     float[] mr = new float[2];
                     p.range(1, mr);
                     extentH = Math.max(mr[1] - mr[0], 0.3F);
-                    // Turning about the anchor, nothing gets farther from the middle than the farthest vertex.
                     extentW = Math.max(2F * p.radius(), 0.3F) * 1.15F;
                     useMeasured = true;
                     measuredCenter = (mr[0] + mr[1]) / 2F;
@@ -3188,7 +3340,7 @@ public class MobEditorScreen extends Screen {
             tScale = Math.min(baseScale(panelH, extentH), Math.min(panelH * fillH / extentH, rw * fillW / extentW));
         }
 
-        if (p.sScale < 0F || !visible) { // while it is not shown yet there is nothing to ease
+        if (p.sScale < 0F || !visible) {
             p.sScale = tScale;
             p.sCenterY = tCenterY;
             p.sPivX = tPivX;
@@ -3205,9 +3357,8 @@ public class MobEditorScreen extends Screen {
         float cx = rx + rw / 2F;
         float feetY = (top + bottom) / 2F + p.sCenterY * scale;
 
-        // Entity faces the viewer; the sway is applied to the pose so it is perfectly smooth.
         faceViewer(e);
-        forceWet(e); // the fish renderer lays fish on their side unless they are in water
+        forceWet(e);
         e.setInvisible(false);
         float sway = (float) Math.toRadians(swayDeg * Math.sin(Util.getMillis() / 1500.0));
         final float px = p.sPivX;
@@ -3216,15 +3367,15 @@ public class MobEditorScreen extends Screen {
         final List<Entity> drawExtras = extras;
 
         boolean failed = false;
-        g.enableScissor(rx, TOP, visible ? rx + rw + 6 : rx, previewBottom()); // zero width while warming up: rendered, not shown
+        g.enableScissor(rx, TOP, visible ? rx + rw + 6 : rx, previewBottom());
         PoseStack pose = g.pose();
         pose.pushPose();
         EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
-            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + yaw + (dragon ? (float) Math.PI : 0F))); // the dragon model faces the other way
-            pose.translate(-px, 0.0F, -pz); // turn around the fitted middle, not the head
+            pose.mulPose(new Quaternionf().rotateZ((float) Math.PI).rotateY(sway + yaw + (dragon ? (float) Math.PI : 0F)));
+            pose.translate(-px, 0.0F, -pz);
             Lighting.setupForEntityInInventory();
             dispatcher.setRenderShadow(false);
             measuring = p.canMeasure();
@@ -3245,7 +3396,6 @@ public class MobEditorScreen extends Screen {
             active = null;
             return;
         }
-        // Companions that are not shown yet still have to be rendered, so their animation library has settled by the reveal.
         if (!p.settled && !raw.isEmpty()) {
             hiddenRender(g, p, false, partial, raw, realPartial);
         }
@@ -3254,10 +3404,27 @@ public class MobEditorScreen extends Screen {
 
     // ------------------------------------------------------------------ render
 
+    private Component openTitle() {
+        if (dropsOpen) {
+            return Component.translatable("encephalon.screen.drops_title");
+        }
+        if (categoryOpen) {
+            return Component.translatable("encephalon.screen.category_title");
+        }
+        if (damageOpen) {
+            return Component.translatable("encephalon.screen.damage_title");
+        }
+        if (behaviorsOpen) {
+            return Component.translatable("encephalon.screen.behaviors_title");
+        }
+        if (hitboxOpen) {
+            return hitText("encephalon.screen.hitbox_title", "Hitboxes");
+        }
+        return null;
+    }
+
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
-        // The default drops arrive from the server a moment after the editor asks for them (or the list was changed from
-        // elsewhere): rebuild the drop rows when what they are made from has changed.
         if (data != null && dropsOpen && scope.type() == ScopeType.MOB_TYPE && currentDropsSource() != dropsSource) {
             rebuildDropsKeepScroll();
         }
@@ -3276,7 +3443,6 @@ public class MobEditorScreen extends Screen {
                     mx + mw / 2, TOP + 12, 0x808080);
         }
 
-        // Right column header: scope (with override count) on the first line, behavior on the second.
         int n = data.count(scope);
         Component scopeTitle = labelOf(scope).copy().withStyle(ChatFormatting.RED);
         if (n > 0) {
@@ -3286,31 +3452,35 @@ public class MobEditorScreen extends Screen {
         g.enableScissor(rx, 26, rx + rw + 6, TOP - 1);
         g.drawString(this.font, scopeTitle, rx, 28, 0xFFFFFF, true);
         if (scope.type() == ScopeType.MOB_TYPE) {
-            // The registry id next to the name tells apart mobs that share a name or look alike.
             int tw = this.font.width(scopeTitle) + 6;
             g.drawString(this.font, fit(scope.id(), rw - tw), rx + tw, 28, 0x707070, true);
         }
-        if (dropsOpen) {
-            g.drawString(this.font, Component.translatable("encephalon.screen.drops_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
-        } else if (categoryOpen) {
-            g.drawString(this.font, Component.translatable("encephalon.screen.category_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
-        } else if (damageOpen) {
-            g.drawString(this.font, Component.translatable("encephalon.screen.damage_title").copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
+        Component open = openTitle();
+        if (open != null) {
+            g.drawString(this.font, open.copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         } else if (behavior == null) {
             g.drawString(this.font, Component.translatable("encephalon.screen.select"), rx, 39, 0xA0A0A0, true);
         } else {
             g.drawString(this.font, behavior.name().copy().withStyle(ChatFormatting.YELLOW), rx, 39, 0xFFFFFF, true);
         }
         g.disableScissor();
-        if (behavior == null && !dropsOpen && !categoryOpen && !damageOpen) {
+
+        if (hitboxOpen && scope.type() == ScopeType.MOB_TYPE && hitData != null) {
+            // Hitboxes: the usual preview (with the hitbox drawn) in the upper part, the size settings under it.
+            PreviewSandbox.run(() -> renderPreview(g, partialTick));
+            g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
+            drawWarning(g, 0);
+            drawHitboxInfo(g);
+            g.disableScissor();
+            return;
+        }
+        if (behavior == null && !dropsOpen && !categoryOpen && !damageOpen && !behaviorsOpen) {
             PreviewSandbox.run(() -> renderPreview(g, partialTick));
             g.enableScissor(rx, TOP, rx + rw + 6, viewBottom());
             drawWarning(g, 0);
             g.disableScissor();
             return;
         }
-        // No preview while a behavior (or the drops) is open: the mob and its server twin are released until the preview is
-        // needed again.
         if (active != null) {
             release(active);
             active = null;
@@ -3323,7 +3493,6 @@ public class MobEditorScreen extends Screen {
             g.disableScissor();
             drawPanelScrollbar(g);
             if (!hovered.isEmpty()) {
-                // Drawn last and outside the scissor, so the name is never cut off or covered.
                 g.renderTooltip(this.font, hovered.getHoverName(), mouseX, mouseY);
             }
             return;
@@ -3334,7 +3503,7 @@ public class MobEditorScreen extends Screen {
             drawPanelScrollbar(g);
             return;
         }
-        if (damageOpen) {
+        if (damageOpen || behaviorsOpen) {
             drawDamageEditor(g);
             g.disableScissor();
             drawPanelScrollbar(g);
