@@ -199,7 +199,7 @@ public final class DamageDefaults {
             "armor", "armour", "knockback", "rate", "frequency", "level", "size", "length", "distance", "windup", "warmup",
             "recharge", "charge"};
     private static final String[] NOT_SETTING_WORDS = {"spawn", "weight", "biome", "group", "dimension"};
-    private static final int MAX_CONFIG_ROWS = 16;
+    private static final int MAX_CONFIG_ROWS = 40;
     private static final int MAX_SPECIAL = 12;
     private static final int MAX_CANDIDATES = 600;
     /** Goal names that only wrap the real attacks (an "ActionGoal" holding a list of actions): the actions are looked for inside. */
@@ -644,7 +644,7 @@ public final class DamageDefaults {
     }
 
     /**
-     * Numbers in the mod's own config (damage, cooldown, interval, duration, radius, ...) that belong to this mob: the path or the
+     * Every number in the mod's own config (damage, cooldown, interval, duration, radius, ...) that belongs to this mob: the path or the
      * file name carries its name, or the name of one of its attacks. Each becomes an editable row; a value typed there is written
      * to the mod's live config value (not to its file), and the stored value is applied again when a world starts. Hardcoded
      * numbers inside a mod's code cannot be changed, so only what the mod exposes in its config is listed.
@@ -679,9 +679,6 @@ public final class DamageDefaults {
                     }
                     List<String> path = cv.getPath();
                     String joined = String.join(".", path);
-                    if (!tokenHit(joined, SETTING_WORDS) || tokenHit(joined, NOT_SETTING_WORDS)) {
-                        continue;
-                    }
                     String flat = joined.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "");
                     boolean mine = (key.length() >= 3 && (flat.contains(key) || file.contains(key)))
                             || (classKey.length() >= 3 && (flat.contains(classKey) || file.contains(classKey)));
