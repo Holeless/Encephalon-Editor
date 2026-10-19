@@ -25,9 +25,9 @@ import net.minecraft.world.entity.ai.goal.WrappedGoal;
  * <li>Attacks (Combat): only real attacks. A damage row is generated for a mob only when it has no attack of its own at all (no goal,
  * no explosion like the creeper, no verified attack found in its code); a mob that has an attack damage attribute shows that value.
  * Attacks that were only guessed from a name or an animation are dropped: an animation is not an attack.</li>
- * <li>Behaviors: only what can really be edited: the numbers a mod exposes in its own config for that mob, and the duration and
- * level of every effect the mob's code applies (read from its bytecode, so nothing is hardcoded here: a bee's poison, a cave
- * spider's poison, a modded mob's slowness all turn up by themselves).</li>
+ * <li>Behaviors: what can be edited (the numbers a mod exposes in its own config for that mob, and the duration and
+ * level of every effect the mob's code applies, read from its bytecode), followed by reference-only rows for what its built-in AI
+ * does (goals, brain behaviors, see BehaviorScan: an allay's item delivery, dancing, duplication).</li>
  * </ul>
  * Values are stored in MobConfigData's damage map under ids that start with cfg_ (mod config) or fx_ (effects).
  */
@@ -108,9 +108,44 @@ public final class CombatInfo {
         } catch (RuntimeException | LinkageError ex) {
             EncephalonMod.LOGGER.warn("Mob Editor: could not read the effects of {}", t, ex);
         }
+        try {
+            for (BehaviorScan.Info i : aiOf(server, t)) {
+                String key = i.label().toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9]+", "_");
+                out.add(new Attack("ai_" + key, -1, null, Kind.EFFECT, i.label(), i.desc()));
+            }
+        } catch (RuntimeException | LinkageError ex) {
+            EncephalonMod.LOGGER.warn("Mob Editor: could not read the AI of {}", t, ex);
+        }
         List<Attack> done = List.copyOf(out);
         BEHAVIORS.put(t, done);
         return done;
+    }
+
+    /** What the mob's built-in AI does (goals, brain behaviors, notes): reference rows, nothing to edit. */
+    private static List<BehaviorScan.Info> aiOf(MinecraftServer server, EntityType<?> t) {
+        Entity e = null;
+        try {
+            e = t.create(server.overworld());
+            if (e == null) {
+                return List.of();
+            }
+            List<net.minecraft.world.entity.ai.goal.Goal> goals = new ArrayList<>();
+            if (e instanceof Mob mob) {
+                for (WrappedGoal w : mob.goalSelector.getAvailableGoals()) {
+                    goals.add(w.getGoal());
+                }
+                for (WrappedGoal w : mob.targetSelector.getAvailableGoals()) {
+                    goals.add(w.getGoal());
+                }
+            }
+            return BehaviorScan.scan(e.getClass(), goals, BuiltInRegistries.ENTITY_TYPE.getKey(t).toString());
+        } catch (RuntimeException | LinkageError ex) {
+            return List.of();
+        } finally {
+            if (e != null) {
+                e.discard();
+            }
+        }
     }
 
     /** The already scanned behavior rows of a type, or an empty list (never scans: safe on the render thread). */

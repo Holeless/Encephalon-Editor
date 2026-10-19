@@ -508,7 +508,12 @@ public class MobEditorScreen extends Screen {
 
         /** Distance from the anchor's vertical axis that nearly all vertices are within (outermost 0.2% ignored). */
         float radius() {
-            int cut = Math.max(1, samples / 500);
+            return radius(500);
+        }
+
+        /** Same, ignoring the outermost samples/cutDiv vertices (a smaller cutDiv trims more). */
+        float radius(int cutDiv) {
+            int cut = Math.max(1, samples / cutDiv);
             int c = 0;
             int j = MB_BINS - 1;
             while (j > 0 && (c += rhist[j]) < cut) {
@@ -519,8 +524,13 @@ public class MobEditorScreen extends Screen {
 
         /** The extent along an axis, ignoring the outermost 0.2% of vertices at each end (stray bits of a model). */
         void range(int axis, float[] out) {
+            range(axis, out, 500);
+        }
+
+        /** Same, ignoring the outermost samples/cutDiv vertices at each end (100 = 1%). */
+        void range(int axis, float[] out, int cutDiv) {
             int[] h = hist[axis];
-            int cut = Math.max(1, samples / 500);
+            int cut = Math.max(1, samples / cutDiv);
             int c = 0;
             int i = 0;
             while (i < MB_BINS - 1 && (c += h[i]) < cut) {
@@ -1129,7 +1139,7 @@ public class MobEditorScreen extends Screen {
 
         @Override
         public void draw(GuiGraphics g, Font f, int x, int y, int w, int h) {
-            g.renderFakeItem(new ItemStack(Items.REDSTONE), x + 1, y + (h - 16) / 2);
+            g.renderFakeItem(new ItemStack(Items.CARROT_ON_A_STICK), x + 1, y + (h - 16) / 2);
             boolean custom = scope.type() == ScopeType.MOB_TYPE && CombatInfo.hasBehaviorValues(data, scope.id());
             Component state = Component.translatable(custom ? "encephalon.state.custom" : "encephalon.screen.default");
             int color = custom ? 0xFFAA00 : 0xA0A0A0;
@@ -1198,8 +1208,8 @@ public class MobEditorScreen extends Screen {
         hitFit = track(Button.builder(hitText("encephalon.screen.hitbox_fit", "Fit to Model"), b -> fitHitbox())
                 .bounds(rx, by + 24, half, 20)
                 .tooltip(Tooltip.create(hitText("encephalon.screen.hitbox_fit_tip",
-                        "Measures the model that is drawn and makes a hitbox that fits it. The result is stored as plain numbers, so it costs nothing in the game."))).build());
-        hitReset = track(Button.builder(hitText("encephalon.screen.hitbox_reset", "Reset Hitbox"), b -> resetHitbox())
+                        "Wraps the hitbox around the drawn model."))).build());
+        hitReset = track(Button.builder(hitText("encephalon.screen.hitbox_reset", "Reset"), b -> resetHitbox())
                 .bounds(rx + half + 4, by + 24, rw - half - 4, 20).build());
         hitFit.active = false;
         hitReset.active = editable && hitData.has(id);
@@ -1218,10 +1228,22 @@ public class MobEditorScreen extends Screen {
         if (!fitReady() || p == null) {
             return;
         }
-        float[] r = new float[2];
-        p.range(1, r);
-        double h = Mth.clamp(r[1], 0.1, 32.0);
-        double w = Mth.clamp(2.0 * p.radius(), 0.1, 32.0);
+        // Wrap the drawn model closely: ignore the outermost 1% of vertices (wisps, tails, stray bits) on every axis, take the
+        // height from the feet to the top, and make the (square) footprint the geometric mean of the model's width and
+        // length, never wider than its round footprint. A long mob therefore gets a box smaller than its length (its tail
+        // is outside), instead of a huge one.
+        float[] ry = new float[2];
+        float[] rxr = new float[2];
+        float[] rzr = new float[2];
+        p.range(1, ry, 100);
+        p.range(0, rxr, 100);
+        p.range(2, rzr, 100);
+        double h = Mth.clamp(ry[1], 0.1, 32.0);
+        double spanX = Math.max(0.05, rxr[1] - rxr[0]);
+        double spanZ = Math.max(0.05, rzr[1] - rzr[0]);
+        double w = Math.sqrt(spanX * spanZ);
+        w = Math.min(w, 2.0 * p.radius(100));
+        w = Mth.clamp(w, 0.1, 32.0);
         String id = scope.id();
         HitboxData.Hitbox old = hitData.hitbox(id);
         HitboxData.Hitbox nh = new HitboxData.Hitbox(old.wMul(), old.hMul(), true, w, h);
@@ -1256,7 +1278,7 @@ public class MobEditorScreen extends Screen {
             }
             setFilter(s -> s.matches("\\d*\\.?\\d*"));
             setHint(hitText(kind == 0 ? "encephalon.screen.hitbox_width" : "encephalon.screen.hitbox_height",
-                    kind == 0 ? "Width x (1 = normal)" : "Height x (1 = normal)"));
+                    kind == 0 ? "Width x" : "Height x"));
         }
 
         void commit() {
@@ -1307,13 +1329,13 @@ public class MobEditorScreen extends Screen {
         EntityType<?> t = selectedType();
         HitboxData.Hitbox h = hitData.hitbox(scope.id());
         float[] cur = h.size(t.getWidth(), t.getHeight());
-        Component line = hitText("encephalon.screen.hitbox_info", "Default %s x %s   Now %s x %s blocks",
+        Component line = hitText("encephalon.screen.hitbox_info", "Default %s x %s  Now %s x %s",
                 fmt(Math.round(t.getWidth() * 100) / 100.0), fmt(Math.round(t.getHeight() * 100) / 100.0),
                 fmt(Math.round(cur[0] * 100) / 100.0), fmt(Math.round(cur[1] * 100) / 100.0));
         g.drawString(this.font, fit(line.getString(), rw), rx, hitInfoY, h.isDefault() ? 0xA0A0A0 : 0xFFAA00, true);
         Component sub = h.fit()
-                ? hitText("encephalon.screen.hitbox_fitted", "Fitted to the model (grey box: default, yellow: now)")
-                : hitText("encephalon.screen.hitbox_legend", "Grey box: default, yellow: now");
+                ? hitText("encephalon.screen.hitbox_fitted", "Fitted (grey: default, yellow: now)")
+                : hitText("encephalon.screen.hitbox_legend", "Grey: default, yellow: now");
         g.drawString(this.font, fit(sub.getString(), rw), rx, hitInfoY + 11, 0x808080, true);
         if (hitFit != null) {
             hitFit.active = fitReady();
@@ -2825,6 +2847,8 @@ public class MobEditorScreen extends Screen {
         PoseStack pose = g.pose();
         pose.pushPose();
         EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
+        boolean hitboxesWere = dispatcher.shouldRenderHitBoxes();
+        dispatcher.setRenderHitBoxes(false); // F3+B must not draw (or be measured into) the preview
         try {
             pose.translate(rx, TOP, 50.0);
             pose.scale(1F, 1F, -1F);
@@ -2838,6 +2862,7 @@ public class MobEditorScreen extends Screen {
             ok = false;
         } finally {
             measuring = false;
+            dispatcher.setRenderHitBoxes(hitboxesWere);
             dispatcher.setRenderShadow(true);
             pose.popPose();
             Lighting.setupFor3DItems();
@@ -3411,6 +3436,8 @@ public class MobEditorScreen extends Screen {
         PoseStack pose = g.pose();
         pose.pushPose();
         EntityRenderDispatcher dispatcher = this.minecraft.getEntityRenderDispatcher();
+        boolean hitboxesWere = dispatcher.shouldRenderHitBoxes();
+        dispatcher.setRenderHitBoxes(false); // only the Hitboxes tab draws boxes (drawHitboxLines), never F3+B
         try {
             pose.translate(cx, feetY, 50.0);
             pose.scale(scale, scale, -scale);
@@ -3425,6 +3452,7 @@ public class MobEditorScreen extends Screen {
             failed = true;
         } finally {
             measuring = false;
+            dispatcher.setRenderHitBoxes(hitboxesWere);
             dispatcher.setRenderShadow(true);
             pose.popPose();
             Lighting.setupFor3DItems();
