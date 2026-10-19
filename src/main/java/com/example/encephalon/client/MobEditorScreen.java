@@ -47,7 +47,6 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.LogoRenderer;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
@@ -2858,7 +2857,7 @@ public class MobEditorScreen extends Screen {
             final MultiBufferSource use = source;
             PreviewSandbox.asLevelRun(p.entity.level(),
                     () -> dispatcher.render(p.entity, 0.0, 0.0, 0.0, 0.0F, partial, pose, use, 15728880));
-            if (hitboxOpen && !measuring && hitData != null) {
+            if (hitboxOpen && hitData != null) {
                 drawHitbox(g, p, pose);
             }
         }
@@ -2875,16 +2874,57 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** The default hitbox (grey) and the edited one (yellow), as line boxes around the mob's feet. Drawn straight to the real buffer, never measured. */
+    /** Screen-space edges of the hitbox boxes of the last draw: x1, y1, x2, y2, colour. */
+    private final List<float[]> hitSegs = new ArrayList<>();
+
+    /**
+     * Projects the corners of the default (grey) and edited (yellow) hitbox through the pose the mob is drawn with and stores their
+     * edges in screen space. They are drawn on top afterwards (see drawHitboxLines), so depth can never hide them.
+     */
     private void drawHitbox(GuiGraphics g, Preview p, PoseStack pose) {
+        hitSegs.clear();
         float dw = p.type.getWidth();
         float dh = p.type.getHeight();
         float[] s = hitData.hitbox(BuiltInRegistries.ENTITY_TYPE.getKey(p.type).toString()).size(dw, dh);
-        VertexConsumer lines = g.bufferSource().getBuffer(RenderType.lines());
+        Matrix4f m = pose.last().pose();
         if (Math.abs(s[0] - dw) > 1.0E-3F || Math.abs(s[1] - dh) > 1.0E-3F) {
-            LevelRenderer.renderLineBox(pose, lines, new AABB(-dw / 2.0, 0.0, -dw / 2.0, dw / 2.0, dh, dw / 2.0), 0.6F, 0.6F, 0.6F, 1F);
+            addBox(m, dw, dh, 0xFFAAAAAA);
         }
-        LevelRenderer.renderLineBox(pose, lines, new AABB(-s[0] / 2.0, 0.0, -s[0] / 2.0, s[0] / 2.0, s[1], s[0] / 2.0), 1F, 0.85F, 0.1F, 1F);
+        addBox(m, s[0], s[1], 0xFFFFD21A);
+    }
+
+    private void addBox(Matrix4f m, float w, float h, int color) {
+        Vector3f[] c = new Vector3f[8];
+        for (int i = 0; i < 8; i++) {
+            float x = (i & 1) == 0 ? -w / 2F : w / 2F;
+            float y = (i & 2) == 0 ? 0F : h;
+            float z = (i & 4) == 0 ? -w / 2F : w / 2F;
+            c[i] = m.transformPosition(x, y, z, new Vector3f());
+        }
+        for (int i = 0; i < 8; i++) {
+            for (int bit = 1; bit <= 4; bit <<= 1) {
+                int j = i | bit;
+                if (j != i) {
+                    hitSegs.add(new float[] {c[i].x, c[i].y, c[j].x, c[j].y, Float.intBitsToFloat(color)});
+                }
+            }
+        }
+    }
+
+    private void drawHitboxLines(GuiGraphics g) {
+        g.enableScissor(rx, TOP, rx + rw + 6, previewBottom());
+        for (float[] sg : hitSegs) {
+            int color = Float.floatToRawIntBits(sg[4]);
+            float dx = sg[2] - sg[0];
+            float dy = sg[3] - sg[1];
+            int steps = Math.max(1, (int) Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))));
+            for (int i = 0; i <= steps; i++) {
+                int px = Math.round(sg[0] + dx * i / steps);
+                int py = Math.round(sg[1] + dy * i / steps);
+                g.fill(px, py, px + 1, py + 1, color);
+            }
+        }
+        g.disableScissor();
     }
 
     private boolean fastForward(GuiGraphics g, Preview p, List<Entity> raw, float realPartial) {
@@ -3398,6 +3438,9 @@ public class MobEditorScreen extends Screen {
         }
         if (!p.settled && !raw.isEmpty()) {
             hiddenRender(g, p, false, partial, raw, realPartial);
+        }
+        if (hitboxOpen && visible && !hitSegs.isEmpty()) {
+            drawHitboxLines(g);
         }
         g.drawCenteredString(this.font, p.type.getDescription(), (int) cx, previewBottom() - 12, 0xC8C8C8);
     }
