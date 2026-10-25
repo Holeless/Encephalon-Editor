@@ -7,8 +7,6 @@ import com.example.encephalon.EncephalonMod;
 
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
@@ -22,8 +20,12 @@ import net.neoforged.neoforge.event.tick.EntityTickEvent;
 /**
  * Applies the hitboxes set in the Mob Editor. Runs on both logical sides (the client needs the same box for aiming at the mob),
  * reading the same HitboxData: in singleplayer the client reads the integrated server's data directly (multiplayer sync is a TODO,
- * like the rest of the editor). The box is only replaced when its size differs, and sizes are cached per type, so a mob without an
- * override costs one volatile read per tick, and a mob with one costs a map lookup.
+ * like the rest of the editor). Sizes are cached per type, so a mob without an override costs one volatile read per tick, and a
+ * mob with one costs a map lookup.
+ * <p>
+ * The footprint is a width x length rectangle. Minecraft boxes cannot rotate, so each tick the rectangle is turned by the mob's
+ * body yaw and the axis-aligned bounds of the result are used: tight when the mob faces a cardinal direction, with some slack
+ * at diagonal angles (a limit of vanilla's AABB).
  */
 @EventBusSubscriber(modid = EncephalonMod.MOD_ID)
 public final class HitboxOverrides {
@@ -51,7 +53,7 @@ public final class HitboxOverrides {
         cachedFor = null;
     }
 
-    /** {width, height} of the edited hitbox of the type, or null when it has no override. Safe to call from any thread. */
+    /** {width, height, length} of the edited hitbox of the type, or null when it has no override. Safe to call from any thread. */
     public static float[] sizeOf(EntityType<?> type) {
         HitboxData d = current;
         if (d == null || !d.any()) {
@@ -74,17 +76,25 @@ public final class HitboxOverrides {
 
     @SubscribeEvent
     public static void onTick(EntityTickEvent.Post event) {
-        Entity e = event.getEntity();
-        if (!(e instanceof LivingEntity) || e instanceof Player) {
+        if (!(event.getEntity() instanceof LivingEntity e) || e instanceof Player) {
             return;
         }
-        float[] s = sizeOf(e.getType());
+        float[] s = sizeOf(e.getType()); // {width, height, length}
         if (s == null) {
             return;
         }
+        double yaw = Math.toRadians(e.yBodyRot);
+        double c = Math.abs(Math.cos(yaw));
+        double sn = Math.abs(Math.sin(yaw));
+        double xs = c * s[0] + sn * s[2];
+        double zs = sn * s[0] + c * s[2];
+        AABB want = new AABB(e.getX() - xs / 2.0, e.getY(), e.getZ() - zs / 2.0,
+                e.getX() + xs / 2.0, e.getY() + s[1], e.getZ() + zs / 2.0);
         AABB b = e.getBoundingBox();
-        if (Math.abs(b.getXsize() - s[0]) > 1.0E-4 || Math.abs(b.getYsize() - s[1]) > 1.0E-4) {
-            e.setBoundingBox(EntityDimensions.scalable(s[0], s[1]).makeBoundingBox(e.position()));
+        if (Math.abs(b.minX - want.minX) > 1.0E-4 || Math.abs(b.maxX - want.maxX) > 1.0E-4
+                || Math.abs(b.minY - want.minY) > 1.0E-4 || Math.abs(b.maxY - want.maxY) > 1.0E-4
+                || Math.abs(b.minZ - want.minZ) > 1.0E-4 || Math.abs(b.maxZ - want.maxZ) > 1.0E-4) {
+            e.setBoundingBox(want);
         }
     }
 }
