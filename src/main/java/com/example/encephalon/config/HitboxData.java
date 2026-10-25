@@ -11,25 +11,31 @@ import net.minecraft.world.level.saveddata.SavedData;
 
 /**
  * Per-world hitbox overrides, one entry per mob type. Kept in its own file (data/encephalon_hitboxes.dat) so it does not
- * touch MobConfigData. wMul / hMul scale the width / height; fit = true means "use fitW / fitH (measured from the model)
- * instead of the type's default size" before the multipliers apply. The fitted size is stored as plain numbers, so a fitted
- * hitbox costs nothing per tick.
+ * touch MobConfigData. wMul / hMul scale the width / height; fit = true means "use fitW / fitH / fitL (measured from the model)
+ * instead of the type's default size" before the multipliers apply. wMul scales both width and length. The fitted size is stored
+ * as plain numbers, so a fitted hitbox costs nothing per tick.
+ * fitW is the sideways width (local x), fitL the front-to-back length (local z).
  */
 public class HitboxData extends SavedData {
     private static final String FILE = "encephalon_hitboxes";
 
-    public record Hitbox(double wMul, double hMul, boolean fit, double fitW, double fitH) {
-        public static final Hitbox NONE = new Hitbox(1.0, 1.0, false, 0.0, 0.0);
+    public record Hitbox(double wMul, double hMul, boolean fit, double fitW, double fitH, double fitL) {
+        public static final Hitbox NONE = new Hitbox(1.0, 1.0, false, 0.0, 0.0, 0.0);
 
         public boolean isDefault() {
             return !fit && wMul == 1.0 && hMul == 1.0;
         }
 
-        /** {width, height} in blocks, given the type's default size. */
+        /** {width (local x), height, length (local z)} in blocks, given the type's default size. */
         public float[] size(float defW, float defH) {
             double w = (fit ? fitW : defW) * wMul;
             double h = (fit ? fitH : defH) * hMul;
-            return new float[] {(float) Math.max(0.05, Math.min(64.0, w)), (float) Math.max(0.05, Math.min(64.0, h))};
+            double l = (fit ? fitL : defW) * wMul;
+            return new float[] {clampSize(w), clampSize(h), clampSize(l)};
+        }
+
+        private static float clampSize(double v) {
+            return (float) Math.max(0.05, Math.min(64.0, v));
         }
     }
 
@@ -46,8 +52,10 @@ public class HitboxData extends SavedData {
         CompoundTag t = tag.getCompound("Boxes");
         for (String k : t.getAllKeys()) {
             CompoundTag c = t.getCompound(k);
+            // Saves from before the length existed fall back to a square footprint.
+            double fitL = c.contains("FitL") ? c.getDouble("FitL") : c.getDouble("FitW");
             d.boxes.put(k, new Hitbox(c.getDouble("WMul"), c.getDouble("HMul"), c.getBoolean("Fit"),
-                    c.getDouble("FitW"), c.getDouble("FitH")));
+                    c.getDouble("FitW"), c.getDouble("FitH"), fitL));
         }
         return d;
     }
@@ -62,6 +70,7 @@ public class HitboxData extends SavedData {
             c.putBoolean("Fit", h.fit());
             c.putDouble("FitW", h.fitW());
             c.putDouble("FitH", h.fitH());
+            c.putDouble("FitL", h.fitL());
             t.put(k, c);
         });
         tag.put("Boxes", t);
