@@ -51,7 +51,7 @@
   "encephalon.screen.hitbox_reset": "Reset",
   "encephalon.screen.hitbox_width": "Width x",
   "encephalon.screen.hitbox_height": "Height x",
-  "encephalon.screen.hitbox_info": "Default %s x %s  Now %s x %s",
+  "encephalon.screen.hitbox_info": "Default %s x %s  Now %s x %s x %s (w x h x l)",
   "encephalon.screen.hitbox_fitted": "Fitted (grey: default, yellow: now)",
   "encephalon.screen.hitbox_legend": "Grey: default, yellow: now",
   "encephalon.screen.damage_title": "Combat",
