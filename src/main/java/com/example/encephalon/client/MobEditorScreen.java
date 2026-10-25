@@ -1228,25 +1228,21 @@ public class MobEditorScreen extends Screen {
         if (!fitReady() || p == null) {
             return;
         }
-        // Wrap the drawn model closely: ignore the outermost 1% of vertices (wisps, tails, stray bits) on every axis, take the
-        // height from the feet to the top, and make the (square) footprint the geometric mean of the model's width and
-        // length, never wider than its round footprint. A long mob therefore gets a box smaller than its length (its tail
-        // is outside), instead of a huge one.
+        // Wrap the drawn model with a rectangular footprint: width is the sideways span of the model (local x), length is its
+        // front-to-back span (local z), height runs from the feet to the top. The default 0.2% trim is used, so thin parts
+        // (tails, ears, wings) are inside the box and nothing sticks out.
         float[] ry = new float[2];
         float[] rxr = new float[2];
         float[] rzr = new float[2];
-        p.range(1, ry, 100);
-        p.range(0, rxr, 100);
-        p.range(2, rzr, 100);
+        p.range(1, ry);
+        p.range(0, rxr);
+        p.range(2, rzr);
         double h = Mth.clamp(ry[1], 0.1, 32.0);
-        double spanX = Math.max(0.05, rxr[1] - rxr[0]);
-        double spanZ = Math.max(0.05, rzr[1] - rzr[0]);
-        double w = Math.sqrt(spanX * spanZ);
-        w = Math.min(w, 2.0 * p.radius(100));
-        w = Mth.clamp(w, 0.1, 32.0);
+        double w = Mth.clamp(rxr[1] - rxr[0], 0.1, 32.0);
+        double l = Mth.clamp(rzr[1] - rzr[0], 0.1, 32.0);
         String id = scope.id();
         HitboxData.Hitbox old = hitData.hitbox(id);
-        HitboxData.Hitbox nh = new HitboxData.Hitbox(old.wMul(), old.hMul(), true, w, h);
+        HitboxData.Hitbox nh = new HitboxData.Hitbox(old.wMul(), old.hMul(), true, w, h, l);
         edit(() -> hitData.set(id, nh));
         refreshHitboxWidgets();
     }
@@ -1264,7 +1260,7 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Size multiplier field: kind 0 = width, 1 = height. 1 (or empty) is the normal size. Enter or clicking away applies it. */
+    /** Size multiplier field: kind 0 = width (and length), 1 = height. 1 (or empty) is the normal size. Enter or clicking away applies it. */
     private final class HitBox extends EditBox {
         private final int kind;
 
@@ -1296,8 +1292,9 @@ public class MobEditorScreen extends Screen {
                     v = 1.0;
                 }
             }
-            HitboxData.Hitbox nh = kind == 0 ? new HitboxData.Hitbox(v, old.hMul(), old.fit(), old.fitW(), old.fitH())
-                    : new HitboxData.Hitbox(old.wMul(), v, old.fit(), old.fitW(), old.fitH());
+            HitboxData.Hitbox nh = kind == 0
+                    ? new HitboxData.Hitbox(v, old.hMul(), old.fit(), old.fitW(), old.fitH(), old.fitL())
+                    : new HitboxData.Hitbox(old.wMul(), v, old.fit(), old.fitW(), old.fitH(), old.fitL());
             if (!nh.equals(old)) {
                 edit(() -> hitData.set(id, nh));
             }
@@ -1324,14 +1321,15 @@ public class MobEditorScreen extends Screen {
         }
     }
 
-    /** Text under the preview: default and current hitbox size, and what the two fields do. */
+    /** Text under the preview: default and current hitbox size (width x height x length), and what the two fields do. */
     private void drawHitboxInfo(GuiGraphics g) {
         EntityType<?> t = selectedType();
         HitboxData.Hitbox h = hitData.hitbox(scope.id());
-        float[] cur = h.size(t.getWidth(), t.getHeight());
-        Component line = hitText("encephalon.screen.hitbox_info", "Default %s x %s  Now %s x %s",
+        float[] cur = h.size(t.getWidth(), t.getHeight()); // {width, height, length}
+        Component line = hitText("encephalon.screen.hitbox_info", "Default %s x %s  Now %s x %s x %s (w x h x l)",
                 fmt(Math.round(t.getWidth() * 100) / 100.0), fmt(Math.round(t.getHeight() * 100) / 100.0),
-                fmt(Math.round(cur[0] * 100) / 100.0), fmt(Math.round(cur[1] * 100) / 100.0));
+                fmt(Math.round(cur[0] * 100) / 100.0), fmt(Math.round(cur[1] * 100) / 100.0),
+                fmt(Math.round(cur[2] * 100) / 100.0));
         g.drawString(this.font, fit(line.getString(), rw), rx, hitInfoY, h.isDefault() ? 0xA0A0A0 : 0xFFAA00, true);
         Component sub = h.fit()
                 ? hitText("encephalon.screen.hitbox_fitted", "Fitted (grey: default, yellow: now)")
@@ -2905,25 +2903,26 @@ public class MobEditorScreen extends Screen {
     /**
      * Projects the corners of the default (grey) and edited (yellow) hitbox through the pose the mob is drawn with and stores their
      * edges in screen space. They are drawn on top afterwards (see drawHitboxLines), so depth can never hide them.
+     * The boxes are rectangular: width along the mob's local x, length along its local z.
      */
     private void drawHitbox(GuiGraphics g, Preview p, PoseStack pose) {
         hitSegs.clear();
         float dw = p.type.getWidth();
         float dh = p.type.getHeight();
-        float[] s = hitData.hitbox(BuiltInRegistries.ENTITY_TYPE.getKey(p.type).toString()).size(dw, dh);
+        float[] s = hitData.hitbox(BuiltInRegistries.ENTITY_TYPE.getKey(p.type).toString()).size(dw, dh); // {w, h, l}
         Matrix4f m = pose.last().pose();
-        if (Math.abs(s[0] - dw) > 1.0E-3F || Math.abs(s[1] - dh) > 1.0E-3F) {
-            addBox(m, dw, dh, 0xFFAAAAAA);
+        if (Math.abs(s[0] - dw) > 1.0E-3F || Math.abs(s[1] - dh) > 1.0E-3F || Math.abs(s[2] - dw) > 1.0E-3F) {
+            addBox(m, dw, dh, dw, 0xFFAAAAAA);
         }
-        addBox(m, s[0], s[1], 0xFFFFD21A);
+        addBox(m, s[0], s[1], s[2], 0xFFFFD21A);
     }
 
-    private void addBox(Matrix4f m, float w, float h, int color) {
+    private void addBox(Matrix4f m, float w, float h, float l, int color) {
         Vector3f[] c = new Vector3f[8];
         for (int i = 0; i < 8; i++) {
             float x = (i & 1) == 0 ? -w / 2F : w / 2F;
             float y = (i & 2) == 0 ? 0F : h;
-            float z = (i & 4) == 0 ? -w / 2F : w / 2F;
+            float z = (i & 4) == 0 ? -l / 2F : l / 2F;
             c[i] = m.transformPosition(x, y, z, new Vector3f());
         }
         for (int i = 0; i < 8; i++) {
